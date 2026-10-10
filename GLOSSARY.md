@@ -58,3 +58,7 @@ _Avoid_: Rollback
 **Dataset**:
 An immutable, versioned collection of Bars (and, once prepared, features) for one or more Instruments at one bar size, described by a manifest recording its source, time range and lineage. A change to the data produces a new Dataset, never an edit. A trained model can always name the exact Dataset it saw.
 _Avoid_: Data dump, table
+
+**Seed cohort**:
+A Candidate together with sibling runs that share its training configuration and Dataset but differ in seed. Evaluated together at the backtest Gate to show consistency across seeds. Siblings are evidence only and are never promoted.
+_Avoid_: Ensemble, seed sweep
