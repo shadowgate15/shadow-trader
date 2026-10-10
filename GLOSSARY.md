@@ -34,3 +34,7 @@ _Avoid_: Fill model, broker model
 **Promotion path**:
 The ordered stages (backtest, paper, real money) an agent moves through, and the evidence required to pass each gate.
 _Avoid_: Deployment pipeline, rollout
+
+**Dataset**:
+An immutable, versioned collection of Bars (and, once prepared, features) for one or more Instruments at one bar size, described by a manifest recording its source, time range and lineage. A change to the data produces a new Dataset, never an edit. A trained model can always name the exact Dataset it saw.
+_Avoid_: Data dump, table
