@@ -1,3 +1,11 @@
+## Tooling
+
+Python 3.13 project managed with [uv](https://docs.astral.sh/uv/). Always run Python tooling through `uv run` rather than invoking tools directly.
+
+- **Dependencies / environment:** `uv sync` to install, `uv add <pkg>` (or `uv add --dev <pkg>`) to add packages. Don't use `pip`.
+- **Linting and formatting:** [ruff](https://docs.astral.sh/ruff/) — `uv run ruff check` and `uv run ruff format`. Config is in `pyproject.toml`.
+- **Type checking:** [ty](https://docs.astral.sh/ty/) — `uv run ty check`. Config is in `pyproject.toml`.
+
 ## Agent skills
 
 ### Issue tracker
