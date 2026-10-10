@@ -5,12 +5,20 @@ A reinforcement-learning system that learns to trade forex on short intraday bar
 ## Language
 
 **Bar**:
-One fixed-length time interval of price data for an instrument. Length is configurable; 5 minutes is the default and 15 minutes the fallback.
+One fixed-length time interval of price data for an instrument, aligned to the UTC clock and identified by its open time. Length is configurable; 5 minutes is the default and 15 minutes the fallback. Prices are bid-side, with the spread carried alongside so the ask is always derivable.
 _Avoid_: Candle, tick
 
 **Instrument**:
 A single tradable forex pair, such as EUR/USD.
 _Avoid_: Symbol, ticker, asset
+
+**Session**:
+One continuous open-market stretch, from the weekly open (Sunday ~17:00 New York) to the weekly close (Friday ~17:00 New York). The daily 17:00 New York rollover is a marker inside a Session, not a boundary. Forex has no holiday calendar; the weekly closure is the only expected closure.
+_Avoid_: Trading day, market hours
+
+**Gap**:
+A Bar missing from inside an open Session because no quotes arrived. Never filled at ingestion and always flagged. The weekly closure between Sessions is not a Gap.
+_Avoid_: Missing data, hole
 
 **Subsystem**:
 A deployable piece of the system with its own charter and its own wayfinder map: market data ingestion, dataset preparation, trading environment, agent and training, evaluation, broker integration, live orchestration.
