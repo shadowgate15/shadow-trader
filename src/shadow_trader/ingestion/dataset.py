@@ -274,7 +274,7 @@ def _raw_inputs(data_root: Path, instruments: Iterable[str]) -> dict[str, str]:
     return found
 
 
-def build_dataset(
+def write_dataset(
     config: Config,
     bar_size: int,
     bars: Mapping[str, Sequence[Bar]],

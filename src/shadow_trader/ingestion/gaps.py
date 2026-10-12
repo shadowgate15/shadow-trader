@@ -60,7 +60,7 @@ def _in_run(bar: Bar) -> bool:
     return bar.is_gap and "source_missing" not in bar.quality_flags
 
 
-def _month_bounds(month: str) -> tuple[datetime, datetime]:
+def month_bounds(month: str) -> tuple[datetime, datetime]:
     """UTC span of a New York calendar month (``YYYY-MM``), as HistData files cut it."""
     year, number = month_parts(month)
     following = (year + number // 12, number % 12 + 1)
@@ -72,7 +72,7 @@ def _month_bounds(month: str) -> tuple[datetime, datetime]:
 
 def source_missing_bars(instrument: str, month: str, bar_minutes: int) -> Iterator[Bar]:
     """Gap rows flagged ``source_missing`` for every in-Session slot of a month."""
-    begin, end = _month_bounds(month)
+    begin, end = month_bounds(month)
     size = timedelta(minutes=bar_minutes)
     sunday = week_sunday(begin.astimezone(NY).date()) - timedelta(days=7)
     while True:

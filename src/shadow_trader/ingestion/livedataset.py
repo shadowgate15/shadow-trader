@@ -136,7 +136,7 @@ def build_live(
     parent = dataset.latest_dataset(
         data_root, source, bar_size, config.build.instruments
     )
-    return dataset.build_dataset(
+    return dataset.write_dataset(
         config,
         bar_size,
         series,

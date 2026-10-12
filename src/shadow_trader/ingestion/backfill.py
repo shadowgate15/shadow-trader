@@ -22,9 +22,16 @@ from pathlib import Path
 from . import dataset
 from .anomaly import FlaggingBarBuilder, summarize_flags
 from .bars import Bar, Quote
-from .config import DEFAULT_START, Config, to_month, validate_bar_sizes
+from .config import (
+    DEFAULT_START,
+    Config,
+    ConfigError,
+    last_complete_month,
+    to_month,
+    validate_bar_sizes,
+)
 from .dataset import DatasetRef, RawCache
-from .gaps import flag_suspected_outages, source_missing_bars
+from .gaps import flag_suspected_outages, month_bounds, source_missing_bars
 from .report import (
     WARNING_CODES,
     Alignment,
@@ -164,15 +171,19 @@ def parse_ticks(text: str, label: str, price_scale: int) -> Iterator[Quote]:
         yield Quote(ts, quote_bid, quote_ask)
 
 
-def build_backfill(config: Config, bar_size: int) -> BackfillResult:
+def build_backfill(
+    config: Config, bar_size: int, *, now: datetime | None = None
+) -> BackfillResult:
     """Build one Dataset (all configured Instruments) at ``bar_size`` minutes.
 
     A failed build writes a failure report under ``<data_root>/reports/failed``
-    (no Dataset directory exists) and re-raises ``BuildFailure``.
+    (no Dataset directory exists) and re-raises ``BuildFailure``. Without a
+    configured end month the range runs to the last complete UTC month before
+    ``now`` (default: the current time).
     """
     validate_bar_sizes((bar_size,))
     try:
-        return _build(config, bar_size)
+        return _build(config, bar_size, now or datetime.now(UTC))
     except BuildFailure as failure:
         # an unwritable report must not mask the failure itself
         with contextlib.suppress(OSError):
@@ -182,10 +193,15 @@ def build_backfill(config: Config, bar_size: int) -> BackfillResult:
         raise
 
 
-def _build(config: Config, bar_size: int) -> BackfillResult:
+def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
     cache = RawCache(config.paths.data_root)
     build = config.build
-    end = build.end or build.start
+    end = build.end or last_complete_month(now)
+    if end < build.start:
+        raise ConfigError(
+            f"build.start {build.start} is after the last complete month {end}"
+        )
+    lo, hi = month_bounds(build.start)[0], month_bounds(end)[1]
     series: dict[str, list[Bar]] = {}
     warnings: list[BuildWarning] = []
     dropped: dict[str, int] = {}
@@ -216,10 +232,18 @@ def _build(config: Config, bar_size: int) -> BackfillResult:
                         f"{instrument}/{period}",
                     )
                 )
-            for quote in parse_ticks(text, f"{instrument}/{period}", scale):
+            label = f"{instrument}/{period}"
+            for row, quote in enumerate(parse_ticks(text, label, scale), start=1):
                 first_ticks.setdefault(_week_open(quote.ts), quote.ts)
-                bars.extend(builder.push(quote))
+                try:
+                    bars.extend(builder.push(quote))
+                except ValueError as exc:
+                    where = f"{label} row {row}"
+                    raise BuildFailure(
+                        f"ticks out of order at {where}: {exc}", where
+                    ) from None
         bars.extend(builder.flush())
+        bars = [bar for bar in bars if lo <= bar.open_time < hi]
         for opened, first in first_ticks.items():
             if (off := _alignment_warning(instrument, opened, first)) is not None:
                 warnings.append(off[0])
@@ -249,7 +273,15 @@ def _build(config: Config, bar_size: int) -> BackfillResult:
                     instrument,
                 )
             )
-    ref = dataset.build_dataset(config, bar_size, series, tick_flag_counts=tick_flags)
+    ref = dataset.write_dataset(
+        config,
+        bar_size,
+        series,
+        parent=dataset.latest_dataset(
+            config.paths.data_root, SOURCE, bar_size, build.instruments
+        ),
+        tick_flag_counts=tick_flags,
+    )
     report_path = write_build_report(
         ref.path,
         build_report(

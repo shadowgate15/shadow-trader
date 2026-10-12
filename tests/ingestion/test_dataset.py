@@ -11,7 +11,7 @@ import pytest
 
 from shadow_trader.ingestion.bars import Quote, build_bars
 from shadow_trader.ingestion.config import Config, load_config
-from shadow_trader.ingestion.dataset import DatasetError, build_dataset, open_dataset
+from shadow_trader.ingestion.dataset import DatasetError, write_dataset, open_dataset
 
 # Winter Session opening Sun 2024-01-07 22:00 UTC.
 WINTER = datetime(2024, 1, 7, 22, 0, tzinfo=UTC)
@@ -50,8 +50,8 @@ def test_build_twice_gives_same_id_and_dataset_reads_back(tmp_path):
     config = make_config(tmp_path)
     bars = make_bars()
 
-    first = build_dataset(config, 5, bars)
-    second = build_dataset(config, 5, bars)
+    first = write_dataset(config, 5, bars)
+    second = write_dataset(config, 5, bars)
 
     assert first.dataset_id == second.dataset_id
     root = config.paths.data_root / "datasets" / first.dataset_id
@@ -64,33 +64,33 @@ def test_build_twice_gives_same_id_and_dataset_reads_back(tmp_path):
 def test_provenance_never_changes_id_but_content_affecting_rules_do(tmp_path):
     config = make_config(tmp_path)
     bars = make_bars()
-    base = build_dataset(config, 5, bars)
+    base = write_dataset(config, 5, bars)
 
-    other_provenance = build_dataset(
+    other_provenance = write_dataset(
         config,
         5,
         bars,
         created_at=datetime(2030, 1, 1, tzinfo=UTC),
         builder_revision="deadbeef",
     )
-    stricter = build_dataset(
+    stricter = write_dataset(
         make_config(tmp_path, "[rules.gap]\noutage_threshold_minutes = 45\n"),
         5,
         bars,
     )
-    reporting_only = build_dataset(
+    reporting_only = write_dataset(
         make_config(tmp_path, "[rules.anomaly]\nalert_fraction = 0.5\n"), 5, bars
     )
 
     assert other_provenance.dataset_id == base.dataset_id
     assert reporting_only.dataset_id == base.dataset_id
     assert stricter.dataset_id != base.dataset_id
-    assert build_dataset(config, 10, bars).dataset_id != base.dataset_id
+    assert write_dataset(config, 10, bars).dataset_id != base.dataset_id
 
 
 def test_contract_schema_metadata_and_manifest_fields(tmp_path):
     config = make_config(tmp_path)
-    ref = build_dataset(config, 5, make_bars())
+    ref = write_dataset(config, 5, make_bars())
 
     table = pq.read_table(ref.path / "bars/instrument=EURUSD/year=2024/part-0.parquet")
     assert {f.name: str(f.type) for f in table.schema} == {
@@ -149,9 +149,9 @@ def test_append_writes_new_dir_hardlinks_closed_years_and_records_parent(tmp_pat
     y2023 = make_bars(datetime(2023, 1, 8, 22, 0, tzinfo=UTC))["EURUSD"]
     y2024 = make_bars(WINTER)["EURUSD"]
     later = make_bars(WINTER + timedelta(days=7))["EURUSD"]
-    first = build_dataset(config, 5, {"EURUSD": y2023 + y2024})
+    first = write_dataset(config, 5, {"EURUSD": y2023 + y2024})
 
-    second = build_dataset(
+    second = write_dataset(
         config, 5, {"EURUSD": y2023 + y2024 + later}, parent=first.dataset_id
     )
 
@@ -167,7 +167,7 @@ def test_append_writes_new_dir_hardlinks_closed_years_and_records_parent(tmp_pat
 
 def test_unknown_schema_version_and_missing_manifest_are_refused(tmp_path):
     config = make_config(tmp_path)
-    ref = build_dataset(config, 5, make_bars())
+    ref = write_dataset(config, 5, make_bars())
     manifest_path = ref.path / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
 

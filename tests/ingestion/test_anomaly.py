@@ -16,7 +16,7 @@ from shadow_trader.ingestion.anomaly import (
 )
 from shadow_trader.ingestion.bars import Bar, Quote, build_bars
 from shadow_trader.ingestion.config import AnomalyRuleConfig
-from shadow_trader.ingestion.dataset import build_dataset
+from shadow_trader.ingestion.dataset import write_dataset
 
 from .test_dataset import make_config
 
@@ -322,7 +322,7 @@ def test_anomaly_thresholds_change_dataset_id_but_alert_fraction_does_not(tmp_pa
 
     def dataset_id(rules: str) -> str:
         config = make_config(tmp_path, f"[rules.anomaly]\n{rules}\n")
-        return build_dataset(config, 5, series).dataset_id
+        return write_dataset(config, 5, series).dataset_id
 
     base = dataset_id("")
     assert dataset_id("price_spike_k = 12.0") != base
@@ -337,7 +337,7 @@ def test_manifest_records_per_flag_counts_for_bars_and_ticks(tmp_path):
         q(timedelta(minutes=7), "1.10150", "1.10150"),
     ]
     bars, builder = run(quotes)
-    ref = build_dataset(
+    ref = write_dataset(
         make_config(tmp_path),
         5,
         {"EURUSD": bars},
