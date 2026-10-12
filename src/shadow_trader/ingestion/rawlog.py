@@ -11,7 +11,9 @@ for rebuilding live Bars and live Datasets.
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
+import os
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -49,6 +51,7 @@ class RawQuoteLog:
             self._dir.mkdir(parents=True, exist_ok=True)
             self.compress_closed(before=period)
             self._handle = (self._dir / f"{period}.jsonl").open("a")
+            self._write_open_sidecar()
         assert self._handle is not None
         line = {
             "source_ts": quote.ts.astimezone(UTC).isoformat(),
@@ -62,6 +65,7 @@ class RawQuoteLog:
     def close(self) -> None:
         """Release the open hour's file; it stays uncompressed until it closes."""
         self._close_handle()
+        self._write_open_sidecar()
         self._period = None
 
     def compress_closed(self, before: str) -> None:
@@ -82,6 +86,29 @@ class RawQuoteLog:
                 http={},
             )
             path.unlink()
+            path.with_name(path.name + ".meta.json").unlink(missing_ok=True)
+
+    def _write_open_sidecar(self) -> None:
+        """Describe the open hour's plain file; rewritten as the file grows.
+
+        Unlike the write-once sidecar of a compressed file, this one is only
+        provisional (``open: true``) until the hour closes and is compressed.
+        """
+        if self._period is None:
+            return
+        path = self._dir / f"{self._period}.jsonl"
+        data = path.read_bytes()
+        sidecar = {
+            "open": True,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size": len(data),
+            "request": {"source": self._source, "instrument": self._instrument},
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        meta = path.with_name(path.name + ".meta.json")
+        tmp = meta.with_name(meta.name + ".tmp")
+        tmp.write_text(json.dumps(sidecar, indent=2, sort_keys=True))
+        os.replace(tmp, meta)
 
     def _close_handle(self) -> None:
         if self._handle is not None:

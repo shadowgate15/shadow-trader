@@ -26,7 +26,7 @@ from .bars import Bar
 from .config import Config, validate_bar_sizes
 from .dataset import DatasetRef
 from .gaps import flag_suspected_outages, with_flag
-from .live import Event, LiveIngester
+from .live import Event, LiveIngester, overlaps_interval
 from .rawlog import raw_log_dir, read_raw_log
 from .replay import ReplayAdapter
 from .report import live_report_dir
@@ -52,10 +52,13 @@ def _down_intervals(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _overlaps(bar: Bar, size: timedelta, down: list[dict[str, Any]]) -> bool:
-    end = bar.open_time + size
     return any(
-        datetime.fromisoformat(i["start"]) < end
-        and (i["end"] is None or datetime.fromisoformat(i["end"]) > bar.open_time)
+        overlaps_interval(
+            bar.open_time,
+            size,
+            datetime.fromisoformat(i["start"]),
+            datetime.fromisoformat(i["end"]) if i["end"] else None,
+        )
         for i in down
     )
 
@@ -68,10 +71,13 @@ def _log_files(data_root: Path, source: str, instrument: str) -> dict[str, str]:
         if path.name.endswith(".meta.json"):
             continue
         sidecar = path.with_name(path.name + ".meta.json")
+        meta: dict[str, Any] = (
+            json.loads(sidecar.read_text()) if sidecar.exists() else {"open": True}
+        )
         digest = (
-            json.loads(sidecar.read_text())["sha256"]
-            if sidecar.exists()
-            else hashlib.sha256(path.read_bytes()).hexdigest()
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            if meta.get("open")  # provisional sidecar: the bytes are the truth
+            else meta["sha256"]
         )
         found[f"live/{source}/{instrument}/{path.name}"] = digest
     return found
@@ -133,7 +139,7 @@ def build_live(
     parent = dataset.latest_dataset(
         data_root, source, bar_size, config.build.instruments
     )
-    return dataset.build_dataset(
+    return dataset.write_dataset(
         config,
         bar_size,
         series,

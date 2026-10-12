@@ -14,12 +14,12 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Iterator, Sequence
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, timedelta
 
 from .anomaly import VOCABULARY
-from .bars import NY, SESSION_HOURS, Bar
-
-_ROLLOVER = time(17, 0)
+from .bars import Bar, gap_bar
+from .config import month_parts
+from .session import NY, open_of, slots_per_session, week_sunday
 
 
 def with_flag(bar: Bar, flag: str) -> Bar:
@@ -60,9 +60,9 @@ def _in_run(bar: Bar) -> bool:
     return bar.is_gap and "source_missing" not in bar.quality_flags
 
 
-def _month_bounds(month: str) -> tuple[datetime, datetime]:
+def month_bounds(month: str) -> tuple[datetime, datetime]:
     """UTC span of a New York calendar month (``YYYY-MM``), as HistData files cut it."""
-    year, number = int(month[:4]), int(month[5:])
+    year, number = month_parts(month)
     following = (year + number // 12, number % 12 + 1)
     return (
         datetime(year, number, 1, tzinfo=NY).astimezone(UTC),
@@ -72,31 +72,15 @@ def _month_bounds(month: str) -> tuple[datetime, datetime]:
 
 def source_missing_bars(instrument: str, month: str, bar_minutes: int) -> Iterator[Bar]:
     """Gap rows flagged ``source_missing`` for every in-Session slot of a month."""
-    begin, end = _month_bounds(month)
+    begin, end = month_bounds(month)
     size = timedelta(minutes=bar_minutes)
-    sunday = begin.astimezone(NY).date()
-    sunday -= timedelta(days=(sunday.weekday() + 1) % 7 + 7)
+    sunday = week_sunday(begin.astimezone(NY).date()) - timedelta(days=7)
     while True:
-        opened = datetime.combine(sunday, _ROLLOVER, tzinfo=NY).astimezone(UTC)
+        opened = open_of(sunday)
         if opened >= end:
             return
-        for slot in range(SESSION_HOURS * 60 // bar_minutes):
+        for slot in range(slots_per_session(bar_minutes)):
             start = opened + slot * size
             if begin <= start < end:
-                local = start.astimezone(NY)
-                yield Bar(
-                    instrument=instrument,
-                    open_time=start,
-                    open=None,
-                    high=None,
-                    low=None,
-                    close=None,
-                    spread_close=None,
-                    spread_mean=None,
-                    tick_count=None,
-                    is_gap=True,
-                    session_id=opened,
-                    is_rollover=local.time() == _ROLLOVER and local.weekday() < 4,
-                    quality_flags=("source_missing",),
-                )
+                yield gap_bar(instrument, start, opened, ("source_missing",))
         sunday += timedelta(days=7)

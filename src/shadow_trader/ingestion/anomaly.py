@@ -21,8 +21,9 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from .bars import Bar, BarBuilder, Quote, _session_of
-from .config import AnomalyRuleConfig
+from .bars import Bar, BarBuilder, Quote
+from .config import AnomalyRuleConfig, pip_size
+from .session import session_of
 
 # Closed, additive-only vocabulary. Gap-only flags are written by Gap handling.
 TICK_FLAGS = ("crossed_quote", "zero_spread", "price_spike", "stale_quote")
@@ -32,12 +33,7 @@ VOCABULARY = (*TICK_FLAGS, *BAR_FLAGS, *GAP_FLAGS)
 # Flags that feed the alert warning; zero_spread and spread_spike are excluded.
 ALERT_FLAGS = ("price_spike", "crossed_quote", "stale_quote")
 
-_PIP = Decimal("0.0001")
 _MAD_TO_SIGMA = 1.4826  # scales MAD to a standard deviation for normal data
-
-
-def _is_jpy(instrument: str) -> bool:
-    return instrument.endswith("JPY")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -96,7 +92,7 @@ class TickDetector:
     ) -> None:
         self._rules = rules
         self._factor = 10**price_scale
-        self._pip = self._factor * (Decimal("0.01") if _is_jpy(instrument) else _PIP)
+        self._pip = self._factor * pip_size(instrument)
         self._bids: deque[int] = deque(maxlen=rules.price_spike_window_ticks)
         self._run_quote: tuple[Decimal, Decimal] | None = None
         self._run_ticks = 0
@@ -156,7 +152,7 @@ class SpreadSpikeDetector:
     def __init__(self, instrument: str, rules: AnomalyRuleConfig) -> None:
         self._rules = rules
         self._lookback = timedelta(hours=rules.spread_spike_lookback_hours)
-        self._pip = float(Decimal("0.01") if _is_jpy(instrument) else _PIP)
+        self._pip = float(pip_size(instrument))
         self._history: deque[tuple[datetime, float]] = deque()
         self._first: datetime | None = None
 
@@ -201,7 +197,7 @@ class FlaggingBarBuilder:
         return self._builder.dropped_out_of_session
 
     def push(self, quote: Quote) -> list[Bar]:
-        if _session_of(quote.ts) is not None:
+        if session_of(quote.ts) is not None:
             tick_flags = self._ticks.observe(quote)
             if tick_flags:
                 self._slot_flags.setdefault(self._slot_of(quote.ts), set()).update(

@@ -19,6 +19,7 @@ from shadow_trader.ingestion.config import AnomalyRuleConfig
 from shadow_trader.ingestion.live import Heartbeat, LiveIngester, SourceDown, SourceUp
 from shadow_trader.ingestion.rawlog import read_raw_log
 from shadow_trader.ingestion.replay import ReplayAdapter
+from shadow_trader.ingestion.session import session_of
 
 from .test_dataset import make_config
 
@@ -91,11 +92,17 @@ def test_empty_slots_close_as_gap_bars_once_a_heartbeat_passes(tmp_path):
     ]
 
 
-def test_end_of_stream_closes_the_rest_of_the_session_like_a_backfill_flush(tmp_path):
-    emitted, _ = live(tmp_path, [q(timedelta(minutes=1))])
+def test_end_of_stream_flushes_only_slots_the_watermark_has_closed(tmp_path):
+    emitted, _ = live(
+        tmp_path,
+        [q(timedelta(minutes=1)), Heartbeat(OPEN + timedelta(minutes=10, seconds=1))],
+    )
 
-    assert len(emitted) == 120 * 60 // 5  # the whole Session grid, as in a backfill
-    assert [b.tick_count for b, _ in emitted[:2]] == [1, None]
+    # slots 0 and 1 are closed; the rest of the Session is not invented
+    assert [(b.open_time, b.is_gap) for b, _ in emitted] == [
+        (OPEN, False),
+        (OPEN + timedelta(minutes=5), True),
+    ]
 
 
 def test_out_of_order_quotes_in_an_open_slot_order_by_timestamp_then_arrival(tmp_path):
@@ -105,6 +112,7 @@ def test_out_of_order_quotes_in_an_open_slot_order_by_timestamp_then_arrival(tmp
             q(timedelta(seconds=30), bid="1.10030"),
             q(timedelta(seconds=10), bid="1.10010"),  # earlier ts, arrives later
             q(timedelta(seconds=30), bid="1.10040"),  # same ts as first, arrives after
+            Heartbeat(OPEN + timedelta(minutes=6)),
         ],
     )
 
@@ -122,6 +130,7 @@ def test_late_quote_inside_the_repair_window_re_emits_the_slot_as_next_revision(
             Heartbeat(OPEN + timedelta(minutes=6)),  # slot 0 closes as revision 0
             q(timedelta(minutes=2), bid="1.10020"),  # late: slot 0 is closed
             q(timedelta(minutes=7), bid="1.10050"),
+            Heartbeat(OPEN + timedelta(minutes=11)),
         ],
     )
 
@@ -252,9 +261,12 @@ def shared_config(tmp_path_factory):
 @given(quotes=arrival_sequences(), minutes=st.sampled_from(BAR_SIZES))
 def test_stream_equals_batch_for_sealed_bars(shared_config, quotes, minutes):
     config = shared_config
+    # time passing to the Session close is what closes the trailing slots
+    sessions = [s for x in quotes if (s := session_of(x.ts)) is not None]
+    closing = [Heartbeat(sessions[0][1] + timedelta(minutes=1))] if sessions else []
     ingester = LiveIngester(
         config,
-        ReplayAdapter(quotes, instrument="EURUSD"),
+        ReplayAdapter([*quotes, *closing], instrument="EURUSD"),
         sink=lambda bar, revision: None,
         bar_size=minutes,
     )
@@ -424,6 +436,25 @@ def raw_dir(tmp_path):
     return tmp_path / "data" / "raw" / "live" / "replay" / "EURUSD"
 
 
+def test_the_open_hour_file_has_a_sidecar_that_a_clean_close_brings_up_to_date(
+    tmp_path,
+):
+    live(
+        tmp_path,
+        [q(timedelta(minutes=m)) for m in (1, 2)],
+        clock=arrival_clock(timedelta(seconds=1)),
+        start=OPEN,
+    )
+
+    plain = raw_dir(tmp_path) / "20300101T09.jsonl"
+    sidecar = json.loads(
+        (raw_dir(tmp_path) / "20300101T09.jsonl.meta.json").read_text()
+    )
+    assert sidecar["open"] is True  # provisional: the hour may still be appended to
+    assert sidecar["sha256"] == hashlib.sha256(plain.read_bytes()).hexdigest()
+    assert sidecar["size"] == len(plain.read_bytes())
+
+
 def test_closed_hours_are_compressed_and_the_sidecar_hashes_the_compressed_bytes(
     tmp_path,
 ):
@@ -441,6 +472,7 @@ def test_closed_hours_are_compressed_and_the_sidecar_hashes_the_compressed_bytes
         "20300101T10.jsonl.gz",
         "20300101T10.jsonl.gz.meta.json",
         "20300101T11.jsonl",  # the open hour is still plain, append-only
+        "20300101T11.jsonl.meta.json",  # with a provisional sidecar
     ]
     packed = (directory / "20300101T09.jsonl.gz").read_bytes()
     sidecar = json.loads((directory / "20300101T09.jsonl.gz.meta.json").read_text())
@@ -469,7 +501,9 @@ def test_the_raw_log_reproduces_the_emitted_bars_and_a_later_run_never_rewrites_
     assert len(logged) == 3
     LiveIngester(
         make_config(tmp_path),
-        ReplayAdapter(logged, instrument="EURUSD"),
+        ReplayAdapter(
+            [*logged, Heartbeat(OPEN + timedelta(minutes=30))], instrument="EURUSD"
+        ),
         sink=lambda bar, revision: replayed.append(bar),
         start=OPEN,
         clock=arrival_clock(first=ARRIVAL + timedelta(days=1)),  # new hours: new files
@@ -556,7 +590,7 @@ def test_the_run_report_holds_counts_lag_distribution_and_first_20_sealed_drops(
 
     report = read_report(tmp_path)
     counts = report["counts"]
-    assert counts["bars_by_revision"]["0"] >= 13  # 12 slots closed by the heartbeat
+    assert counts["bars_by_revision"]["0"] == 12  # slots closed by the heartbeat
     assert counts["bars_by_revision"]["1"] == 1
     assert counts["bars_by_revision"]["2"] == 1
     assert counts["gap_bars"] >= 10

@@ -11,8 +11,10 @@ from __future__ import annotations
 import dataclasses
 import re
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,32 @@ SUPPORTED_BAR_SIZES = (1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60)
 SUPPORTED_LIVE_ADAPTERS = ("replay",)
 DEFAULT_START = "2009-01"
 _MONTH = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
+
+
+def month_parts(month: str) -> tuple[int, int]:
+    """(year, month number) of a ``YYYY-MM`` string."""
+    return int(month[:4]), int(month[5:])
+
+
+def to_period(month: str) -> str:
+    """``YYYY-MM`` to the raw-cache ``YYYYMM`` period."""
+    return month.replace("-", "")
+
+
+def to_month(period: str) -> str:
+    """Raw-cache ``YYYYMM`` period to ``YYYY-MM``."""
+    return f"{period[:4]}-{period[4:]}"
+
+
+def pip_size(instrument: str) -> Decimal:
+    """Price size of one pip: 0.01 for JPY pairs, 0.0001 otherwise."""
+    return Decimal("0.01") if instrument.endswith("JPY") else Decimal("0.0001")
+
+
+def last_complete_month(now: datetime) -> str:
+    """The last fully elapsed UTC month before ``now``, as ``YYYY-MM``."""
+    year, month = (now.year - 1, 12) if now.month == 1 else (now.year, now.month - 1)
+    return f"{year:04d}-{month:02d}"
 
 
 class ConfigError(Exception):
@@ -125,18 +153,25 @@ class Config:
     reconciliation: ReconciliationConfig
     live: LiveConfig
 
-    def content_affecting(self) -> dict[str, Any]:
+    def content_affecting(
+        self, instruments: Iterable[str] | None = None
+    ) -> dict[str, Any]:
         """The values that feed the Dataset hash (reporting-only ones omitted).
 
-        Reconciliation and live settings are reporting-only as a whole.
+        Reconciliation and live settings are reporting-only as a whole. With
+        ``instruments``, only those Instruments' price scales and
+        acknowledged-missing months count, and the free-text ``reason`` never
+        does, so an unrelated edit does not change the Dataset's identity.
         """
+        pairs = sorted(self.instruments if instruments is None else set(instruments))
         return {
             "instruments": {
-                pair: dataclasses.asdict(self.instruments[pair])
-                for pair in sorted(self.instruments)
+                pair: dataclasses.asdict(self.instruments[pair]) for pair in pairs
             },
             "acknowledged_missing": [
-                dataclasses.asdict(a) for a in self.build.acknowledged_missing
+                {"instrument": a.instrument, "month": a.month}
+                for a in self.build.acknowledged_missing
+                if a.instrument in pairs
             ],
             "rules": {
                 "gap": _content_view(self.gap_rule),

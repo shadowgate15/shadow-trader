@@ -11,7 +11,7 @@ import pytest
 
 from shadow_trader import main
 from shadow_trader.ingestion.bars import Bar
-from shadow_trader.ingestion.dataset import build_dataset
+from shadow_trader.ingestion.dataset import write_dataset
 from shadow_trader.ingestion.reconcile import ReconciliationRefused, reconcile
 
 from .test_dataset import make_config
@@ -54,8 +54,8 @@ def gap(i: int) -> Bar:
 
 
 def datasets(config, live, backfill, bar_size=5):
-    live_ref = build_dataset(config, bar_size, {"EURUSD": live}, source="replay")
-    back_ref = build_dataset(config, bar_size, {"EURUSD": backfill})
+    live_ref = write_dataset(config, bar_size, {"EURUSD": live}, source="replay")
+    back_ref = write_dataset(config, bar_size, {"EURUSD": backfill})
     return live_ref.dataset_id, back_ref.dataset_id
 
 
@@ -201,8 +201,8 @@ def test_mismatched_bar_size_instrument_or_schema_version_is_refused(tmp_path):
     config = make_config(tmp_path)
     series = [bar(i) for i in range(5)]
     live_id, back_id = datasets(config, series, series)
-    ten = build_dataset(config, 10, {"EURUSD": series}).dataset_id
-    other = build_dataset(
+    ten = write_dataset(config, 10, {"EURUSD": series}).dataset_id
+    other = write_dataset(
         config, 5, {"GBPUSD": [bar(i, "GBPUSD") for i in range(5)]}
     ).dataset_id
     manifest_path = config.paths.data_root / "datasets" / back_id / "manifest.json"
@@ -223,7 +223,7 @@ def test_cli_diff_writes_the_report_and_refuses_with_exit_1(tmp_path, capsys):
     config = make_config(tmp_path)
     series = [bar(i) for i in range(5)]
     live_id, back_id = datasets(config, series, series)
-    ten = build_dataset(config, 10, {"EURUSD": series}).dataset_id
+    ten = write_dataset(config, 10, {"EURUSD": series}).dataset_id
     base = ["ingest", "diff", "--config", str(tmp_path / "ingest.toml")]
 
     assert main([*base, "--live", live_id, "--backfill", back_id]) == 0

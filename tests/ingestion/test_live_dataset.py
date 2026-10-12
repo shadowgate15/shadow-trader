@@ -7,7 +7,7 @@ from decimal import Decimal
 
 from shadow_trader import main
 from shadow_trader.ingestion.bars import Quote
-from shadow_trader.ingestion.dataset import build_dataset, open_dataset
+from shadow_trader.ingestion.dataset import open_dataset, write_dataset
 from shadow_trader.ingestion.live import LiveIngester, SourceDown, SourceUp
 from shadow_trader.ingestion.livedataset import build_live
 from shadow_trader.ingestion.replay import ReplayAdapter
@@ -121,7 +121,7 @@ def test_manifest_records_live_source_raw_inputs_and_intervals(tmp_path):
 
 def test_a_live_dataset_never_takes_a_backfill_dataset_as_parent(tmp_path):
     config = record(tmp_path, [q(timedelta(minutes=1)), q(timedelta(hours=3))])
-    backfill = build_dataset(config, 5, make_bars(start=OPEN))
+    backfill = write_dataset(config, 5, make_bars(start=OPEN))
 
     live_ref = build_live(config, 5, OPEN, END)
 

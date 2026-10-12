@@ -17,6 +17,7 @@ file it supersedes.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -274,7 +275,7 @@ def _raw_inputs(data_root: Path, instruments: Iterable[str]) -> dict[str, str]:
     return found
 
 
-def build_dataset(
+def write_dataset(
     config: Config,
     bar_size: int,
     bars: Mapping[str, Sequence[Bar]],
@@ -293,7 +294,7 @@ def build_dataset(
     (latest) year of each Instrument is rewritten.
     """
     data_root = Path(config.paths.data_root)
-    rules = config.content_affecting()
+    rules = config.content_affecting(bars)
     ordered = {
         pair: sorted(series, key=lambda b: b.open_time)
         for pair, series in sorted(bars.items())
@@ -369,7 +370,11 @@ def build_dataset(
             if raw_inputs is not None
             else _raw_inputs(data_root, ordered)
         ),
-        "acknowledged_missing": rules["acknowledged_missing"],
+        "acknowledged_missing": [
+            dataclasses.asdict(a)
+            for a in config.build.acknowledged_missing
+            if a.instrument in ordered
+        ],
         "builder_version": _builder_version(),
         "builder_git_revision": builder_revision or _git_revision(),
         "gap_rules": gap_rules,

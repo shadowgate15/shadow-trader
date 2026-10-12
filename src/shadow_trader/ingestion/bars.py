@@ -11,15 +11,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from zoneinfo import ZoneInfo
 
 from .config import ConfigError, validate_bar_sizes
-
-NY = ZoneInfo("America/New_York")
-SESSION_HOURS = 120
-_ROLLOVER = time(17, 0)
+from .session import is_rollover, next_open, session_of, slots_per_session
 
 
 @dataclass(frozen=True)
@@ -50,23 +46,28 @@ class Bar:
     quality_flags: tuple[str, ...] = ()
 
 
-def _session_of(ts: datetime) -> tuple[datetime, datetime] | None:
-    """The (open, close) UTC pair of the Session containing ``ts``, if any."""
-    utc = ts.astimezone(UTC)
-    local = utc.astimezone(NY)
-    sunday = local.date() - timedelta(days=(local.weekday() + 1) % 7)
-    opened = datetime.combine(sunday, _ROLLOVER, tzinfo=NY).astimezone(UTC)
-    if utc < opened:
-        sunday -= timedelta(days=7)
-        opened = datetime.combine(sunday, _ROLLOVER, tzinfo=NY).astimezone(UTC)
-    closed = datetime.combine(sunday + timedelta(days=5), _ROLLOVER, tzinfo=NY)
-    closed = closed.astimezone(UTC)
-    return (opened, closed) if utc < closed else None
-
-
-def _next_open(opened: datetime) -> datetime:
-    sunday = opened.astimezone(NY).date() + timedelta(days=7)
-    return datetime.combine(sunday, _ROLLOVER, tzinfo=NY).astimezone(UTC)
+def gap_bar(
+    instrument: str,
+    open_time: datetime,
+    session_id: datetime,
+    quality_flags: tuple[str, ...] = (),
+) -> Bar:
+    """A null-priced Gap row for one in-Session slot."""
+    return Bar(
+        instrument=instrument,
+        open_time=open_time,
+        open=None,
+        high=None,
+        low=None,
+        close=None,
+        spread_close=None,
+        spread_mean=None,
+        tick_count=None,
+        is_gap=True,
+        session_id=session_id,
+        is_rollover=is_rollover(open_time),
+        quality_flags=quality_flags,
+    )
 
 
 class BarBuilder:
@@ -84,7 +85,7 @@ class BarBuilder:
             raise ConfigError("price_scale must not be negative")
         self.instrument = instrument
         self._size = timedelta(minutes=bar_minutes)
-        self._slots = SESSION_HOURS * 60 // bar_minutes
+        self._slots = slots_per_session(bar_minutes)
         self._factor = 10**price_scale
         self._open: datetime | None = None  # open of the cursor Session
         self._slot = 0  # next slot to close
@@ -97,7 +98,7 @@ class BarBuilder:
             raise ValueError("quote timestamp must be timezone-aware")
         bid = self._scaled(quote.bid)
         ask = self._scaled(quote.ask)
-        session = _session_of(quote.ts)
+        session = session_of(quote.ts)
         if session is None:
             self.dropped_out_of_session += 1
             return []
@@ -113,7 +114,7 @@ class BarBuilder:
         Earlier slots of the Session are never emitted, so they are not Gaps.
         Only valid before any quote or clock has moved the builder.
         """
-        session = _session_of(slot_start)
+        session = session_of(slot_start)
         if self._open is not None or session is None:
             raise ValueError("start_at needs a fresh builder and an in-Session slot")
         self._open = session[0]
@@ -127,7 +128,7 @@ class BarBuilder:
         """
         if ts.tzinfo is None:
             raise ValueError("timestamp must be timezone-aware")
-        session = _session_of(ts)
+        session = session_of(ts)
         if session is None:
             out: list[Bar] = []
             if self._open is not None:
@@ -149,7 +150,7 @@ class BarBuilder:
             )
         while self._open != opened:
             self._close_through(self._slots, out)
-            self._open = _next_open(self._open)
+            self._open = next_open(self._open)
             self._slot = 0
         self._close_through(slot, out)
         return out
@@ -174,26 +175,11 @@ class BarBuilder:
     def _emit(self) -> Bar:
         assert self._open is not None
         start = self._open + self._slot * self._size
-        local = start.astimezone(NY)
-        rollover = local.time() == _ROLLOVER and local.weekday() < 4
         ticks = sorted(self._pending, key=lambda t: t[0])  # stable: arrival ties
         self._pending = []
         self._slot += 1
         if not ticks:
-            return Bar(
-                open=None,
-                high=None,
-                low=None,
-                close=None,
-                spread_close=None,
-                spread_mean=None,
-                tick_count=None,
-                is_gap=True,
-                instrument=self.instrument,
-                open_time=start,
-                session_id=self._open,
-                is_rollover=rollover,
-            )
+            return gap_bar(self.instrument, start, self._open)
         bids = [b for _, b, _ in ticks]
         spreads = [a - b for _, b, a in ticks]
         return Bar(
@@ -208,7 +194,7 @@ class BarBuilder:
             instrument=self.instrument,
             open_time=start,
             session_id=self._open,
-            is_rollover=rollover,
+            is_rollover=is_rollover(start),
         )
 
 
@@ -224,4 +210,4 @@ def build_bars(
     return bars, builder.dropped_out_of_session
 
 
-__all__ = ["Bar", "BarBuilder", "Quote", "build_bars"]
+__all__ = ["Bar", "BarBuilder", "Quote", "build_bars", "gap_bar"]

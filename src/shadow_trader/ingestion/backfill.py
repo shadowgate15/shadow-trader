@@ -15,17 +15,23 @@ import io
 import zipfile
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from . import dataset
 from .anomaly import FlaggingBarBuilder, summarize_flags
 from .bars import Bar, Quote
-from .config import DEFAULT_START, Config, validate_bar_sizes
+from .config import (
+    DEFAULT_START,
+    Config,
+    ConfigError,
+    last_complete_month,
+    to_month,
+    validate_bar_sizes,
+)
 from .dataset import DatasetRef, RawCache
-from .gaps import flag_suspected_outages, source_missing_bars
+from .gaps import flag_suspected_outages, month_bounds, source_missing_bars
 from .report import (
     WARNING_CODES,
     Alignment,
@@ -33,9 +39,8 @@ from .report import (
     write_build_report,
     write_failed_report,
 )
+from .session import NY, open_of, week_sunday
 from .sources import SOURCE, months_between
-
-NY = ZoneInfo("America/New_York")
 
 
 class BuildFailure(Exception):
@@ -69,7 +74,7 @@ class BackfillResult:
     report_path: Path | None = None
 
 
-def _raw_month(cache: RawCache, instrument: str, period: str) -> str:
+def read_raw_month(cache: RawCache, instrument: str, period: str) -> str:
     """Text of one raw month; a missing, corrupt or empty month fails the build."""
     path = cache.path_for(SOURCE, instrument, period, "zip")
     if not path.exists():
@@ -109,12 +114,10 @@ _WEEK_LEAD = timedelta(hours=6)  # ticks this close before the open join the wee
 
 def _week_open(ts: datetime) -> datetime:
     """UTC weekly open (Sunday 17:00 New York) of the week ``ts`` belongs to."""
-    local = ts.astimezone(NY)
-    sunday = local.date() - timedelta(days=(local.weekday() + 1) % 7)
-    opened = datetime.combine(sunday, time(17, 0), tzinfo=NY).astimezone(UTC)
+    sunday = week_sunday(ts.astimezone(NY).date())
+    opened = open_of(sunday)
     if ts < opened - _WEEK_LEAD:
-        sunday -= timedelta(days=7)
-        opened = datetime.combine(sunday, time(17, 0), tzinfo=NY).astimezone(UTC)
+        opened = open_of(sunday - timedelta(days=7))
     return opened
 
 
@@ -140,7 +143,7 @@ def _alignment_warning(
     )
 
 
-def _parse(text: str, label: str, price_scale: int) -> Iterator[Quote]:
+def parse_ticks(text: str, label: str, price_scale: int) -> Iterator[Quote]:
     for row, line in enumerate(text.splitlines(), start=1):
         where = f"{label} row {row}"
         try:
@@ -168,15 +171,19 @@ def _parse(text: str, label: str, price_scale: int) -> Iterator[Quote]:
         yield Quote(ts, quote_bid, quote_ask)
 
 
-def build_backfill(config: Config, bar_size: int) -> BackfillResult:
+def build_backfill(
+    config: Config, bar_size: int, *, now: datetime | None = None
+) -> BackfillResult:
     """Build one Dataset (all configured Instruments) at ``bar_size`` minutes.
 
     A failed build writes a failure report under ``<data_root>/reports/failed``
-    (no Dataset directory exists) and re-raises ``BuildFailure``.
+    (no Dataset directory exists) and re-raises ``BuildFailure``. Without a
+    configured end month the range runs to the last complete UTC month before
+    ``now`` (default: the current time).
     """
     validate_bar_sizes((bar_size,))
     try:
-        return _build(config, bar_size)
+        return _build(config, bar_size, now or datetime.now(UTC))
     except BuildFailure as failure:
         # an unwritable report must not mask the failure itself
         with contextlib.suppress(OSError):
@@ -186,10 +193,24 @@ def build_backfill(config: Config, bar_size: int) -> BackfillResult:
         raise
 
 
-def _build(config: Config, bar_size: int) -> BackfillResult:
+def build_dataset(config: Config, bar_size: int) -> DatasetRef:
+    """Build a backfill Dataset at ``bar_size`` from the raw cache (spec API).
+
+    The CLI ``build`` command and this share ``build_backfill``; use that for
+    the warnings and the build report.
+    """
+    return build_backfill(config, bar_size).ref
+
+
+def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
     cache = RawCache(config.paths.data_root)
     build = config.build
-    end = build.end or build.start
+    end = build.end or last_complete_month(now)
+    if end < build.start:
+        raise ConfigError(
+            f"build.start {build.start} is after the last complete month {end}"
+        )
+    lo, hi = month_bounds(build.start)[0], month_bounds(end)[1]
     series: dict[str, list[Bar]] = {}
     warnings: list[BuildWarning] = []
     dropped: dict[str, int] = {}
@@ -205,13 +226,13 @@ def _build(config: Config, bar_size: int) -> BackfillResult:
         }
         missing: dict[datetime, Bar] = {}
         for period in months_between(build.start, end):
-            month = f"{period[:4]}-{period[4:]}"
+            month = to_month(period)
             if month in acknowledged:
                 for gap in source_missing_bars(instrument, month, bar_size):
                     missing[gap.open_time] = gap
                 continue
-            text = _raw_month(cache, instrument, period)
-            if f"{period[:4]}-{period[4:]}" < DEFAULT_START:
+            text = read_raw_month(cache, instrument, period)
+            if month < DEFAULT_START:
                 warnings.append(
                     BuildWarning(
                         "thin_data",
@@ -220,10 +241,18 @@ def _build(config: Config, bar_size: int) -> BackfillResult:
                         f"{instrument}/{period}",
                     )
                 )
-            for quote in _parse(text, f"{instrument}/{period}", scale):
+            label = f"{instrument}/{period}"
+            for row, quote in enumerate(parse_ticks(text, label, scale), start=1):
                 first_ticks.setdefault(_week_open(quote.ts), quote.ts)
-                bars.extend(builder.push(quote))
+                try:
+                    bars.extend(builder.push(quote))
+                except ValueError as exc:
+                    where = f"{label} row {row}"
+                    raise BuildFailure(
+                        f"ticks out of order at {where}: {exc}", where
+                    ) from None
         bars.extend(builder.flush())
+        bars = [bar for bar in bars if lo <= bar.open_time < hi]
         for opened, first in first_ticks.items():
             if (off := _alignment_warning(instrument, opened, first)) is not None:
                 warnings.append(off[0])
@@ -253,7 +282,15 @@ def _build(config: Config, bar_size: int) -> BackfillResult:
                     instrument,
                 )
             )
-    ref = dataset.build_dataset(config, bar_size, series, tick_flag_counts=tick_flags)
+    ref = dataset.write_dataset(
+        config,
+        bar_size,
+        series,
+        parent=dataset.latest_dataset(
+            config.paths.data_root, SOURCE, bar_size, build.instruments
+        ),
+        tick_flag_counts=tick_flags,
+    )
     report_path = write_build_report(
         ref.path,
         build_report(

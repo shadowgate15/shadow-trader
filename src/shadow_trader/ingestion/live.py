@@ -13,11 +13,11 @@ import logging
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from .anomaly import FlaggingBarBuilder
-from .bars import NY, Bar, Quote, _next_open, _session_of
+from .bars import Bar, Quote
 from .config import Config
 from .gaps import with_flag
 from .rawlog import RawQuoteLog
@@ -29,6 +29,7 @@ from .report import (
     write_live_report,
 )
 from .revisions import RevisionLog
+from .session import next_open, session_of, upcoming_open
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,16 @@ class SourceInterval:
     reason: str  # "adapter" (reported by the adapter) or "between_runs"
 
 
+def overlaps_interval(
+    open_time: datetime,
+    size: timedelta,
+    start: datetime,
+    end: datetime | None,
+) -> bool:
+    """Whether the slot at ``open_time`` overlaps ``[start, end)`` (None: open)."""
+    return start < open_time + size and (end is None or end > open_time)
+
+
 log = logging.getLogger(__name__)
 
 
@@ -92,6 +103,10 @@ class _ClosedSlot:
     revision: int = 0
 
 
+def _discard(bar: Bar, revision: int) -> None:
+    """The default sink: Bars are still kept in ``LiveIngester.revisions``."""
+
+
 class LiveIngester:
     """Turns one Instrument's quote stream into closed Bars at one bar size."""
 
@@ -100,7 +115,7 @@ class LiveIngester:
         config: Config,
         adapter: QuoteStream,
         *,
-        sink: BarSink,
+        sink: BarSink = _discard,
         bar_size: int | None = None,
         start: datetime | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -125,7 +140,6 @@ class LiveIngester:
         self._watermark: datetime | None = None
         self._cursor: datetime | None = None  # start of the next slot to close
         self._pending: dict[datetime, list[Quote]] = {}
-        self._last_session_close: datetime | None = None
         self._closed: dict[datetime, _ClosedSlot] = {}  # unsealed, in slot order
         self._down_since: datetime | None = None
         self.late_dropped = 0
@@ -154,18 +168,20 @@ class LiveIngester:
     def _slot_at_or_after(self, start: datetime) -> datetime:
         """The first slot opening at or after ``start``, skipping the closure."""
         start = start.astimezone(UTC)
-        session = _session_of(start)
+        session = session_of(start)
         if session is not None:
             first = session[0] + -((session[0] - start) // self._size) * self._size
             if first < session[1]:
                 return first
-            return _next_open(session[0])
-        local = start.astimezone(NY)
-        sunday = local.date() + timedelta(days=(6 - local.weekday()) % 7)
-        return datetime.combine(sunday, time(17, 0), tzinfo=NY).astimezone(UTC)
+            return next_open(session[0])
+        return upcoming_open(start)
 
     def run(self) -> None:
-        """Consume the adapter's stream to its end, emitting Bars to the sink."""
+        """Consume the adapter's stream to its end, emitting Bars to the sink.
+
+        Only slots the watermark has closed are emitted: the end of a stream is
+        not time passing, so it never invents the rest of the Session.
+        """
         self._begin_run()
         try:
             for event in self._adapter.events():
@@ -173,7 +189,6 @@ class LiveIngester:
                 if self._stopped:
                     self._report("stopped")  # clean shutdown: closed slots only
                     return
-            self._finish()
             self._report("finished")
         finally:
             self._rawlog.close()
@@ -294,13 +309,12 @@ class LiveIngester:
     def _on_quote(self, quote: Quote) -> None:
         if self._record:
             self._rawlog.append(quote, self._clock())
-        session = _session_of(quote.ts)
+        session = session_of(quote.ts)
         if session is None:
             self.dropped_out_of_session += 1
         else:
             if self._cursor is None:
                 self._cursor = session[0]
-            self._last_session_close = session[1]
             slot = self._slot_of(quote.ts)
             if self._first_slot is not None and slot < self._first_slot:
                 pass  # before the start: not part of this run's grid
@@ -349,7 +363,7 @@ class LiveIngester:
             del self._closed[slot]
 
     def _slot_of(self, ts: datetime) -> datetime:
-        session = _session_of(ts)
+        session = session_of(ts)
         assert session is not None
         utc = ts.astimezone(UTC)
         return session[0] + (utc - session[0]) // self._size * self._size
@@ -363,15 +377,6 @@ class LiveIngester:
             if end + self._grace > self._watermark:
                 return
             self._close(slot)
-
-    def _finish(self) -> None:
-        """End of stream: close the rest of the last Session, as a backfill does."""
-        while (
-            self._cursor is not None
-            and self._last_session_close is not None
-            and self._cursor < self._last_session_close
-        ):
-            self._close(self._cursor, repairable=False)
 
     def _close(self, slot: datetime, *, repairable: bool = True) -> None:
         snapshot = copy.deepcopy(self._builder) if repairable else self._builder
@@ -404,9 +409,8 @@ class LiveIngester:
         """
         if not bar.is_gap:
             return bar
-        end = bar.open_time + self._size
         if any(
-            i.start < end and (i.end is None or i.end > bar.open_time)
+            overlaps_interval(bar.open_time, self._size, i.start, i.end)
             for i in self.outages
         ):
             return with_flag(bar, "suspected_outage")
@@ -430,10 +434,10 @@ class LiveIngester:
                 self._emit(bar, closed.revision)
 
     def _after(self, slot: datetime) -> datetime:
-        session = _session_of(slot)
+        session = session_of(slot)
         assert session is not None
         nxt = slot + self._size
-        return nxt if nxt < session[1] else _next_open(session[0])
+        return nxt if nxt < session[1] else next_open(session[0])
 
 
 __all__ = [
@@ -444,4 +448,5 @@ __all__ = [
     "QuoteStream",
     "SourceDown",
     "SourceUp",
+    "overlaps_interval",
 ]
