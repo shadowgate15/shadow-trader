@@ -103,19 +103,43 @@ class BarBuilder:
             return []
         opened = session[0]
         slot = int((quote.ts.astimezone(UTC) - opened) // self._size)
+        out = self._move_to(opened, slot, quote.ts)
+        self._pending.append((quote.ts.astimezone(UTC), bid, ask))
+        return out
+
+    def advance(self, ts: datetime) -> list[Bar]:
+        """Close every slot that ends at or before ``ts``; no tick is added.
+
+        This is how a clock (a heartbeat or watermark) closes empty slots as
+        Gaps. A ``ts`` in the weekly closure closes the rest of the Session.
+        """
+        if ts.tzinfo is None:
+            raise ValueError("timestamp must be timezone-aware")
+        session = _session_of(ts)
+        if session is None:
+            out: list[Bar] = []
+            if self._open is not None:
+                self._close_through(self._slots, out)
+            return out
+        opened = session[0]
+        slot = int((ts.astimezone(UTC) - opened) // self._size)
+        if self._open is not None and (opened, slot) < (self._open, self._slot):
+            return []  # a clock running behind the grid is a no-op
+        return self._move_to(opened, slot, ts)
+
+    def _move_to(self, opened: datetime, slot: int, ts: datetime) -> list[Bar]:
         out: list[Bar] = []
         if self._open is None:
             self._open = opened
         elif (opened, slot) < (self._open, self._slot):
             raise ValueError(
-                f"quote at {quote.ts.isoformat()} falls in an already closed slot"
+                f"quote at {ts.isoformat()} falls in an already closed slot"
             )
         while self._open != opened:
             self._close_through(self._slots, out)
             self._open = _next_open(self._open)
             self._slot = 0
         self._close_through(slot, out)
-        self._pending.append((quote.ts.astimezone(UTC), bid, ask))
         return out
 
     def flush(self) -> list[Bar]:
