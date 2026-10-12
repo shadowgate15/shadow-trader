@@ -11,7 +11,7 @@ import json
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -34,9 +34,12 @@ OUTAGE_RUN_CAP = 200
 
 
 class WarningEntry(Protocol):
-    code: str
-    message: str
-    locator: str | None
+    @property
+    def code(self) -> str: ...
+    @property
+    def message(self) -> str: ...
+    @property
+    def locator(self) -> str | None: ...
 
 
 @dataclass(frozen=True)
@@ -172,6 +175,45 @@ def build_report(
         "raw_inputs": dict(raw_inputs or {}),
         "config": resolved_config(config) if config else None,
     }
+
+
+def console_summary(report: Mapping[str, Any], path: Path) -> list[str]:
+    """Console lines derived from a report's JSON (never stored).
+
+    One line per warning code with its count, then the artifact path; a failed
+    report leads with the failing condition and locator.
+    """
+    lines: list[str] = []
+    if report["status"] == "failed":
+        where = f" ({report['locator']})" if report.get("locator") else ""
+        lines.append(f"build failed: {report['condition']}{where}")
+    else:
+        counts: dict[str, int] = {}
+        for warning in report["warnings"]:
+            counts[warning["code"]] = counts.get(warning["code"], 0) + 1
+        lines.extend(f"warning: {code} x{counts[code]}" for code in counts)
+    lines.append(f"report: {path}")
+    return lines
+
+
+def write_failed_report(
+    data_root: Path, bar_size: int, condition: str, locator: str | None
+) -> Path:
+    """Record a failed build under ``<data_root>/reports/failed``."""
+    now = datetime.now(UTC)
+    path = Path(data_root) / "reports" / "failed" / f"{now:%Y%m%dT%H%M%S%fZ}.json"
+    _write_json(
+        path,
+        {
+            "report_version": REPORT_VERSION,
+            "status": "failed",
+            "bar_size": bar_size,
+            "condition": condition,
+            "locator": locator,
+            "failed_at": now.isoformat(),
+        },
+    )
+    return path
 
 
 def write_build_report(dataset_path: Path, report: Mapping[str, Any]) -> Path:

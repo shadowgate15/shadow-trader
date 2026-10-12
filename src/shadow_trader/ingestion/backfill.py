@@ -10,12 +10,14 @@ price scale, fails the build naming file and row. Everything else suspect
 
 from __future__ import annotations
 
+import contextlib
 import io
 import zipfile
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from . import dataset
@@ -24,7 +26,13 @@ from .bars import Bar, Quote
 from .config import DEFAULT_START, Config, validate_bar_sizes
 from .dataset import DatasetRef, RawCache
 from .gaps import flag_suspected_outages, source_missing_bars
-from .report import WARNING_CODES, Alignment, build_report, write_build_report
+from .report import (
+    WARNING_CODES,
+    Alignment,
+    build_report,
+    write_build_report,
+    write_failed_report,
+)
 from .sources import SOURCE, months_between
 
 NY = ZoneInfo("America/New_York")
@@ -39,6 +47,7 @@ class BuildFailure(Exception):
     def __init__(self, message: str, locator: str | None = None) -> None:
         super().__init__(message)
         self.locator = locator
+        self.report_path: Path | None = None  # the failure report, once written
 
 
 @dataclass(frozen=True)
@@ -57,21 +66,28 @@ class BackfillResult:
     ref: DatasetRef
     warnings: tuple[BuildWarning, ...] = field(default=())
     dropped_out_of_session: Mapping[str, int] = field(default_factory=dict)
+    report_path: Path | None = None
 
 
 def _raw_month(cache: RawCache, instrument: str, period: str) -> str:
     """Text of one raw month; a missing, corrupt or empty month fails the build."""
     path = cache.path_for(SOURCE, instrument, period, "zip")
     if not path.exists():
-        raise BuildFailure(f"raw month missing: {instrument} {period}")
+        raise BuildFailure(
+            f"raw month missing: {instrument} {period}", f"{instrument}/{period}"
+        )
     member = f"DAT_ASCII_{instrument}_T_{period}.csv"
     try:
         with zipfile.ZipFile(io.BytesIO(path.read_bytes())) as archive:
             text = archive.read(member).decode()
     except (zipfile.BadZipFile, KeyError, UnicodeDecodeError):
-        raise BuildFailure(f"raw month corrupt: {instrument} {period}") from None
+        raise BuildFailure(
+            f"raw month corrupt: {instrument} {period}", f"{instrument}/{period}"
+        ) from None
     if not text.strip():
-        raise BuildFailure(f"raw month empty: {instrument} {period}")
+        raise BuildFailure(
+            f"raw month empty: {instrument} {period}", f"{instrument}/{period}"
+        )
     return text
 
 
@@ -134,23 +150,43 @@ def _parse(text: str, label: str, price_scale: int) -> Iterator[Quote]:
             )
             quote_bid, quote_ask = Decimal(bid), Decimal(ask)
         except (ValueError, InvalidOperation):
-            raise BuildFailure(f"unparseable tick at {where}: {line!r}") from None
+            raise BuildFailure(
+                f"unparseable tick at {where}: {line!r}", where
+            ) from None
         if any((price * 10**price_scale) % 1 != 0 for price in (quote_bid, quote_ask)):
             raise BuildFailure(
                 f"tick has more precision than price scale {price_scale} "
-                f"at {where}: {line!r}"
+                f"at {where}: {line!r}",
+                where,
             )
         ts = _to_utc(naive)
         if ts is None:
             raise BuildFailure(
-                f"ambiguous or nonexistent New York local time {stamp} at {where}"
+                f"ambiguous or nonexistent New York local time {stamp} at {where}",
+                where,
             )
         yield Quote(ts, quote_bid, quote_ask)
 
 
 def build_backfill(config: Config, bar_size: int) -> BackfillResult:
-    """Build one Dataset (all configured Instruments) at ``bar_size`` minutes."""
+    """Build one Dataset (all configured Instruments) at ``bar_size`` minutes.
+
+    A failed build writes a failure report under ``<data_root>/reports/failed``
+    (no Dataset directory exists) and re-raises ``BuildFailure``.
+    """
     validate_bar_sizes((bar_size,))
+    try:
+        return _build(config, bar_size)
+    except BuildFailure as failure:
+        # an unwritable report must not mask the failure itself
+        with contextlib.suppress(OSError):
+            failure.report_path = write_failed_report(
+                config.paths.data_root, bar_size, str(failure), failure.locator
+            )
+        raise
+
+
+def _build(config: Config, bar_size: int) -> BackfillResult:
     cache = RawCache(config.paths.data_root)
     build = config.build
     end = build.end or build.start
@@ -217,10 +253,8 @@ def build_backfill(config: Config, bar_size: int) -> BackfillResult:
                     instrument,
                 )
             )
-    ref = dataset.build_dataset(
-        config, bar_size, series, tick_flag_counts=tick_flags
-    )
-    write_build_report(
+    ref = dataset.build_dataset(config, bar_size, series, tick_flag_counts=tick_flags)
+    report_path = write_build_report(
         ref.path,
         build_report(
             dataset_id=ref.dataset_id,
@@ -234,4 +268,4 @@ def build_backfill(config: Config, bar_size: int) -> BackfillResult:
             config=config,
         ),
     )
-    return BackfillResult(ref, tuple(warnings), dropped)
+    return BackfillResult(ref, tuple(warnings), dropped, report_path)

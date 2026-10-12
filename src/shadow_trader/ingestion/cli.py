@@ -8,6 +8,7 @@ values; argparse rejects any other flag with exit code 2.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from collections.abc import Sequence
@@ -16,6 +17,7 @@ from pathlib import Path
 from shadow_trader.ingestion.backfill import BuildFailure, build_backfill
 from shadow_trader.ingestion.config import Config, ConfigError, load_config
 from shadow_trader.ingestion.dataset import RawCache
+from shadow_trader.ingestion.report import console_summary
 from shadow_trader.ingestion.sources import (
     Transport,
     UrllibTransport,
@@ -96,11 +98,18 @@ def _run_build(config: Config) -> int:
     try:
         for bar_size in config.build.bar_sizes:
             result = build_backfill(config, bar_size)
-            for warning in result.warnings:
-                print(f"warning: {warning.code}: {warning.message}")
             print(f"built {bar_size} min dataset {result.ref.dataset_id}")
+            assert result.report_path is not None
+            report = json.loads(result.report_path.read_text())
+            for line in console_summary(report, result.report_path):
+                print(line)
     except BuildFailure as exc:
-        print(f"build failed: {exc}", file=sys.stderr)
+        if exc.report_path is not None:
+            report = json.loads(exc.report_path.read_text())
+            for line in console_summary(report, exc.report_path):
+                print(line, file=sys.stderr)
+        else:
+            print(f"build failed: {exc}", file=sys.stderr)
         return EXIT_BUILD_FAILURE
     return EXIT_OK
 

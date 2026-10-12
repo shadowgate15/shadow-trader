@@ -101,8 +101,7 @@ def test_build_report_lists_only_off_weeks_with_the_observed_offset(
     alignment = read_report(build())["instruments"]["EURUSD"]["session_alignment"]
 
     assert [
-        (a["week"], a["offset_minutes"], a["wrong_offset_signature"])
-        for a in alignment
+        (a["week"], a["offset_minutes"], a["wrong_offset_signature"]) for a in alignment
     ] == expected
 
 
@@ -157,6 +156,125 @@ def test_reporting_only_changes_alter_the_report_but_never_the_dataset_id(tmp_pa
     assert flags["alert_exceeded"] is False
     assert flags["alert_fraction"] == 1.0
     assert not any("report" in p["path"] for p in second.ref.manifest["partitions"])
+
+
+def failed_reports(tmp_path):
+    return sorted((tmp_path / "data" / "reports" / "failed").glob("*.json"))
+
+
+def test_missing_raw_month_writes_a_failure_report_and_no_dataset(tmp_path):
+    from shadow_trader.ingestion.backfill import build_backfill
+    from tests.ingestion.test_backfill import make_config
+
+    config = make_config(tmp_path, "EURUSD", "2024-01")
+
+    with pytest.raises(BuildFailure) as raised:
+        build_backfill(config, 5)
+
+    [path] = failed_reports(tmp_path)
+    report = json.loads(path.read_text())
+    assert report["report_version"] == 1
+    assert report["status"] == "failed"
+    assert "raw month missing" in report["condition"]
+    assert report["locator"] == "EURUSD/202401"
+    assert report["bar_size"] == 5
+    assert raised.value.report_path == path
+    assert not (tmp_path / "data" / "datasets").exists()
+
+
+@pytest.mark.parametrize(
+    ("lines", "locator"),
+    [
+        (["20240107 170000000,1.1,1.1001,0", "garbage"], "EURUSD/202401 row 2"),
+        (
+            ["20240107 170000000,1.1,1.1001,0", "20240107 170001000,1.100005,1.1,0"],
+            "EURUSD/202401 row 2",
+        ),
+        (["20240310 023000000,1.1,1.1001,0"], "EURUSD/202403 row 1"),
+    ],
+)
+def test_row_failures_locate_the_file_and_row(tmp_path, lines, locator):
+    month = "2024-03" if locator.endswith("202403 row 1") else "2024-01"
+    _, build = build_csv(tmp_path, "EURUSD", month, lines)
+
+    with pytest.raises(BuildFailure):
+        build()
+
+    [path] = failed_reports(tmp_path)
+    assert json.loads(path.read_text())["locator"] == locator
+
+
+def test_console_summary_has_one_line_per_warning_code_then_the_path():
+    from pathlib import Path
+
+    from shadow_trader.ingestion.report import console_summary
+
+    warnings = [
+        {"code": "thin_data", "message": "a", "locator": "EURUSD/200812"},
+        {"code": "session_alignment", "message": "b", "locator": "EURUSD/week-1"},
+        {"code": "thin_data", "message": "c", "locator": "EURUSD/200901"},
+    ]
+    report = {"status": "ok", "warnings": warnings}
+
+    assert console_summary(report, Path("/x/build-report.json")) == [
+        "warning: thin_data x2",
+        "warning: session_alignment x1",
+        "report: /x/build-report.json",
+    ]
+    assert console_summary({"status": "ok", "warnings": []}, Path("/y.json")) == [
+        "report: /y.json"
+    ]
+
+
+def test_console_summary_of_a_failure_names_condition_and_locator():
+    from pathlib import Path
+
+    from shadow_trader.ingestion.report import console_summary
+
+    report = {"status": "failed", "condition": "boom", "locator": "EURUSD/202401"}
+
+    assert console_summary(report, Path("/f.json")) == [
+        "build failed: boom (EURUSD/202401)",
+        "report: /f.json",
+    ]
+
+
+def test_cli_summarises_a_warnings_only_build_from_its_json_and_exits_0(
+    tmp_path, capsys
+):
+    from shadow_trader import main
+    from shadow_trader.ingestion.report import console_summary
+    from tests.ingestion.test_backfill import cli_config, install_raw
+
+    path, config = cli_config(tmp_path, "2008-12", "[5]")
+    install_raw(config, "EURUSD", "200812", b"20081207 170000000,1.30000,1.30010,0\n")
+
+    assert main(["ingest", "build", "--config", str(path)]) == 0
+
+    out = capsys.readouterr().out.splitlines()
+    [dataset] = (config.paths.data_root / "datasets").iterdir()
+    artifact = dataset / "build-report.json"
+    expected = console_summary(json.loads(artifact.read_text()), artifact)
+    assert expected[0] == "warning: thin_data x1"
+    assert out[-len(expected) :] == expected
+    assert not (dataset / "console-summary.txt").exists()
+
+
+def test_cli_failed_build_exits_1_names_the_failure_report_and_leaves_no_dataset(
+    tmp_path, capsys
+):
+    from shadow_trader import main
+    from tests.ingestion.test_backfill import cli_config
+
+    path, config = cli_config(tmp_path)
+
+    assert main(["ingest", "build", "--config", str(path)]) == 1
+
+    [report] = (config.paths.data_root / "reports" / "failed").glob("*.json")
+    err = capsys.readouterr().err
+    assert "raw month missing" in err
+    assert f"report: {report}" in err
+    assert not (config.paths.data_root / "datasets").exists()
 
 
 def gap_run_series(runs):
