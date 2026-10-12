@@ -7,7 +7,7 @@ from decimal import Decimal
 
 from shadow_trader import main
 from shadow_trader.ingestion.bars import Quote
-from shadow_trader.ingestion.dataset import write_dataset, open_dataset
+from shadow_trader.ingestion.dataset import open_dataset, write_dataset
 from shadow_trader.ingestion.live import LiveIngester, SourceDown, SourceUp
 from shadow_trader.ingestion.livedataset import build_live
 from shadow_trader.ingestion.replay import ReplayAdapter

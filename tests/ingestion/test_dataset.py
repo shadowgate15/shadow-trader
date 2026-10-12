@@ -11,7 +11,7 @@ import pytest
 
 from shadow_trader.ingestion.bars import Quote, build_bars
 from shadow_trader.ingestion.config import Config, load_config
-from shadow_trader.ingestion.dataset import DatasetError, write_dataset, open_dataset
+from shadow_trader.ingestion.dataset import DatasetError, open_dataset, write_dataset
 
 # Winter Session opening Sun 2024-01-07 22:00 UTC.
 WINTER = datetime(2024, 1, 7, 22, 0, tzinfo=UTC)
