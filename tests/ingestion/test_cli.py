@@ -1,8 +1,12 @@
+import io
+import zipfile
 from pathlib import Path
 
 import pytest
 
 from shadow_trader import main
+from shadow_trader.ingestion import cli
+from shadow_trader.ingestion.sources import Response
 
 SUBCOMMANDS = ("fetch", "build", "live", "build-live", "diff")
 
@@ -37,8 +41,8 @@ def test_ingest_help_lists_the_five_subcommands(capsys):
         assert name in out
 
 
-@pytest.mark.parametrize("command", SUBCOMMANDS)
-def test_every_subcommand_takes_config(command, config_path, capsys):
+@pytest.mark.parametrize("command", [c for c in SUBCOMMANDS if c != "fetch"])
+def test_every_stub_subcommand_takes_config(command, config_path, capsys):
     extra = ["--from", "2024-01", "--to", "2024-02"] if command == "build-live" else []
 
     code = run(["ingest", command, "--config", str(config_path), *extra])
@@ -124,3 +128,68 @@ def test_overriding_a_rule_value_is_rejected(flag, config_path, capsys):
 
     assert code == 2
     assert flag in capsys.readouterr().err
+
+
+class FakeTransport:
+    def __init__(self, reply):
+        self.reply = reply
+        self.posts = 0
+
+    def get(self, url, headers):
+        return Response(200, b'<input type="hidden" name="tk" value="T">', {})
+
+    def post(self, url, form, headers):
+        self.posts += 1
+        return self.reply
+
+
+def fetch_config(tmp_path: Path) -> Path:
+    path = tmp_path / "fetch.toml"
+    path.write_text(
+        f'[paths]\ndata_root = "{tmp_path / "data"}"\n'
+        '[build]\ninstruments = ["EURUSD"]\nstart = "2024-03"\nend = "2024-03"\n'
+    )
+    return path
+
+
+def test_fetch_downloads_into_the_cache_and_exits_0(tmp_path, monkeypatch, capsys):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("DAT_ASCII_EURUSD_T_202403.csv", b"x")
+    transport = FakeTransport(Response(200, buf.getvalue(), {}))
+    monkeypatch.setattr(cli, "make_transport", lambda: transport)
+    monkeypatch.setattr(cli, "_sleep", lambda s: None)
+
+    code = run(["ingest", "fetch", "--config", str(fetch_config(tmp_path))])
+
+    assert code == 0
+    assert (tmp_path / "data/raw/histdata/EURUSD/202403.zip").read_bytes() == (
+        buf.getvalue()
+    )
+    assert "fetched 1" in capsys.readouterr().out
+
+
+def test_fetch_exits_1_when_a_download_is_rejected(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli, "make_transport", lambda: FakeTransport(Response(200, b"not a zip", {}))
+    )
+    monkeypatch.setattr(cli, "_sleep", lambda s: None)
+
+    code = run(["ingest", "fetch", "--config", str(fetch_config(tmp_path))])
+
+    assert code == 1
+    assert "202403" in capsys.readouterr().err
+
+
+def test_fetch_reports_absent_months_as_warnings_with_exit_0(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        cli, "make_transport", lambda: FakeTransport(Response(200, b"", {}))
+    )
+    monkeypatch.setattr(cli, "_sleep", lambda s: None)
+
+    code = run(["ingest", "fetch", "--config", str(fetch_config(tmp_path))])
+
+    assert code == 0
+    assert "absent" in capsys.readouterr().out
