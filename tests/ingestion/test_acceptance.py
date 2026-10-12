@@ -198,8 +198,9 @@ def test_real_eurusd_replay_live_sealed_bars_equal_batch(tmp_path):
 
     built = build_backfill(config, 5)
     batch = open_dataset(config.paths.data_root, built.ref.dataset_id).read("EURUSD")
-    # every week's raw clock was inferred, so no week is off the 17:00 open
-    assert not [w for w in built.warnings if w.code == "session_alignment"]
+    # every week's raw clock was inferred, so no week looks hour-shifted (a late
+    # holiday open, like the New Year Monday, still warns but is no signature)
+    assert not [w for w in built.warnings if "wrong-offset" in w.message]
     started = time.monotonic()
     ingester, sealed = replay_bars(config, 5)
     print(
