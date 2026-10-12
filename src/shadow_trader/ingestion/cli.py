@@ -11,17 +11,17 @@ import argparse
 import json
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-from shadow_trader.ingestion.backfill import BuildFailure, build_backfill
-from shadow_trader.ingestion.config import Config, ConfigError, load_config
-from shadow_trader.ingestion.dataset import DatasetError, RawCache
-from shadow_trader.ingestion.livedataset import build_live
-from shadow_trader.ingestion.reconcile import ReconciliationRefused, reconcile
-from shadow_trader.ingestion.report import console_summary
-from shadow_trader.ingestion.sources import (
+from .backfill import BuildFailure, build_backfill
+from .config import Config, ConfigError, load_config
+from .dataset import DatasetError, RawCache
+from .livedataset import build_live
+from .reconcile import ReconciliationRefused, reconcile
+from .report import console_summary
+from .sources import (
     Transport,
     UrllibTransport,
     fetch_months,
@@ -96,7 +96,7 @@ def make_transport() -> Transport:
 _sleep = time.sleep
 
 
-def _run_fetch(config: Config) -> int:
+def _run_fetch(config: Config, args: argparse.Namespace) -> int:
     report = fetch_months(
         RawCache(config.paths.data_root),
         make_transport(),
@@ -116,7 +116,7 @@ def _run_fetch(config: Config) -> int:
     return EXIT_OK if report.ok else EXIT_BUILD_FAILURE
 
 
-def _run_build(config: Config) -> int:
+def _run_build(config: Config, args: argparse.Namespace) -> int:
     try:
         for bar_size in config.build.bar_sizes:
             result = build_backfill(config, bar_size)
@@ -163,6 +163,20 @@ def _run_diff(config: Config, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _run_live(config: Config, args: argparse.Namespace) -> int:
+    print("ingest live: not implemented yet", file=sys.stderr)
+    return EXIT_BUILD_FAILURE
+
+
+_HANDLERS: dict[str, Callable[[Config, argparse.Namespace], int]] = {
+    "fetch": _run_fetch,
+    "build": _run_build,
+    "live": _run_live,
+    "build-live": _run_build_live,
+    "diff": _run_diff,
+}
+
+
 def run_ingest(args: argparse.Namespace) -> int:
     try:
         config = load_config(args.config).with_overrides(
@@ -175,22 +189,11 @@ def run_ingest(args: argparse.Namespace) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
 
-    if args.command == "fetch":
-        return _run_fetch(config)
-    if args.command == "build":
-        return _run_build(config)
-    if args.command in ("build-live", "diff"):
-        try:
-            if args.command == "diff":
-                return _run_diff(config, args)
-            return _run_build_live(config, args)
-        except ConfigError as exc:
-            print(f"config error: {exc}", file=sys.stderr)
-            return EXIT_CONFIG_ERROR
-
-    del config  # consumed by the real commands in later tickets
-    print(f"ingest {args.command}: not implemented yet", file=sys.stderr)
-    return EXIT_BUILD_FAILURE
+    try:
+        return _HANDLERS[args.command](config, args)
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
 
 
 def main(argv: Sequence[str] | None = None) -> int:

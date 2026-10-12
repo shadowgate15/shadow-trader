@@ -22,10 +22,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .bars import NY, Bar
-from .config import Config
+from .bars import Bar
+from .config import Config, pip_size
 from .dataset import Dataset, DatasetError, open_dataset
-from .report import REPORT_VERSION, _write_json
+from .report import REPORT_VERSION, nearest_rank, write_json
+from .session import NY
 
 WORST_BAR_CAP = 500
 _PRICE_FIELDS = ("open", "high", "low", "close")
@@ -34,10 +35,6 @@ _DRIFT_FIELDS = (*_PRICE_FIELDS, "spread_close", "spread_mean")
 
 class ReconciliationRefused(Exception):
     """The two Datasets are not comparable (CLI exit code 1)."""
-
-
-def _pip(instrument: str) -> float:
-    return 0.01 if instrument.endswith("JPY") else 0.0001
 
 
 def _open(config: Config, dataset_id: str) -> Dataset:
@@ -62,10 +59,6 @@ def _check_comparable(live: Dataset, backfill: Dataset) -> None:
 
 def _dev(a: float, b: float, pip: float) -> float:
     return round(abs(a - b) / pip, 6)
-
-
-def _rank(ordered: Sequence[float], p: float) -> float:
-    return ordered[max(0, math.ceil(p * len(ordered)) - 1)]
 
 
 @dataclass
@@ -111,7 +104,7 @@ def _compare(
     tally: _Tally, live: Bar, backfill: Bar, config: Config, week: str
 ) -> None:
     tol = config.reconciliation
-    pip = _pip(live.instrument)
+    pip = float(pip_size(live.instrument))
     assert None not in (live.open, backfill.open)
     price_devs = {
         f: _dev(getattr(live, f), getattr(backfill, f), pip) for f in _PRICE_FIELDS
@@ -127,10 +120,7 @@ def _compare(
     tally.bump("beyond" if beyond else "within", week)
 
     for name in _DRIFT_FIELDS:
-        scale = pip
-        tally.drift[name].append(
-            (getattr(live, name) - getattr(backfill, name)) / scale
-        )
+        tally.drift[name].append((getattr(live, name) - getattr(backfill, name)) / pip)
     assert live.tick_count is not None and backfill.tick_count is not None
     tally.drift["tick_count"].append(float(live.tick_count - backfill.tick_count))
     ratio = live.tick_count / backfill.tick_count if backfill.tick_count else math.inf
@@ -164,7 +154,7 @@ def _drift_summary(values: Sequence[float]) -> dict[str, Any]:
     return {
         "count": len(values),
         "mean": round(sum(values) / len(values), 6),
-        "p95_abs": round(_rank(magnitudes, 0.95), 6),
+        "p95_abs": round(nearest_rank(magnitudes, 0.95), 6),
         "max_abs": round(magnitudes[-1], 6),
     }
 
@@ -294,7 +284,7 @@ def reconcile(config: Config, live_id: str, backfill_id: str) -> Path:
     backfill = _open(config, backfill_id)
     document = build_reconciliation(config, live, backfill)
     path = reconciliation_path(config.paths.data_root, live_id, backfill_id)
-    _write_json(path, document)
+    write_json(path, document)
     return path
 
 

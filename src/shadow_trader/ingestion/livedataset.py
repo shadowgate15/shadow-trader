@@ -26,7 +26,7 @@ from .bars import Bar
 from .config import Config, validate_bar_sizes
 from .dataset import DatasetRef
 from .gaps import flag_suspected_outages, with_flag
-from .live import Event, LiveIngester
+from .live import Event, LiveIngester, overlaps_interval
 from .rawlog import raw_log_dir, read_raw_log
 from .replay import ReplayAdapter
 from .report import live_report_dir
@@ -52,10 +52,13 @@ def _down_intervals(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _overlaps(bar: Bar, size: timedelta, down: list[dict[str, Any]]) -> bool:
-    end = bar.open_time + size
     return any(
-        datetime.fromisoformat(i["start"]) < end
-        and (i["end"] is None or datetime.fromisoformat(i["end"]) > bar.open_time)
+        overlaps_interval(
+            bar.open_time,
+            size,
+            datetime.fromisoformat(i["start"]),
+            datetime.fromisoformat(i["end"]) if i["end"] else None,
+        )
         for i in down
     )
 

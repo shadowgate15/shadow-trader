@@ -36,9 +36,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
 
-from shadow_trader.ingestion.dataset import RawCache
+from .config import last_complete_month, month_parts
+from .dataset import SOURCE, RawCache
 
-SOURCE = "histdata"
 BASE_URL = "https://www.histdata.com"
 POST_URL = f"{BASE_URL}/get.php"
 ZERO_BYTE_ATTEMPTS = 3
@@ -116,18 +116,13 @@ def month_page_url(instrument: str, period: str) -> str:
 
 def months_between(start: str, end: str) -> list[str]:
     """Inclusive ``YYYYMM`` periods from ``YYYY-MM`` start to ``YYYY-MM`` end."""
-    year, month = int(start[:4]), int(start[5:])
-    last = (int(end[:4]), int(end[5:]))
+    year, month = month_parts(start)
+    last = month_parts(end)
     periods = []
     while (year, month) <= last:
         periods.append(f"{year:04d}{month:02d}")
         year, month = (year + 1, 1) if month == 12 else (year, month + 1)
     return periods
-
-
-def _last_complete_month(now: datetime) -> str:
-    year, month = (now.year - 1, 12) if now.month == 1 else (now.year, now.month - 1)
-    return f"{year:04d}-{month:02d}"
 
 
 def _validate_zip(data: bytes, instrument: str, period: str) -> str | None:
@@ -174,7 +169,7 @@ def fetch_months(
 
     clock = now()
     for instrument in instruments:
-        for period in months_between(start, end or _last_complete_month(clock)):
+        for period in months_between(start, end or last_complete_month(clock)):
             key = (instrument, period)
             if not supersede and cache.has(SOURCE, instrument, period, "zip"):
                 report.skipped.append(key)

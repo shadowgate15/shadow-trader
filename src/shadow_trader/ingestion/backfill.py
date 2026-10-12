@@ -15,15 +15,14 @@ import io
 import zipfile
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from . import dataset
 from .anomaly import FlaggingBarBuilder, summarize_flags
 from .bars import Bar, Quote
-from .config import DEFAULT_START, Config, validate_bar_sizes
+from .config import DEFAULT_START, Config, to_month, validate_bar_sizes
 from .dataset import DatasetRef, RawCache
 from .gaps import flag_suspected_outages, source_missing_bars
 from .report import (
@@ -33,9 +32,8 @@ from .report import (
     write_build_report,
     write_failed_report,
 )
+from .session import NY, open_of, week_sunday
 from .sources import SOURCE, months_between
-
-NY = ZoneInfo("America/New_York")
 
 
 class BuildFailure(Exception):
@@ -69,7 +67,7 @@ class BackfillResult:
     report_path: Path | None = None
 
 
-def _raw_month(cache: RawCache, instrument: str, period: str) -> str:
+def read_raw_month(cache: RawCache, instrument: str, period: str) -> str:
     """Text of one raw month; a missing, corrupt or empty month fails the build."""
     path = cache.path_for(SOURCE, instrument, period, "zip")
     if not path.exists():
@@ -109,12 +107,10 @@ _WEEK_LEAD = timedelta(hours=6)  # ticks this close before the open join the wee
 
 def _week_open(ts: datetime) -> datetime:
     """UTC weekly open (Sunday 17:00 New York) of the week ``ts`` belongs to."""
-    local = ts.astimezone(NY)
-    sunday = local.date() - timedelta(days=(local.weekday() + 1) % 7)
-    opened = datetime.combine(sunday, time(17, 0), tzinfo=NY).astimezone(UTC)
+    sunday = week_sunday(ts.astimezone(NY).date())
+    opened = open_of(sunday)
     if ts < opened - _WEEK_LEAD:
-        sunday -= timedelta(days=7)
-        opened = datetime.combine(sunday, time(17, 0), tzinfo=NY).astimezone(UTC)
+        opened = open_of(sunday - timedelta(days=7))
     return opened
 
 
@@ -140,7 +136,7 @@ def _alignment_warning(
     )
 
 
-def _parse(text: str, label: str, price_scale: int) -> Iterator[Quote]:
+def parse_ticks(text: str, label: str, price_scale: int) -> Iterator[Quote]:
     for row, line in enumerate(text.splitlines(), start=1):
         where = f"{label} row {row}"
         try:
@@ -205,13 +201,13 @@ def _build(config: Config, bar_size: int) -> BackfillResult:
         }
         missing: dict[datetime, Bar] = {}
         for period in months_between(build.start, end):
-            month = f"{period[:4]}-{period[4:]}"
+            month = to_month(period)
             if month in acknowledged:
                 for gap in source_missing_bars(instrument, month, bar_size):
                     missing[gap.open_time] = gap
                 continue
-            text = _raw_month(cache, instrument, period)
-            if f"{period[:4]}-{period[4:]}" < DEFAULT_START:
+            text = read_raw_month(cache, instrument, period)
+            if month < DEFAULT_START:
                 warnings.append(
                     BuildWarning(
                         "thin_data",
@@ -220,7 +216,7 @@ def _build(config: Config, bar_size: int) -> BackfillResult:
                         f"{instrument}/{period}",
                     )
                 )
-            for quote in _parse(text, f"{instrument}/{period}", scale):
+            for quote in parse_ticks(text, f"{instrument}/{period}", scale):
                 first_ticks.setdefault(_week_open(quote.ts), quote.ts)
                 bars.extend(builder.push(quote))
         bars.extend(builder.flush())

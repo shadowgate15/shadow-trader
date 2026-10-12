@@ -54,7 +54,7 @@ class Alignment:
     wrong_offset_signature: bool
 
 
-def _write_json(path: Path, document: Mapping[str, Any]) -> None:
+def write_json(path: Path, document: Mapping[str, Any]) -> None:
     """Write ``document`` by atomic rename."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -204,7 +204,7 @@ def write_failed_report(
     """Record a failed build under ``<data_root>/reports/failed``."""
     now = datetime.now(UTC)
     path = Path(data_root) / "reports" / "failed" / f"{now:%Y%m%dT%H%M%S%fZ}.json"
-    _write_json(
+    write_json(
         path,
         {
             "report_version": REPORT_VERSION,
@@ -222,19 +222,20 @@ def live_report_dir(data_root: Path, source: str, instrument: str) -> Path:
     return Path(data_root) / "reports" / "live" / source / instrument
 
 
+def nearest_rank(ordered: Sequence[float], p: float) -> float:
+    """Nearest-rank percentile ``p`` (0-1) of an ascending, non-empty sequence."""
+    return ordered[max(0, math.ceil(p * len(ordered)) - 1)]
+
+
 def lag_distribution(lags: Sequence[float]) -> dict[str, Any]:
     """Count, p50, p95 and max (seconds) of late-quote lags; nearest-rank."""
     if not lags:
         return {"count": 0, "p50": None, "p95": None, "max": None}
     ordered = sorted(lags)
-
-    def rank(p: float) -> float:
-        return ordered[max(0, math.ceil(p * len(ordered)) - 1)]
-
     return {
         "count": len(ordered),
-        "p50": rank(0.50),
-        "p95": rank(0.95),
+        "p50": nearest_rank(ordered, 0.50),
+        "p95": nearest_rank(ordered, 0.95),
         "max": ordered[-1],
     }
 
@@ -311,7 +312,7 @@ def write_live_report(
     """Atomically (re)write one run's report."""
     directory = live_report_dir(data_root, source, instrument)
     path = directory / f"{document['run_id']}.json"
-    _write_json(path, document)
+    write_json(path, document)
     return path
 
 
@@ -338,12 +339,12 @@ def mark_stale_runs_crashed(
         run = document["run"]
         began = run["last_watermark"] or run["started_at"]
         document["status"] = "crashed"
-        _write_json(path, document)
+        write_json(path, document)
         downtime.append({"start": began, "end": restarted_at.isoformat()})
     return downtime
 
 
 def write_build_report(dataset_path: Path, report: Mapping[str, Any]) -> Path:
     path = dataset_path / BUILD_REPORT
-    _write_json(path, report)
+    write_json(path, report)
     return path
