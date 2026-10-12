@@ -210,6 +210,10 @@ class FlaggingBarBuilder:
                 self.tick_flag_counts.update(tick_flags)
         return [self._flag(bar) for bar in self._builder.push(quote)]
 
+    def advance(self, ts: datetime) -> list[Bar]:
+        """Close slots ending at or before ``ts`` (a clock, not a tick)."""
+        return [self._flag(bar) for bar in self._builder.advance(ts)]
+
     def flush(self) -> list[Bar]:
         return [self._flag(bar) for bar in self._builder.flush()]
 
