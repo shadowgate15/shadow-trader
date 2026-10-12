@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from shadow_trader.ingestion.anomaly import BAR_FLAGS, TICK_FLAGS
 from shadow_trader.ingestion.backfill import BuildFailure, build_backfill
 from shadow_trader.ingestion.config import Config, ConfigError, load_config
 from shadow_trader.ingestion.dataset import RawCache, open_dataset
@@ -86,9 +87,9 @@ def assert_matches_reference(bars, ticks, minutes: int) -> None:
     for bar, row in zip(bars, expected, strict=True):
         for key, value in row.items():
             assert getattr(bar, key) == value, (key, bar.open_time)
-        # only Gap rows may carry a flag here: a long enough run is an outage
-        assert bar.quality_flags in ((), ("suspected_outage",))
-        assert bar.is_gap or bar.quality_flags == ()
+        # Gap rows carry only outage flags; priced Bars only anomaly flags
+        allowed = ("suspected_outage",) if bar.is_gap else (*TICK_FLAGS, *BAR_FLAGS)
+        assert set(bar.quality_flags) <= set(allowed), (bar.open_time, bar)
 
 
 def build_fixture(tmp_path, name, pair, month, minutes=5, scale_toml=""):
@@ -293,6 +294,36 @@ def test_session_alignment_warns_per_thresholds_and_never_fails(
     if warns:
         assert ("wrong-offset" in found[0].message) == signature
         assert found[0].locator == "EURUSD/week-2024-01-07"
+
+
+def crossed_lines(count):
+    """One in-Session quote per second with ask below bid, from the open."""
+    return [
+        f"20240107 1700{second:02d}000,1.10010,1.10000,0" for second in range(count)
+    ]
+
+
+def test_backfill_flags_ticks_and_records_tick_flag_counts_in_the_manifest(tmp_path):
+    _, build = build_csv(tmp_path, "EURUSD", "2024-01", crossed_lines(3))
+
+    result = build()
+
+    first = open_dataset(tmp_path / "data", result.ref.dataset_id).read("EURUSD")[0]
+    assert first.quality_flags == ("crossed_quote",)
+    coverage = result.ref.manifest["coverage"]["EURUSD"]
+    assert coverage["tick_flag_counts"] == {"crossed_quote": 3}
+    assert coverage["flag_counts"]["crossed_quote"] == 1
+
+
+def test_alert_fraction_exceeded_is_a_build_warning(tmp_path):
+    _, build = build_csv(tmp_path, "EURUSD", "2024-01", crossed_lines(3))
+
+    result = build()
+
+    [warning] = [
+        w for w in result.warnings if w.code == "anomaly_alert_fraction_exceeded"
+    ]
+    assert warning.locator == "EURUSD"
 
 
 def cli_config(tmp_path, month="2024-01", sizes="[5, 15]"):

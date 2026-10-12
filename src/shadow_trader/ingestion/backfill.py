@@ -19,7 +19,8 @@ from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 from . import dataset
-from .bars import Bar, BarBuilder, Quote
+from .anomaly import FlaggingBarBuilder, summarize_flags
+from .bars import Bar, Quote
 from .config import DEFAULT_START, Config, validate_bar_sizes
 from .dataset import DatasetRef, RawCache
 from .gaps import flag_suspected_outages, source_missing_bars
@@ -140,9 +141,10 @@ def build_backfill(config: Config, bar_size: int) -> BackfillResult:
     series: dict[str, list[Bar]] = {}
     warnings: list[BuildWarning] = []
     dropped: dict[str, int] = {}
+    tick_flags: dict[str, dict[str, int]] = {}
     for instrument in build.instruments:
         scale = config.instruments[instrument].price_scale
-        builder = BarBuilder(instrument, bar_size, scale)
+        builder = FlaggingBarBuilder(instrument, bar_size, scale, config.anomaly_rule)
         bars: list[Bar] = []
         first_ticks: dict[datetime, datetime] = {}  # weekly open -> first tick
         acknowledged = {
@@ -178,6 +180,15 @@ def build_backfill(config: Config, bar_size: int) -> BackfillResult:
             bar_size,
             config.gap_rule.outage_threshold_minutes,
         )
+        tick_flags[instrument] = dict(builder.tick_flag_counts)
+        summary = summarize_flags(
+            series[instrument],
+            builder.tick_flag_counts,
+            config.anomaly_rule.alert_fraction,
+        )
+        warnings.extend(
+            BuildWarning(w.code, w.message, instrument) for w in summary.warnings
+        )
         if builder.dropped_out_of_session:
             dropped[instrument] = builder.dropped_out_of_session
             warnings.append(
@@ -188,5 +199,7 @@ def build_backfill(config: Config, bar_size: int) -> BackfillResult:
                     instrument,
                 )
             )
-    ref = dataset.build_dataset(config, bar_size, series)
+    ref = dataset.build_dataset(
+        config, bar_size, series, tick_flag_counts=tick_flags
+    )
     return BackfillResult(ref, tuple(warnings), dropped)
