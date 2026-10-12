@@ -18,6 +18,8 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.169.0",
+    "pytest>=9.1.1",
     "ruff>=0.17.0",
     "ty>=0.0.86",
 ]
@@ -31,3 +33,6 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 
 [tool.ty.environment]
 python-version = "3.13"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
