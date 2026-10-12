@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime, timedelta
 
-from .backfill import parse_ticks, read_raw_month
+from .backfill import infer_week_clock, parse_ticks, read_raw_month
 from .config import Config, last_complete_month
 from .dataset import RawCache
 from .gaps import month_bounds
@@ -65,9 +65,11 @@ def _cache_events(config: Config, instrument: str, now: datetime) -> Iterator[Ev
     end = build.end or last_complete_month(now)
     last: datetime | None = None
     grace = timedelta(seconds=config.live.grace_seconds)
-    for period in months_between(build.start, end):
+    periods = list(months_between(build.start, end))
+    clock = infer_week_clock(cache, instrument, periods)  # as the backfill does
+    for period in periods:
         text = read_raw_month(cache, instrument, period)
-        for quote in parse_ticks(text, f"{instrument}/{period}", scale):
+        for quote in parse_ticks(text, f"{instrument}/{period}", scale, clock):
             last = quote.ts
             yield quote
     if last is not None and (session := session_of(last)) is not None:

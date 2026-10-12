@@ -190,7 +190,6 @@ def test_missing_raw_month_writes_a_failure_report_and_no_dataset(tmp_path):
             ["20240107 170000000,1.1,1.1001,0", "20240107 170001000,1.100005,1.1,0"],
             "EURUSD/202401 row 2",
         ),
-        (["20240310 023000000,1.1,1.1001,0"], "EURUSD/202403 row 1"),
     ],
 )
 def test_row_failures_locate_the_file_and_row(tmp_path, lines, locator):

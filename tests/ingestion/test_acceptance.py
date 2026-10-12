@@ -5,7 +5,9 @@ the raw cache: set ``SHADOW_TRADER_RAW_ROOT`` to a data_root holding
 ``raw/histdata/EURUSD/<YYYYMM>.zip`` for the months to verify, e.g. 2024-01 to
 2024-04 (fetched with ``ingest fetch``); the build test covers every cached month.
 ``SHADOW_TRADER_REPLAY_RANGE`` (``YYYY-MM`` or ``YYYY-MM:YYYY-MM``, default
-``2024-01``) picks the replay-parity range.
+``2024-01``) picks the replay-parity range and ``SHADOW_TRADER_BUILD_RANGE``
+(same form, default every cached month) the build range; a week whose raw clock
+fits no rule (source defects, e.g. 2023) fails the build, which is the point.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import json
 import os
 import re
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -82,6 +85,35 @@ def test_replay_live_sealed_bars_equal_batch_bars_with_no_revisions(tmp_path):
     assert prices(ingester.revisions.latest()) == prices(batch)
 
 
+def gap_week_csv() -> bytes:
+    """The summer fixture week moved to the gap week of 2024-03-10 on a fixed UTC-5
+    raw clock (an hour earlier than New York local), closed with a Friday tick."""
+    moved = []
+    for line in fixture_csv("eurusd_summer").decode().splitlines():
+        stamp, rest = line.split(",", 1)
+        naive = datetime.strptime(stamp[:15], "%Y%m%d %H%M%S")
+        naive -= timedelta(days=126, hours=1)
+        moved.append(f"{naive:%Y%m%d %H%M%S}{stamp[15:]},{rest}")
+    moved.append("20240315 155959000,1.10000,1.10010,0")
+    return ("\n".join(moved) + "\n").encode()
+
+
+def test_replay_equals_batch_in_a_gap_week_on_the_fixed_utc_minus_5_clock(tmp_path):
+    config = make_config(tmp_path, "EURUSD", "2024-03")
+    install_raw(config, "EURUSD", "202403", gap_week_csv())
+    result = build_backfill(config, 5)
+    batch = open_dataset(config.paths.data_root, result.ref.dataset_id).read("EURUSD")
+
+    ingester, _ = replay_bars(config, 5)
+
+    assert result.ref.manifest["session_clock"]["EURUSD"]["offsets"] == {
+        "2024-03-10": -300
+    }
+    assert batch[0].open_time == datetime(2024, 3, 10, 21, 0, tzinfo=UTC)
+    assert ingester.late_dropped == 0
+    assert prices(ingester.revisions.latest()) == prices(batch)
+
+
 # --- real-cache acceptance (opt in with -m slow) -------------------------------
 
 
@@ -122,7 +154,14 @@ def test_real_eurusd_cached_range_builds_and_dataset_id_reproduces(
 ):
     root = _real_root()
     periods = _periods(root)
-    config = _real_config(tmp_path, root, _month(periods[0]), _month(periods[-1]))
+    chosen = os.environ.get("SHADOW_TRADER_BUILD_RANGE")
+    start, _, end = (chosen or "").partition(":")
+    config = _real_config(
+        tmp_path,
+        root,
+        start or _month(periods[0]),
+        end or start or _month(periods[-1]),
+    )
 
     started = time.monotonic()
     first = build_backfill(config, 5)
@@ -157,9 +196,10 @@ def test_real_eurusd_replay_live_sealed_bars_equal_batch(tmp_path):
     assert re.fullmatch(r"\d{4}-\d{2}", start)
     config = _real_config(tmp_path, root, start, end or start)
 
-    batch = open_dataset(
-        config.paths.data_root, build_backfill(config, 5).ref.dataset_id
-    ).read("EURUSD")
+    built = build_backfill(config, 5)
+    batch = open_dataset(config.paths.data_root, built.ref.dataset_id).read("EURUSD")
+    # every week's raw clock was inferred, so no week is off the 17:00 open
+    assert not [w for w in built.warnings if w.code == "session_alignment"]
     started = time.monotonic()
     ingester, sealed = replay_bars(config, 5)
     print(
