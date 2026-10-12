@@ -138,6 +138,7 @@ def build_report(
     dropped_out_of_session: Mapping[str, int],
     tick_flag_counts: Mapping[str, Mapping[str, int]] | None = None,
     alignments: Mapping[str, Sequence[Alignment]] | None = None,
+    session_clocks: Mapping[str, Mapping[str, Any]] | None = None,
     warnings: Sequence[WarningEntry] = (),
     raw_inputs: Mapping[str, str] | None = None,
     config: Config | None = None,
@@ -162,6 +163,7 @@ def build_report(
             "session_alignment": [
                 dataclasses.asdict(a) for a in (alignments or {}).get(pair, ())
             ],
+            "session_clock": dict((session_clocks or {}).get(pair, {})),
             "suspected_outage_runs": _outage_runs(bars, bar_size),
         }
     return {

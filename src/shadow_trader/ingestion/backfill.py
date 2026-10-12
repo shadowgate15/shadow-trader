@@ -1,11 +1,12 @@
 """Backfill build: raw cache of HistData ticks to an immutable Dataset.
 
-Reads only the write-once raw cache (never the network). Ticks are New York
-local time with DST; each is converted to UTC through ``America/New_York`` and
-fed to the shared incremental ``BarBuilder``. A tick whose local time is
-ambiguous or nonexistent, or that has more precision than the Instrument's
-price scale, fails the build naming file and row. Everything else suspect
-(thin data, ticks outside a Session, a misaligned weekly open) only warns.
+Reads only the write-once raw cache (never the network). The raw clock of each
+Session week is inferred (New York local time or fixed UTC-5, see ``clock``);
+ticks are converted to UTC with their week's offset and fed to the shared
+incremental ``BarBuilder``. A week that fits no clock rule, or a tick with more
+precision than the Instrument's price scale, fails the build naming week or
+file and row. Everything else suspect (thin data, ticks outside a Session, a
+misaligned weekly open) only warns.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from __future__ import annotations
 import contextlib
 import io
 import zipfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -22,6 +23,7 @@ from pathlib import Path
 from . import dataset
 from .anomaly import FlaggingBarBuilder, summarize_flags
 from .bars import Bar, Quote
+from .clock import WeekClock, WeekClockError, WeekEvidence
 from .config import (
     DEFAULT_START,
     Config,
@@ -96,13 +98,20 @@ def read_raw_month(cache: RawCache, instrument: str, period: str) -> str:
     return text
 
 
-def _to_utc(naive: datetime) -> datetime | None:
-    """UTC instant of a New York local time, or None if ambiguous/nonexistent."""
-    first = naive.replace(tzinfo=NY, fold=0)
-    second = naive.replace(tzinfo=NY, fold=1)
-    if first.utcoffset() != second.utcoffset():
-        return None
-    return first.astimezone(UTC)
+def infer_week_clock(
+    cache: RawCache, instrument: str, periods: Iterable[str]
+) -> WeekClock:
+    """The raw-clock offset of every Session week in ``periods`` (a pre-pass)."""
+    evidence = WeekEvidence()
+    for period in periods:
+        evidence.add_text(read_raw_month(cache, instrument, period))
+    try:
+        return evidence.infer()
+    except WeekClockError as error:
+        week = next(iter(error.failures))
+        raise BuildFailure(
+            f"{instrument} {error}", f"{instrument}/week-{week}"
+        ) from None
 
 
 ALIGNMENT_TOLERANCE = timedelta(hours=1)
@@ -143,7 +152,9 @@ def _alignment_warning(
     )
 
 
-def parse_ticks(text: str, label: str, price_scale: int) -> Iterator[Quote]:
+def parse_ticks(
+    text: str, label: str, price_scale: int, clock: WeekClock
+) -> Iterator[Quote]:
     for row, line in enumerate(text.splitlines(), start=1):
         where = f"{label} row {row}"
         try:
@@ -162,13 +173,7 @@ def parse_ticks(text: str, label: str, price_scale: int) -> Iterator[Quote]:
                 f"at {where}: {line!r}",
                 where,
             )
-        ts = _to_utc(naive)
-        if ts is None:
-            raise BuildFailure(
-                f"ambiguous or nonexistent New York local time {stamp} at {where}",
-                where,
-            )
-        yield Quote(ts, quote_bid, quote_ask)
+        yield Quote(clock.to_utc(naive), quote_bid, quote_ask)
 
 
 def build_backfill(
@@ -216,6 +221,7 @@ def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
     dropped: dict[str, int] = {}
     tick_flags: dict[str, dict[str, int]] = {}
     alignments: dict[str, list[Alignment]] = {}
+    clocks: dict[str, WeekClock] = {}
     for instrument in build.instruments:
         scale = config.instruments[instrument].price_scale
         builder = FlaggingBarBuilder(instrument, bar_size, scale, config.anomaly_rule)
@@ -225,6 +231,15 @@ def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
             a.month for a in build.acknowledged_missing if a.instrument == instrument
         }
         missing: dict[datetime, Bar] = {}
+        clocks[instrument] = clock = infer_week_clock(
+            cache,
+            instrument,
+            [
+                period
+                for period in months_between(build.start, end)
+                if to_month(period) not in acknowledged
+            ],
+        )
         for period in months_between(build.start, end):
             month = to_month(period)
             if month in acknowledged:
@@ -242,7 +257,9 @@ def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
                     )
                 )
             label = f"{instrument}/{period}"
-            for row, quote in enumerate(parse_ticks(text, label, scale), start=1):
+            for row, quote in enumerate(
+                parse_ticks(text, label, scale, clock), start=1
+            ):
                 first_ticks.setdefault(_week_open(quote.ts), quote.ts)
                 try:
                     bars.extend(builder.push(quote))
@@ -290,6 +307,7 @@ def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
             config.paths.data_root, SOURCE, bar_size, build.instruments
         ),
         tick_flag_counts=tick_flags,
+        extra_manifest={"session_clock": _clock_manifest(clocks)},
     )
     report_path = write_build_report(
         ref.path,
@@ -300,9 +318,15 @@ def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
             dropped_out_of_session=dropped,
             tick_flag_counts=tick_flags,
             alignments=alignments,
+            session_clocks={pair: c.summary() for pair, c in clocks.items()},
             warnings=warnings,
             raw_inputs=ref.manifest["raw_inputs"],
             config=config,
         ),
     )
     return BackfillResult(ref, tuple(warnings), dropped, report_path)
+
+
+def _clock_manifest(clocks: Mapping[str, WeekClock]) -> dict[str, object]:
+    """Provenance of the inferred raw-clock offsets (not hashed into the Dataset)."""
+    return {pair: clock.provenance() for pair, clock in clocks.items()}

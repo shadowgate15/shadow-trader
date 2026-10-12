@@ -177,23 +177,28 @@ def build_csv(tmp_path, pair, month, lines, minutes=5):
 
 
 @pytest.mark.parametrize(
-    "stamp",
+    ("session_tick", "stamp"),
     [
-        "20240310 023000000",  # nonexistent: clocks jump 02:00 -> 03:00
-        "20241103 013000000",  # ambiguous: 01:00-02:00 happens twice
+        ("20240303", "20240310 023000000"),  # nonexistent: 02:00 -> 03:00
+        ("20241027", "20241103 013000000"),  # ambiguous: 01:00-02:00 twice
     ],
 )
-def test_tick_at_dst_edge_fails_naming_file_and_row(tmp_path, stamp):
+def test_tick_at_dst_edge_is_dropped_out_of_session_not_fatal(
+    tmp_path, session_tick, stamp
+):
+    # The offset is fixed per Session week and the clock change happens while the
+    # market is closed, so a wall-clock tick there is just outside any Session
     month = f"{stamp[:4]}-{stamp[4:6]}"
     lines = [
-        f"{stamp[:6]}01 170000000,1.10000,1.10010,0",
+        f"{session_tick} 170000000,1.10000,1.10010,0",
         f"{stamp},1.10000,1.10010,0",
     ]
-    config, build = build_csv(tmp_path, "EURUSD", month, lines)
+    _, build = build_csv(tmp_path, "EURUSD", month, lines)
 
-    with pytest.raises(BuildFailure, match=rf"EURUSD/{stamp[:6]}.*row 2"):
-        build()
-    assert not (config.paths.data_root / "datasets").exists()
+    result = build()
+
+    [warning] = [w for w in result.warnings if w.code == "out_of_session_ticks"]
+    assert warning.message.startswith("1 ")
 
 
 def test_tick_with_more_precision_than_the_price_scale_fails(tmp_path):
@@ -274,11 +279,9 @@ def test_ticks_outside_any_session_are_dropped_counted_and_warned(tmp_path):
         ("185500", True, True),  # 115 min: start of the 115-125 signature
         ("190000", True, True),  # 120 min
         ("191500", True, False),  # 135 min
-        ("160000", True, True),  # 60 min before the open
-        ("150500", True, True),  # 115 min before the open
     ],
 )
-def test_session_alignment_warns_per_thresholds_and_never_fails(
+def test_session_alignment_warns_per_thresholds_and_does_not_fail(
     tmp_path, first_tick, warns, signature
 ):
     lines = [
@@ -294,6 +297,22 @@ def test_session_alignment_warns_per_thresholds_and_never_fails(
     if warns:
         assert ("wrong-offset" in found[0].message) == signature
         assert found[0].locator == "EURUSD/week-2024-01-07"
+
+
+@pytest.mark.parametrize("first_tick", ["160000", "150500"])
+def test_first_tick_an_hour_or_more_before_the_open_fits_no_clock_rule(
+    tmp_path, first_tick
+):
+    lines = [
+        f"20240107 {first_tick}000,1.10000,1.10010,0",
+        "20240107 200000000,1.10000,1.10010,0",
+    ]
+    _, build = build_csv(tmp_path, "EURUSD", "2024-01", lines)
+
+    with pytest.raises(
+        BuildFailure, match=r"EURUSD week of 2024-01-07.*before the open"
+    ):
+        build()
 
 
 def crossed_lines(count):
