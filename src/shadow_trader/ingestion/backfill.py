@@ -10,26 +10,44 @@ price scale, fails the build naming file and row. Everything else suspect
 
 from __future__ import annotations
 
+import contextlib
 import io
 import zipfile
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from . import dataset
-from .bars import Bar, BarBuilder, Quote
+from .anomaly import FlaggingBarBuilder, summarize_flags
+from .bars import Bar, Quote
 from .config import DEFAULT_START, Config, validate_bar_sizes
 from .dataset import DatasetRef, RawCache
 from .gaps import flag_suspected_outages, source_missing_bars
+from .report import (
+    WARNING_CODES,
+    Alignment,
+    build_report,
+    write_build_report,
+    write_failed_report,
+)
 from .sources import SOURCE, months_between
 
 NY = ZoneInfo("America/New_York")
 
 
 class BuildFailure(Exception):
-    """The backfill cannot produce a trustworthy Dataset (CLI exit code 1)."""
+    """The backfill cannot produce a trustworthy Dataset (CLI exit code 1).
+
+    ``locator`` names where it failed (file and row, or Instrument and period).
+    """
+
+    def __init__(self, message: str, locator: str | None = None) -> None:
+        super().__init__(message)
+        self.locator = locator
+        self.report_path: Path | None = None  # the failure report, once written
 
 
 @dataclass(frozen=True)
@@ -38,27 +56,38 @@ class BuildWarning:
     message: str
     locator: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.code not in WARNING_CODES:
+            raise ValueError(f"unknown warning code {self.code!r}")
+
 
 @dataclass(frozen=True)
 class BackfillResult:
     ref: DatasetRef
     warnings: tuple[BuildWarning, ...] = field(default=())
     dropped_out_of_session: Mapping[str, int] = field(default_factory=dict)
+    report_path: Path | None = None
 
 
 def _raw_month(cache: RawCache, instrument: str, period: str) -> str:
     """Text of one raw month; a missing, corrupt or empty month fails the build."""
     path = cache.path_for(SOURCE, instrument, period, "zip")
     if not path.exists():
-        raise BuildFailure(f"raw month missing: {instrument} {period}")
+        raise BuildFailure(
+            f"raw month missing: {instrument} {period}", f"{instrument}/{period}"
+        )
     member = f"DAT_ASCII_{instrument}_T_{period}.csv"
     try:
         with zipfile.ZipFile(io.BytesIO(path.read_bytes())) as archive:
             text = archive.read(member).decode()
     except (zipfile.BadZipFile, KeyError, UnicodeDecodeError):
-        raise BuildFailure(f"raw month corrupt: {instrument} {period}") from None
+        raise BuildFailure(
+            f"raw month corrupt: {instrument} {period}", f"{instrument}/{period}"
+        ) from None
     if not text.strip():
-        raise BuildFailure(f"raw month empty: {instrument} {period}")
+        raise BuildFailure(
+            f"raw month empty: {instrument} {period}", f"{instrument}/{period}"
+        )
     return text
 
 
@@ -91,7 +120,7 @@ def _week_open(ts: datetime) -> datetime:
 
 def _alignment_warning(
     instrument: str, opened: datetime, first: datetime
-) -> BuildWarning | None:
+) -> tuple[BuildWarning, Alignment] | None:
     offset = first - opened
     minutes = abs(offset) / timedelta(minutes=1)
     signature = any(low <= minutes <= high for low, high in WRONG_OFFSET_SIGNATURES)
@@ -104,7 +133,11 @@ def _alignment_warning(
     )
     if signature:
         message += "; matches a wrong-offset signature (timestamp convention?)"
-    return BuildWarning("session_alignment", message, f"{instrument}/week-{week}")
+    locator = f"{instrument}/week-{week}"
+    return (
+        BuildWarning("session_alignment", message, locator),
+        Alignment(week, locator, round(offset / timedelta(minutes=1)), signature),
+    )
 
 
 def _parse(text: str, label: str, price_scale: int) -> Iterator[Quote]:
@@ -117,32 +150,54 @@ def _parse(text: str, label: str, price_scale: int) -> Iterator[Quote]:
             )
             quote_bid, quote_ask = Decimal(bid), Decimal(ask)
         except (ValueError, InvalidOperation):
-            raise BuildFailure(f"unparseable tick at {where}: {line!r}") from None
+            raise BuildFailure(
+                f"unparseable tick at {where}: {line!r}", where
+            ) from None
         if any((price * 10**price_scale) % 1 != 0 for price in (quote_bid, quote_ask)):
             raise BuildFailure(
                 f"tick has more precision than price scale {price_scale} "
-                f"at {where}: {line!r}"
+                f"at {where}: {line!r}",
+                where,
             )
         ts = _to_utc(naive)
         if ts is None:
             raise BuildFailure(
-                f"ambiguous or nonexistent New York local time {stamp} at {where}"
+                f"ambiguous or nonexistent New York local time {stamp} at {where}",
+                where,
             )
         yield Quote(ts, quote_bid, quote_ask)
 
 
 def build_backfill(config: Config, bar_size: int) -> BackfillResult:
-    """Build one Dataset (all configured Instruments) at ``bar_size`` minutes."""
+    """Build one Dataset (all configured Instruments) at ``bar_size`` minutes.
+
+    A failed build writes a failure report under ``<data_root>/reports/failed``
+    (no Dataset directory exists) and re-raises ``BuildFailure``.
+    """
     validate_bar_sizes((bar_size,))
+    try:
+        return _build(config, bar_size)
+    except BuildFailure as failure:
+        # an unwritable report must not mask the failure itself
+        with contextlib.suppress(OSError):
+            failure.report_path = write_failed_report(
+                config.paths.data_root, bar_size, str(failure), failure.locator
+            )
+        raise
+
+
+def _build(config: Config, bar_size: int) -> BackfillResult:
     cache = RawCache(config.paths.data_root)
     build = config.build
     end = build.end or build.start
     series: dict[str, list[Bar]] = {}
     warnings: list[BuildWarning] = []
     dropped: dict[str, int] = {}
+    tick_flags: dict[str, dict[str, int]] = {}
+    alignments: dict[str, list[Alignment]] = {}
     for instrument in build.instruments:
         scale = config.instruments[instrument].price_scale
-        builder = BarBuilder(instrument, bar_size, scale)
+        builder = FlaggingBarBuilder(instrument, bar_size, scale, config.anomaly_rule)
         bars: list[Bar] = []
         first_ticks: dict[datetime, datetime] = {}  # weekly open -> first tick
         acknowledged = {
@@ -170,13 +225,23 @@ def build_backfill(config: Config, bar_size: int) -> BackfillResult:
                 bars.extend(builder.push(quote))
         bars.extend(builder.flush())
         for opened, first in first_ticks.items():
-            if (warning := _alignment_warning(instrument, opened, first)) is not None:
-                warnings.append(warning)
+            if (off := _alignment_warning(instrument, opened, first)) is not None:
+                warnings.append(off[0])
+                alignments.setdefault(instrument, []).append(off[1])
         merged = {bar.open_time: bar for bar in bars} | missing
         series[instrument] = flag_suspected_outages(
             sorted(merged.values(), key=lambda bar: bar.open_time),
             bar_size,
             config.gap_rule.outage_threshold_minutes,
+        )
+        tick_flags[instrument] = dict(builder.tick_flag_counts)
+        summary = summarize_flags(
+            series[instrument],
+            builder.tick_flag_counts,
+            config.anomaly_rule.alert_fraction,
+        )
+        warnings.extend(
+            BuildWarning(w.code, w.message, instrument) for w in summary.warnings
         )
         if builder.dropped_out_of_session:
             dropped[instrument] = builder.dropped_out_of_session
@@ -188,5 +253,19 @@ def build_backfill(config: Config, bar_size: int) -> BackfillResult:
                     instrument,
                 )
             )
-    ref = dataset.build_dataset(config, bar_size, series)
-    return BackfillResult(ref, tuple(warnings), dropped)
+    ref = dataset.build_dataset(config, bar_size, series, tick_flag_counts=tick_flags)
+    report_path = write_build_report(
+        ref.path,
+        build_report(
+            dataset_id=ref.dataset_id,
+            bar_size=bar_size,
+            series=series,
+            dropped_out_of_session=dropped,
+            tick_flag_counts=tick_flags,
+            alignments=alignments,
+            warnings=warnings,
+            raw_inputs=ref.manifest["raw_inputs"],
+            config=config,
+        ),
+    )
+    return BackfillResult(ref, tuple(warnings), dropped, report_path)
