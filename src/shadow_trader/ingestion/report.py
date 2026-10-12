@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ WARNING_CODES = (
 REPORT_VERSION = 1
 BUILD_REPORT = "build-report.json"
 OUTAGE_RUN_CAP = 200
+DROPPED_EXAMPLE_CAP = 20
 
 
 class WarningEntry(Protocol):
@@ -214,6 +216,131 @@ def write_failed_report(
         },
     )
     return path
+
+
+def live_report_dir(data_root: Path, source: str, instrument: str) -> Path:
+    return Path(data_root) / "reports" / "live" / source / instrument
+
+
+def lag_distribution(lags: Sequence[float]) -> dict[str, Any]:
+    """Count, p50, p95 and max (seconds) of late-quote lags; nearest-rank."""
+    if not lags:
+        return {"count": 0, "p50": None, "p95": None, "max": None}
+    ordered = sorted(lags)
+
+    def rank(p: float) -> float:
+        return ordered[max(0, math.ceil(p * len(ordered)) - 1)]
+
+    return {
+        "count": len(ordered),
+        "p50": rank(0.50),
+        "p95": rank(0.95),
+        "max": ordered[-1],
+    }
+
+
+def live_run_report(
+    *,
+    run_id: str,
+    status: str,
+    source: str,
+    instrument: str,
+    bar_size: int,
+    started_at: datetime,
+    ended_at: datetime | None,
+    last_watermark: datetime | None,
+    source_down: Sequence[Mapping[str, Any]],
+    bars_by_revision: Mapping[int, int],
+    gap_bars: int,
+    late_accepted: int,
+    dropped_after_seal: int,
+    out_of_session: int,
+    late_lags: Sequence[float],
+    catch_ups: Sequence[Mapping[str, Any]],
+    dropped_examples: Sequence[Mapping[str, Any]],
+    resolved: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The live run report of one ingester process lifetime (a plain document)."""
+    return {
+        "report_version": REPORT_VERSION,
+        "run_id": run_id,
+        "status": status,
+        "source": source,
+        "instrument": instrument,
+        "bar_size": bar_size,
+        "run": {
+            "started_at": started_at.isoformat(),
+            "ended_at": ended_at.isoformat() if ended_at else None,
+            "last_watermark": last_watermark.isoformat() if last_watermark else None,
+        },
+        "source_down": [dict(i) for i in source_down],
+        "counts": {
+            "bars": sum(bars_by_revision.values()),
+            "bars_by_revision": {
+                str(r): n for r, n in sorted(bars_by_revision.items())
+            },
+            "gap_bars": gap_bars,
+            "late_quotes_accepted": late_accepted,
+            "quotes_dropped_after_seal": dropped_after_seal,
+            "quotes_dropped_out_of_session": out_of_session,
+        },
+        "late_quote_lag_seconds": lag_distribution(late_lags),
+        "catch_up": [dict(c) for c in catch_ups],
+        "dropped_after_seal_examples": [
+            dict(e) for e in dropped_examples[:DROPPED_EXAMPLE_CAP]
+        ],
+        "warnings": (
+            [
+                {
+                    "code": "live_quote_after_seal",
+                    "message": f"{dropped_after_seal} quotes arrived after their "
+                    "Bar was sealed and were dropped",
+                    "locator": None,
+                }
+            ]
+            if dropped_after_seal
+            else []
+        ),
+        "config": dict(resolved) if resolved is not None else None,
+    }
+
+
+def write_live_report(
+    data_root: Path, source: str, instrument: str, document: Mapping[str, Any]
+) -> Path:
+    """Atomically (re)write one run's report."""
+    directory = live_report_dir(data_root, source, instrument)
+    path = directory / f"{document['run_id']}.json"
+    _write_json(path, document)
+    return path
+
+
+def mark_stale_runs_crashed(
+    data_root: Path,
+    source: str,
+    instrument: str,
+    restarted_at: datetime,
+) -> list[dict[str, Any]]:
+    """Mark reports still ``running`` as ``crashed``; return their downtime.
+
+    A run whose report never left ``running`` died without a clean shutdown.
+    The downtime is from its last watermark (or its start, if it never saw an
+    event) to ``restarted_at``, as a source-down interval of reason
+    ``between_runs``.
+    """
+    downtime: list[dict[str, Any]] = []
+    directory = live_report_dir(data_root, source, instrument)
+    for path in sorted(directory.glob("*.json")) if directory.exists() else []:
+        text = path.read_text()
+        if '"status": "running"' not in text:
+            continue  # cheap pre-check: most reports are long finished
+        document = json.loads(text)
+        run = document["run"]
+        began = run["last_watermark"] or run["started_at"]
+        document["status"] = "crashed"
+        _write_json(path, document)
+        downtime.append({"start": began, "end": restarted_at.isoformat()})
+    return downtime
 
 
 def write_build_report(dataset_path: Path, report: Mapping[str, Any]) -> Path:

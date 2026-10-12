@@ -107,6 +107,18 @@ class BarBuilder:
         self._pending.append((quote.ts.astimezone(UTC), bid, ask))
         return out
 
+    def start_at(self, slot_start: datetime) -> None:
+        """Begin the grid at the slot opening at ``slot_start`` (mid-Session start).
+
+        Earlier slots of the Session are never emitted, so they are not Gaps.
+        Only valid before any quote or clock has moved the builder.
+        """
+        session = _session_of(slot_start)
+        if self._open is not None or session is None:
+            raise ValueError("start_at needs a fresh builder and an in-Session slot")
+        self._open = session[0]
+        self._slot = int((slot_start.astimezone(UTC) - session[0]) // self._size)
+
     def advance(self, ts: datetime) -> list[Bar]:
         """Close every slot that ends at or before ``ts``; no tick is added.
 

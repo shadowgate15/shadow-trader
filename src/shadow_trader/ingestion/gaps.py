@@ -22,7 +22,8 @@ from .bars import NY, SESSION_HOURS, Bar
 _ROLLOVER = time(17, 0)
 
 
-def _with_flag(bar: Bar, flag: str) -> Bar:
+def with_flag(bar: Bar, flag: str) -> Bar:
+    """``bar`` with ``flag`` added, in vocabulary order."""
     flags = {*bar.quality_flags, flag}
     return dataclasses.replace(
         bar, quality_flags=tuple(f for f in VOCABULARY if f in flags)
@@ -50,7 +51,7 @@ def flag_suspected_outages(
             end += 1
         if (end - start + 1) * bar_minutes >= threshold_minutes:
             for i in range(start, end + 1):
-                result[i] = _with_flag(result[i], "suspected_outage")
+                result[i] = with_flag(result[i], "suspected_outage")
         start = end + 1
     return result
 
