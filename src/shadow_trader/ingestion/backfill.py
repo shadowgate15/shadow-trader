@@ -24,13 +24,21 @@ from .bars import Bar, Quote
 from .config import DEFAULT_START, Config, validate_bar_sizes
 from .dataset import DatasetRef, RawCache
 from .gaps import flag_suspected_outages, source_missing_bars
+from .report import WARNING_CODES, Alignment, build_report, write_build_report
 from .sources import SOURCE, months_between
 
 NY = ZoneInfo("America/New_York")
 
 
 class BuildFailure(Exception):
-    """The backfill cannot produce a trustworthy Dataset (CLI exit code 1)."""
+    """The backfill cannot produce a trustworthy Dataset (CLI exit code 1).
+
+    ``locator`` names where it failed (file and row, or Instrument and period).
+    """
+
+    def __init__(self, message: str, locator: str | None = None) -> None:
+        super().__init__(message)
+        self.locator = locator
 
 
 @dataclass(frozen=True)
@@ -38,6 +46,10 @@ class BuildWarning:
     code: str
     message: str
     locator: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.code not in WARNING_CODES:
+            raise ValueError(f"unknown warning code {self.code!r}")
 
 
 @dataclass(frozen=True)
@@ -92,7 +104,7 @@ def _week_open(ts: datetime) -> datetime:
 
 def _alignment_warning(
     instrument: str, opened: datetime, first: datetime
-) -> BuildWarning | None:
+) -> tuple[BuildWarning, Alignment] | None:
     offset = first - opened
     minutes = abs(offset) / timedelta(minutes=1)
     signature = any(low <= minutes <= high for low, high in WRONG_OFFSET_SIGNATURES)
@@ -105,7 +117,11 @@ def _alignment_warning(
     )
     if signature:
         message += "; matches a wrong-offset signature (timestamp convention?)"
-    return BuildWarning("session_alignment", message, f"{instrument}/week-{week}")
+    locator = f"{instrument}/week-{week}"
+    return (
+        BuildWarning("session_alignment", message, locator),
+        Alignment(week, locator, round(offset / timedelta(minutes=1)), signature),
+    )
 
 
 def _parse(text: str, label: str, price_scale: int) -> Iterator[Quote]:
@@ -142,6 +158,7 @@ def build_backfill(config: Config, bar_size: int) -> BackfillResult:
     warnings: list[BuildWarning] = []
     dropped: dict[str, int] = {}
     tick_flags: dict[str, dict[str, int]] = {}
+    alignments: dict[str, list[Alignment]] = {}
     for instrument in build.instruments:
         scale = config.instruments[instrument].price_scale
         builder = FlaggingBarBuilder(instrument, bar_size, scale, config.anomaly_rule)
@@ -172,8 +189,9 @@ def build_backfill(config: Config, bar_size: int) -> BackfillResult:
                 bars.extend(builder.push(quote))
         bars.extend(builder.flush())
         for opened, first in first_ticks.items():
-            if (warning := _alignment_warning(instrument, opened, first)) is not None:
-                warnings.append(warning)
+            if (off := _alignment_warning(instrument, opened, first)) is not None:
+                warnings.append(off[0])
+                alignments.setdefault(instrument, []).append(off[1])
         merged = {bar.open_time: bar for bar in bars} | missing
         series[instrument] = flag_suspected_outages(
             sorted(merged.values(), key=lambda bar: bar.open_time),
@@ -201,5 +219,19 @@ def build_backfill(config: Config, bar_size: int) -> BackfillResult:
             )
     ref = dataset.build_dataset(
         config, bar_size, series, tick_flag_counts=tick_flags
+    )
+    write_build_report(
+        ref.path,
+        build_report(
+            dataset_id=ref.dataset_id,
+            bar_size=bar_size,
+            series=series,
+            dropped_out_of_session=dropped,
+            tick_flag_counts=tick_flags,
+            alignments=alignments,
+            warnings=warnings,
+            raw_inputs=ref.manifest["raw_inputs"],
+            config=config,
+        ),
     )
     return BackfillResult(ref, tuple(warnings), dropped)
