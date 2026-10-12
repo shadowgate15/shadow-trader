@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
 
-from .backfill import _parse, _raw_zip
+from .backfill import _parse, _raw_month
 from .config import Config
 from .dataset import RawCache
 from .live import Event
@@ -42,9 +42,5 @@ def _cache_events(config: Config, instrument: str) -> Iterator[Event]:
     build = config.build
     scale = config.instruments[instrument].price_scale
     for period in months_between(build.start, build.end or build.start):
-        text = (
-            _raw_zip(cache, instrument, period)
-            .read(f"DAT_ASCII_{instrument}_T_{period}.csv")
-            .decode()
-        )
+        text = _raw_month(cache, instrument, period)
         yield from _parse(text, f"{instrument}/{period}", scale)

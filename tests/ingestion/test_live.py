@@ -282,11 +282,12 @@ def test_replay_of_raw_cache_ticks_gives_the_backfill_bars_without_network(tmp_p
     )
     ingester.run()
 
-    # build_backfill does not wire the anomaly detector yet, so compare the prices
-    unflagged = [
-        dataclasses.replace(b, quality_flags=()) for b in ingester.revisions.latest()
-    ]
-    assert unflagged == expected
+    # prices only: backfill applies its own Gap run-length rule and does not run
+    # the tick detector, which the stream-equals-batch property covers instead
+    def prices(bars):
+        return [dataclasses.replace(b, quality_flags=()) for b in bars]
+
+    assert prices(ingester.revisions.latest()) == prices(expected)
     assert all(
         rev == 0 for rev, _, _ in ingester.revisions.history(expected[0].open_time)
     )
