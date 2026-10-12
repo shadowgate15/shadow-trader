@@ -22,6 +22,7 @@ from . import dataset
 from .bars import Bar, BarBuilder, Quote
 from .config import DEFAULT_START, Config, validate_bar_sizes
 from .dataset import DatasetRef, RawCache
+from .gaps import flag_suspected_outages, source_missing_bars
 from .sources import SOURCE, months_between
 
 NY = ZoneInfo("America/New_York")
@@ -45,14 +46,20 @@ class BackfillResult:
     dropped_out_of_session: Mapping[str, int] = field(default_factory=dict)
 
 
-def _raw_zip(cache: RawCache, instrument: str, period: str) -> zipfile.ZipFile:
+def _raw_month(cache: RawCache, instrument: str, period: str) -> str:
+    """Text of one raw month; a missing, corrupt or empty month fails the build."""
     path = cache.path_for(SOURCE, instrument, period, "zip")
     if not path.exists():
         raise BuildFailure(f"raw month missing: {instrument} {period}")
+    member = f"DAT_ASCII_{instrument}_T_{period}.csv"
     try:
-        return zipfile.ZipFile(io.BytesIO(path.read_bytes()))
-    except zipfile.BadZipFile:
+        with zipfile.ZipFile(io.BytesIO(path.read_bytes())) as archive:
+            text = archive.read(member).decode()
+    except (zipfile.BadZipFile, KeyError, UnicodeDecodeError):
         raise BuildFailure(f"raw month corrupt: {instrument} {period}") from None
+    if not text.strip():
+        raise BuildFailure(f"raw month empty: {instrument} {period}")
+    return text
 
 
 def _to_utc(naive: datetime) -> datetime | None:
@@ -138,8 +145,17 @@ def build_backfill(config: Config, bar_size: int) -> BackfillResult:
         builder = BarBuilder(instrument, bar_size, scale)
         bars: list[Bar] = []
         first_ticks: dict[datetime, datetime] = {}  # weekly open -> first tick
+        acknowledged = {
+            a.month for a in build.acknowledged_missing if a.instrument == instrument
+        }
+        missing: dict[datetime, Bar] = {}
         for period in months_between(build.start, end):
-            archive = _raw_zip(cache, instrument, period)
+            month = f"{period[:4]}-{period[4:]}"
+            if month in acknowledged:
+                for gap in source_missing_bars(instrument, month, bar_size):
+                    missing[gap.open_time] = gap
+                continue
+            text = _raw_month(cache, instrument, period)
             if f"{period[:4]}-{period[4:]}" < DEFAULT_START:
                 warnings.append(
                     BuildWarning(
@@ -149,8 +165,6 @@ def build_backfill(config: Config, bar_size: int) -> BackfillResult:
                         f"{instrument}/{period}",
                     )
                 )
-            member = f"DAT_ASCII_{instrument}_T_{period}.csv"
-            text = archive.read(member).decode()
             for quote in _parse(text, f"{instrument}/{period}", scale):
                 first_ticks.setdefault(_week_open(quote.ts), quote.ts)
                 bars.extend(builder.push(quote))
@@ -158,7 +172,12 @@ def build_backfill(config: Config, bar_size: int) -> BackfillResult:
         for opened, first in first_ticks.items():
             if (warning := _alignment_warning(instrument, opened, first)) is not None:
                 warnings.append(warning)
-        series[instrument] = bars
+        merged = {bar.open_time: bar for bar in bars} | missing
+        series[instrument] = flag_suspected_outages(
+            sorted(merged.values(), key=lambda bar: bar.open_time),
+            bar_size,
+            config.gap_rule.outage_threshold_minutes,
+        )
         if builder.dropped_out_of_session:
             dropped[instrument] = builder.dropped_out_of_session
             warnings.append(
