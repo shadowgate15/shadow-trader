@@ -62,7 +62,9 @@ class QuoteStream(Protocol):
 
     ``events`` yields source-UTC-stamped events, non-decreasing in time except
     for catch-up output. An adapter may also offer
-    ``fetch_quotes(start, end) -> Iterable[Quote]`` to repair missed quotes.
+    ``fetch_quotes(start, end) -> Iterable[Quote]`` to repair missed quotes, and
+    ``range_start`` (a datetime) when it replays a declared range, so a first
+    Session that opened before it is clipped to start there.
     """
 
     source: str
@@ -151,6 +153,9 @@ class LiveIngester:
         self._config = config
         self._resolved = resolved_config(config)
         self._start = start
+        # A replayed range clips the grid like backfill: dense from the first
+        # tick's Session, but never before where the range begins.
+        self._range_start: datetime | None = getattr(adapter, "range_start", None)
         self._started_at: datetime | None = None
         self._run_id = ""
         self._bars_by_revision: Counter[int] = Counter()
@@ -315,6 +320,11 @@ class LiveIngester:
         else:
             if self._cursor is None:
                 self._cursor = session[0]
+                if self._range_start is not None and session[0] < self._range_start:
+                    self._first_slot = self._cursor = self._slot_at_or_after(
+                        self._range_start
+                    )
+                    self._builder.start_at(self._first_slot)
             slot = self._slot_of(quote.ts)
             if self._first_slot is not None and slot < self._first_slot:
                 pass  # before the start: not part of this run's grid

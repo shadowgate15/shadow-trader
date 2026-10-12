@@ -3,8 +3,9 @@
 The fixture tests run always. The ``slow`` tests run the real EUR/USD history from
 the raw cache: set ``SHADOW_TRADER_RAW_ROOT`` to a data_root holding
 ``raw/histdata/EURUSD/<YYYYMM>.zip`` for the months to verify, e.g. 2024-01 to
-2024-04 (fetched with ``ingest fetch``); the build test covers every cached month. ``SHADOW_TRADER_REPLAY_RANGE`` (``YYYY-MM`` or
-``YYYY-MM:YYYY-MM``, default ``2024-01``) picks the replay-parity range.
+2024-04 (fetched with ``ingest fetch``); the build test covers every cached month.
+``SHADOW_TRADER_REPLAY_RANGE`` (``YYYY-MM`` or ``YYYY-MM:YYYY-MM``, default
+``2024-01``) picks the replay-parity range.
 """
 
 from __future__ import annotations

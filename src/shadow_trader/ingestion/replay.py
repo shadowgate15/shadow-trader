@@ -28,8 +28,12 @@ class ReplayAdapter:
         *,
         instrument: str,
         source: str = "replay",
+        range_start: datetime | None = None,
     ) -> None:
         self._events = events
+        # Where the declared range begins; the ingester starts its grid there
+        # (spec section 5), exactly as backfill clips to the range.
+        self.range_start = range_start
         self.instrument = instrument
         self.source = source
 
@@ -50,6 +54,7 @@ class ReplayAdapter:
         return cls(
             _cache_events(config, instrument, now or datetime.now(UTC)),
             instrument=instrument,
+            range_start=month_bounds(config.build.start)[0],
         )
 
 
