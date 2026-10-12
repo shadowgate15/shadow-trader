@@ -71,10 +71,13 @@ def _log_files(data_root: Path, source: str, instrument: str) -> dict[str, str]:
         if path.name.endswith(".meta.json"):
             continue
         sidecar = path.with_name(path.name + ".meta.json")
+        meta: dict[str, Any] = (
+            json.loads(sidecar.read_text()) if sidecar.exists() else {"open": True}
+        )
         digest = (
-            json.loads(sidecar.read_text())["sha256"]
-            if sidecar.exists()
-            else hashlib.sha256(path.read_bytes()).hexdigest()
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            if meta.get("open")  # provisional sidecar: the bytes are the truth
+            else meta["sha256"]
         )
         found[f"live/{source}/{instrument}/{path.name}"] = digest
     return found

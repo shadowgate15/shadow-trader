@@ -436,6 +436,25 @@ def raw_dir(tmp_path):
     return tmp_path / "data" / "raw" / "live" / "replay" / "EURUSD"
 
 
+def test_the_open_hour_file_has_a_sidecar_that_a_clean_close_brings_up_to_date(
+    tmp_path,
+):
+    live(
+        tmp_path,
+        [q(timedelta(minutes=m)) for m in (1, 2)],
+        clock=arrival_clock(timedelta(seconds=1)),
+        start=OPEN,
+    )
+
+    plain = raw_dir(tmp_path) / "20300101T09.jsonl"
+    sidecar = json.loads(
+        (raw_dir(tmp_path) / "20300101T09.jsonl.meta.json").read_text()
+    )
+    assert sidecar["open"] is True  # provisional: the hour may still be appended to
+    assert sidecar["sha256"] == hashlib.sha256(plain.read_bytes()).hexdigest()
+    assert sidecar["size"] == len(plain.read_bytes())
+
+
 def test_closed_hours_are_compressed_and_the_sidecar_hashes_the_compressed_bytes(
     tmp_path,
 ):
@@ -453,6 +472,7 @@ def test_closed_hours_are_compressed_and_the_sidecar_hashes_the_compressed_bytes
         "20300101T10.jsonl.gz",
         "20300101T10.jsonl.gz.meta.json",
         "20300101T11.jsonl",  # the open hour is still plain, append-only
+        "20300101T11.jsonl.meta.json",  # with a provisional sidecar
     ]
     packed = (directory / "20300101T09.jsonl.gz").read_bytes()
     sidecar = json.loads((directory / "20300101T09.jsonl.gz.meta.json").read_text())
