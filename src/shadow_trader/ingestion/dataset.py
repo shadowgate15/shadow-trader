@@ -276,6 +276,7 @@ def build_dataset(
     parent: str | None = None,
     created_at: datetime | None = None,
     builder_revision: str | None = None,
+    tick_flag_counts: Mapping[str, Mapping[str, int]] | None = None,
 ) -> DatasetRef:
     """Write an immutable Dataset of ``bars`` (per Instrument) and return it.
 
@@ -363,13 +364,16 @@ def build_dataset(
         "anomaly_rules": anomaly_rules,
         "anomaly_rule_set_version": _short_hash(anomaly_rules),
         "created_at": (created_at or datetime.now(UTC)).isoformat(),
-        "coverage": {pair: _coverage(series) for pair, series in ordered.items()},
+        "coverage": {
+            pair: _coverage(series, (tick_flag_counts or {}).get(pair, {}))
+            for pair, series in ordered.items()
+        },
     }
     _write_manifest(target, manifest)
     return DatasetRef(content_hash, target, manifest)
 
 
-def _coverage(series: Sequence[Bar]) -> dict[str, Any]:
+def _coverage(series: Sequence[Bar], tick_flags: Mapping[str, int]) -> dict[str, Any]:
     flag_counts: dict[str, int] = {}
     for bar in series:
         for flag in bar.quality_flags:
@@ -379,6 +383,7 @@ def _coverage(series: Sequence[Bar]) -> dict[str, Any]:
         "gaps": sum(b.is_gap for b in series),
         "flagged_bars": sum(bool(b.quality_flags) for b in series),
         "flag_counts": dict(sorted(flag_counts.items())),
+        "tick_flag_counts": dict(sorted(tick_flags.items())),
     }
 
 

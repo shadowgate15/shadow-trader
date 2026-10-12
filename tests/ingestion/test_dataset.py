@@ -135,7 +135,13 @@ def test_contract_schema_metadata_and_manifest_fields(tmp_path):
     (part,) = manifest["partitions"]
     assert set(part) >= {"path", "rows", "gap_count", "hash"}
     coverage = manifest["coverage"]["EURUSD"]
-    assert set(coverage) == {"sessions", "gaps", "flagged_bars", "flag_counts"}
+    assert set(coverage) == {
+        "sessions",
+        "gaps",
+        "flagged_bars",
+        "flag_counts",
+        "tick_flag_counts",
+    }
 
 
 def test_append_writes_new_dir_hardlinks_closed_years_and_records_parent(tmp_path):
