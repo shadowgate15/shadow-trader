@@ -9,10 +9,17 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from shadow_trader.ingestion.config import ConfigError, load_config
+from shadow_trader.ingestion.config import Config, ConfigError, load_config
+from shadow_trader.ingestion.dataset import RawCache
+from shadow_trader.ingestion.sources import (
+    Transport,
+    UrllibTransport,
+    fetch_months,
+)
 
 EXIT_OK = 0
 EXIT_BUILD_FAILURE = 1
@@ -57,6 +64,33 @@ def add_ingest_parser(subparsers: argparse._SubParsersAction) -> None:  # type: 
             command.add_argument("--to", dest="range_to", help="Range end.")
 
 
+def make_transport() -> Transport:
+    return UrllibTransport()
+
+
+_sleep = time.sleep
+
+
+def _run_fetch(config: Config) -> int:
+    report = fetch_months(
+        RawCache(config.paths.data_root),
+        make_transport(),
+        config.build.instruments,
+        config.build.start,
+        config.build.end,
+        sleep=_sleep,
+    )
+    print(
+        f"fetched {len(report.fetched)}, skipped {len(report.skipped)} cached, "
+        f"absent {len(report.absent)}, rejected {len(report.rejected)}"
+    )
+    for instrument, period in report.absent:
+        print(f"warning: {instrument} {period} absent at source")
+    for (instrument, period), reason in report.rejected:
+        print(f"error: {instrument} {period} rejected: {reason}", file=sys.stderr)
+    return EXIT_OK if report.ok else EXIT_BUILD_FAILURE
+
+
 def run_ingest(args: argparse.Namespace) -> int:
     try:
         config = load_config(args.config).with_overrides(
@@ -68,6 +102,9 @@ def run_ingest(args: argparse.Namespace) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
+
+    if args.command == "fetch":
+        return _run_fetch(config)
 
     del config  # consumed by the real commands in later tickets
     print(f"ingest {args.command}: not implemented yet", file=sys.stderr)
