@@ -2,8 +2,8 @@
 
 The fixture tests run always. The ``slow`` tests run the real EUR/USD history from
 the raw cache: set ``SHADOW_TRADER_RAW_ROOT`` to a data_root holding
-``raw/histdata/EURUSD/<YYYYMM>.zip`` for 2009-01 onwards (fetched with
-``ingest fetch``). ``SHADOW_TRADER_REPLAY_RANGE`` (``YYYY-MM`` or
+``raw/histdata/EURUSD/<YYYYMM>.zip`` for the months to verify, e.g. 2024-01 to
+2024-04 (fetched with ``ingest fetch``); the build test covers every cached month. ``SHADOW_TRADER_REPLAY_RANGE`` (``YYYY-MM`` or
 ``YYYY-MM:YYYY-MM``, default ``2024-01``) picks the replay-parity range.
 """
 
@@ -88,7 +88,7 @@ def _real_root() -> Path:
     root = os.environ.get("SHADOW_TRADER_RAW_ROOT")
     if not root or not (Path(root) / "raw/histdata/EURUSD").is_dir():
         pytest.skip("set SHADOW_TRADER_RAW_ROOT to a data_root with EURUSD raw months")
-    return Path(root)
+    return Path(root).resolve()
 
 
 def _periods(root: Path) -> list[str]:
@@ -96,9 +96,9 @@ def _periods(root: Path) -> list[str]:
         p.name.removesuffix(".zip")
         for p in (root / "raw/histdata/EURUSD").glob("??????.zip")
     )
-    if not found or found[0] > "200901":
-        pytest.skip("raw cache does not reach back to 2009-01")
-    return [p for p in found if p >= "200901"]
+    if not found:
+        pytest.skip("raw cache holds no EURUSD months")
+    return found
 
 
 def _real_config(tmp_path: Path, root: Path, start: str, end: str) -> Config:
@@ -116,12 +116,12 @@ def _month(period: str) -> str:
 
 
 @pytest.mark.slow
-def test_real_eurusd_2009_to_present_builds_and_dataset_id_reproduces(
+def test_real_eurusd_cached_range_builds_and_dataset_id_reproduces(
     tmp_path, record_property
 ):
     root = _real_root()
     periods = _periods(root)
-    config = _real_config(tmp_path, root, "2009-01", _month(periods[-1]))
+    config = _real_config(tmp_path, root, _month(periods[0]), _month(periods[-1]))
 
     started = time.monotonic()
     first = build_backfill(config, 5)
@@ -150,7 +150,7 @@ def test_real_eurusd_2009_to_present_builds_and_dataset_id_reproduces(
 @pytest.mark.slow
 def test_real_eurusd_replay_live_sealed_bars_equal_batch(tmp_path):
     root = _real_root()
-    _periods(root)  # skips when the cache is incomplete
+    _periods(root)  # skips when the cache is empty
     chosen = os.environ.get("SHADOW_TRADER_REPLAY_RANGE", "2024-01")
     start, _, end = chosen.partition(":")
     assert re.fullmatch(r"\d{4}-\d{2}", start)
