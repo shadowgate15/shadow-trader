@@ -11,7 +11,7 @@ from __future__ import annotations
 import copy
 import logging
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
 from typing import Protocol
@@ -104,7 +104,9 @@ class LiveIngester:
         bar_size: int | None = None,
         start: datetime | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        record: bool = True,
     ) -> None:
+        self._record = record  # False: a rebuild from the raw log writes nothing
         self._adapter = adapter
         self._sink = sink
         self._clock = clock
@@ -196,6 +198,8 @@ class LiveIngester:
         self._report("running")
 
     def _report(self, status: str) -> None:
+        if not self._record:
+            return
         assert self._started_at is not None
         write_live_report(
             self._config.paths.data_root,
@@ -229,6 +233,18 @@ class LiveIngester:
                 resolved=self._resolved,
             ),
         )
+
+    def replay_sealed(self, events: Iterable[Event]) -> list[Bar]:
+        """Rebuild from logged events (arrival order); return the sealed Bars.
+
+        Only for an ingester made with ``record=False``. Sealed means past its
+        repair window: open or repairable slots are left out, and nothing is
+        flushed. Each Bar is its slot's latest Revision.
+        """
+        assert not self._record
+        for event in events:
+            self._handle(event)
+        return [b for b in self.revisions.latest() if b.open_time not in self._closed]
 
     def stop(self) -> None:
         """Ask a running ingester to shut down cleanly after the current event.
@@ -276,7 +292,8 @@ class LiveIngester:
         )
 
     def _on_quote(self, quote: Quote) -> None:
-        self._rawlog.append(quote, self._clock())
+        if self._record:
+            self._rawlog.append(quote, self._clock())
         session = _session_of(quote.ts)
         if session is None:
             self.dropped_out_of_session += 1
