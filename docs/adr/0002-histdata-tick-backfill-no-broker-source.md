@@ -1,6 +1,6 @@
 # Backfill from HistData ticks, no broker-tied source in ingestion
 
-Historical backfill uses HistData.com tick bid/ask files, downloaded into the write-once raw cache. Ticks make `spread_mean` and `tick_count` tick-exact, so the Data contract stands unamended. Timestamps are EST without DST (fixed UTC-5) and are converted to UTC at ingestion. Ingestion names no live vendor: it is specified against the source-agnostic quote-stream interface, with a replay adapter feeding HistData ticks through the live path. The first concrete live adapter is chosen with the Broker integration map. Datasets built from HistData are private and never redistributed.
+Historical backfill uses HistData.com tick bid/ask files, downloaded into the write-once raw cache. Ticks make `spread_mean` and `tick_count` tick-exact, so the Data contract stands unamended. Timestamps are New York local time with DST (verified by the [HistData tick probe](https://github.com/shadowgate15/shadow-trader/issues/22)) and are converted to UTC at ingestion via `America/New_York`; a tick whose local time is ambiguous or nonexistent (the DST edges, when the market is closed) fails the build. Ingestion names no live vendor: it is specified against the source-agnostic quote-stream interface, with a replay adapter feeding HistData ticks through the live path. The first concrete live adapter is chosen with the Broker integration map. Datasets built from HistData are private and never redistributed.
 
 ## Considered Options
 
@@ -14,4 +14,5 @@ Historical backfill uses HistData.com tick bid/ask files, downloaded into the wr
 - HistData publishes no terms (only "use at your own risk"), so Datasets built from it must stay private.
 - Spreads and timestamps may differ from the eventual live broker; that gap is a Broker integration / Execution model concern, not an ingestion one.
 - Files arrive as monthly zips, fetched by hand or a fragile script, which the write-once raw cache absorbs.
-- Earliest tick month per pair is unverified until a probe downloads real files.
+- Earliest tick month per pair was verified by the HistData tick probe: 2000-05 to 2000-06 for six majors, 2005-08 for NZD/USD; density is thin before ~2009.
+- Session alignment (first tick of each week at the 17:00 New York open) is checked at build time as a warning, since the timestamp convention was verified by sampling, not exhaustively.
