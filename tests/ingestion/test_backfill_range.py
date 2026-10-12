@@ -85,3 +85,16 @@ def test_backfill_records_the_previous_backfill_of_the_series_as_parent(tmp_path
 
     assert second.ref.dataset_id != first.ref.dataset_id
     assert second.ref.manifest["parent"] == first.ref.dataset_id
+
+
+def test_replay_from_raw_cache_defaults_end_to_the_last_complete_month(tmp_path):
+    from shadow_trader.ingestion.replay import ReplayAdapter
+
+    config = without_end(make_config(tmp_path, "EURUSD", "2024-01"))
+    install_raw(config, "EURUSD", "202401", fixture_csv("eurusd_winter"))
+    adapter = ReplayAdapter.from_raw_cache(
+        config, "EURUSD", now=datetime(2024, 3, 10, tzinfo=UTC)
+    )
+
+    with pytest.raises(BuildFailure, match=r"EURUSD.*202402"):
+        list(adapter.events())

@@ -136,7 +136,6 @@ class LiveIngester:
         self._watermark: datetime | None = None
         self._cursor: datetime | None = None  # start of the next slot to close
         self._pending: dict[datetime, list[Quote]] = {}
-        self._last_session_close: datetime | None = None
         self._closed: dict[datetime, _ClosedSlot] = {}  # unsealed, in slot order
         self._down_since: datetime | None = None
         self.late_dropped = 0
@@ -174,7 +173,11 @@ class LiveIngester:
         return upcoming_open(start)
 
     def run(self) -> None:
-        """Consume the adapter's stream to its end, emitting Bars to the sink."""
+        """Consume the adapter's stream to its end, emitting Bars to the sink.
+
+        Only slots the watermark has closed are emitted: the end of a stream is
+        not time passing, so it never invents the rest of the Session.
+        """
         self._begin_run()
         try:
             for event in self._adapter.events():
@@ -182,7 +185,6 @@ class LiveIngester:
                 if self._stopped:
                     self._report("stopped")  # clean shutdown: closed slots only
                     return
-            self._finish()
             self._report("finished")
         finally:
             self._rawlog.close()
@@ -309,7 +311,6 @@ class LiveIngester:
         else:
             if self._cursor is None:
                 self._cursor = session[0]
-            self._last_session_close = session[1]
             slot = self._slot_of(quote.ts)
             if self._first_slot is not None and slot < self._first_slot:
                 pass  # before the start: not part of this run's grid
@@ -372,15 +373,6 @@ class LiveIngester:
             if end + self._grace > self._watermark:
                 return
             self._close(slot)
-
-    def _finish(self) -> None:
-        """End of stream: close the rest of the last Session, as a backfill does."""
-        while (
-            self._cursor is not None
-            and self._last_session_close is not None
-            and self._cursor < self._last_session_close
-        ):
-            self._close(self._cursor, repairable=False)
 
     def _close(self, slot: datetime, *, repairable: bool = True) -> None:
         snapshot = copy.deepcopy(self._builder) if repairable else self._builder
