@@ -12,11 +12,14 @@ import json
 import sys
 import time
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from shadow_trader.ingestion.backfill import BuildFailure, build_backfill
 from shadow_trader.ingestion.config import Config, ConfigError, load_config
-from shadow_trader.ingestion.dataset import RawCache
+from shadow_trader.ingestion.dataset import DatasetError, RawCache
+from shadow_trader.ingestion.livedataset import build_live
+from shadow_trader.ingestion.reconcile import ReconciliationRefused, reconcile
 from shadow_trader.ingestion.report import console_summary
 from shadow_trader.ingestion.sources import (
     Transport,
@@ -65,6 +68,25 @@ def add_ingest_parser(subparsers: argparse._SubParsersAction) -> None:  # type: 
         if name == "build-live":
             command.add_argument("--from", dest="range_from", help="Range start.")
             command.add_argument("--to", dest="range_to", help="Range end.")
+        if name == "diff":
+            command.add_argument("--live", dest="live_id", help="Live dataset_id.")
+            command.add_argument(
+                "--backfill", dest="backfill_id", help="Backfill dataset_id."
+            )
+
+
+def _parse_utc(value: str | None, flag: str) -> datetime:
+    if value is None:
+        raise ConfigError(f"{flag} is required")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ConfigError(
+            f"{flag} must be an ISO date or datetime: {value!r}"
+        ) from None
+    return (
+        parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    )
 
 
 def make_transport() -> Transport:
@@ -114,6 +136,33 @@ def _run_build(config: Config) -> int:
     return EXIT_OK
 
 
+def _run_build_live(config: Config, args: argparse.Namespace) -> int:
+    start = _parse_utc(args.range_from, "--from")
+    end = _parse_utc(args.range_to, "--to")
+    if end <= start:
+        raise ConfigError(f"--from {start.isoformat()} is not before --to")
+    try:
+        for bar_size in config.build.bar_sizes:
+            ref = build_live(config, bar_size, start, end)
+            print(f"built live {bar_size} min dataset {ref.dataset_id}")
+    except (DatasetError, OSError) as exc:
+        print(f"build-live failed: {exc}", file=sys.stderr)
+        return EXIT_BUILD_FAILURE
+    return EXIT_OK
+
+
+def _run_diff(config: Config, args: argparse.Namespace) -> int:
+    if not (args.live_id and args.backfill_id):
+        raise ConfigError("diff needs --live and --backfill dataset ids")
+    try:
+        path = reconcile(config, args.live_id, args.backfill_id)
+    except ReconciliationRefused as exc:
+        print(f"diff refused: {exc}", file=sys.stderr)
+        return EXIT_BUILD_FAILURE
+    print(f"report: {path}")
+    return EXIT_OK
+
+
 def run_ingest(args: argparse.Namespace) -> int:
     try:
         config = load_config(args.config).with_overrides(
@@ -130,6 +179,14 @@ def run_ingest(args: argparse.Namespace) -> int:
         return _run_fetch(config)
     if args.command == "build":
         return _run_build(config)
+    if args.command in ("build-live", "diff"):
+        try:
+            if args.command == "diff":
+                return _run_diff(config, args)
+            return _run_build_live(config, args)
+        except ConfigError as exc:
+            print(f"config error: {exc}", file=sys.stderr)
+            return EXIT_CONFIG_ERROR
 
     del config  # consumed by the real commands in later tickets
     print(f"ingest {args.command}: not implemented yet", file=sys.stderr)

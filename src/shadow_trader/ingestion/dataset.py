@@ -203,11 +203,17 @@ def _partition_hash(bars: Sequence[Bar]) -> str:
 
 
 def _dataset_hash(
-    bar_size: int, rules: Mapping[str, Any], partitions: Mapping[str, str]
+    source: str,
+    bar_size: int,
+    rules: Mapping[str, Any],
+    partitions: Mapping[str, str],
 ) -> str:
+    # The source is hashed so a live and a backfill Dataset with identical rows
+    # stay distinct Datasets (they are never merged and share no lineage).
     return hashlib.sha256(
         _canonical_json(
             {
+                "source": source,
                 "schema_version": SCHEMA_VERSION,
                 "bar_size": bar_size,
                 "rules": rules,
@@ -277,6 +283,9 @@ def build_dataset(
     created_at: datetime | None = None,
     builder_revision: str | None = None,
     tick_flag_counts: Mapping[str, Mapping[str, int]] | None = None,
+    source: str = SOURCE,
+    raw_inputs: Mapping[str, str] | None = None,
+    extra_manifest: Mapping[str, Any] | None = None,
 ) -> DatasetRef:
     """Write an immutable Dataset of ``bars`` (per Instrument) and return it.
 
@@ -295,7 +304,7 @@ def build_dataset(
             key = f"instrument={pair}/year={bar.open_time.astimezone(UTC).year}"
             parts.setdefault(key, []).append(bar)
     hashes = {key: _partition_hash(rows) for key, rows in parts.items()}
-    content_hash = _dataset_hash(bar_size, rules, hashes)
+    content_hash = _dataset_hash(source, bar_size, rules, hashes)
 
     target = data_root / "datasets" / content_hash
     if (target / "manifest.json").exists():
@@ -341,7 +350,7 @@ def build_dataset(
     first = min((b.open_time for b in all_rows), default=None)
     last = max((b.open_time for b in all_rows), default=None)
     manifest = {
-        "source": SOURCE,
+        "source": source,
         "bar_size": bar_size,
         "instruments": sorted(ordered),
         "time_range": {
@@ -355,7 +364,11 @@ def build_dataset(
         "schema_version": SCHEMA_VERSION,
         "view": VIEW,
         "partitions": entries,
-        "raw_inputs": _raw_inputs(data_root, ordered),
+        "raw_inputs": (
+            dict(raw_inputs)
+            if raw_inputs is not None
+            else _raw_inputs(data_root, ordered)
+        ),
         "acknowledged_missing": rules["acknowledged_missing"],
         "builder_version": _builder_version(),
         "builder_git_revision": builder_revision or _git_revision(),
@@ -368,9 +381,26 @@ def build_dataset(
             pair: _coverage(series, (tick_flag_counts or {}).get(pair, {}))
             for pair, series in ordered.items()
         },
+        **(extra_manifest or {}),
     }
     _write_manifest(target, manifest)
     return DatasetRef(content_hash, target, manifest)
+
+
+def latest_dataset(
+    data_root: Path, source: str, bar_size: int, instruments: Sequence[str]
+) -> str | None:
+    """The most recently created complete Dataset of one series, if any."""
+    found: list[tuple[str, str]] = []
+    for path in (Path(data_root) / "datasets").glob("*/manifest.json"):
+        manifest = json.loads(path.read_text())
+        if (
+            manifest["source"] == source
+            and manifest["bar_size"] == bar_size
+            and manifest["instruments"] == sorted(instruments)
+        ):
+            found.append((manifest["created_at"], manifest["dataset_id"]))
+    return max(found)[1] if found else None
 
 
 def _coverage(series: Sequence[Bar], tick_flags: Mapping[str, int]) -> dict[str, Any]:

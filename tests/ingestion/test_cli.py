@@ -42,12 +42,11 @@ def test_ingest_help_lists_the_five_subcommands(capsys):
 
 
 @pytest.mark.parametrize(
-    "command", [c for c in SUBCOMMANDS if c not in ("fetch", "build")]
+    "command",
+    [c for c in SUBCOMMANDS if c not in ("fetch", "build", "build-live", "diff")],
 )
 def test_every_stub_subcommand_takes_config(command, config_path, capsys):
-    extra = ["--from", "2024-01", "--to", "2024-02"] if command == "build-live" else []
-
-    code = run(["ingest", command, "--config", str(config_path), *extra])
+    code = run(["ingest", command, "--config", str(config_path)])
 
     # The skeleton commands are stubs: they load the config, then report
     # that they are not implemented yet (build failure, exit 1).
