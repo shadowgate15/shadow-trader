@@ -11,7 +11,7 @@ from __future__ import annotations
 import dataclasses
 import re
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -153,18 +153,25 @@ class Config:
     reconciliation: ReconciliationConfig
     live: LiveConfig
 
-    def content_affecting(self) -> dict[str, Any]:
+    def content_affecting(
+        self, instruments: Iterable[str] | None = None
+    ) -> dict[str, Any]:
         """The values that feed the Dataset hash (reporting-only ones omitted).
 
-        Reconciliation and live settings are reporting-only as a whole.
+        Reconciliation and live settings are reporting-only as a whole. With
+        ``instruments``, only those Instruments' price scales and
+        acknowledged-missing months count, and the free-text ``reason`` never
+        does, so an unrelated edit does not change the Dataset's identity.
         """
+        pairs = sorted(self.instruments if instruments is None else set(instruments))
         return {
             "instruments": {
-                pair: dataclasses.asdict(self.instruments[pair])
-                for pair in sorted(self.instruments)
+                pair: dataclasses.asdict(self.instruments[pair]) for pair in pairs
             },
             "acknowledged_missing": [
-                dataclasses.asdict(a) for a in self.build.acknowledged_missing
+                {"instrument": a.instrument, "month": a.month}
+                for a in self.build.acknowledged_missing
+                if a.instrument in pairs
             ],
             "rules": {
                 "gap": _content_view(self.gap_rule),

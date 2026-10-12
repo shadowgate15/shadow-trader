@@ -179,3 +179,37 @@ def test_unknown_schema_version_and_missing_manifest_are_refused(tmp_path):
     manifest_path.unlink()
     with pytest.raises(DatasetError, match="no manifest"):
         open_dataset(config.paths.data_root, ref.dataset_id)
+
+
+ACK = (
+    '[[build.acknowledged_missing]]\ninstrument = "{pair}"\nmonth = "{month}"\n{reason}'
+)
+
+
+def ack(pair, month, reason=""):
+    return ACK.format(
+        pair=pair, month=month, reason=f'reason = "{reason}"\n' if reason else ""
+    )
+
+
+def hashed_id(tmp_path, name, rules):
+    (tmp_path / name).mkdir()
+    return write_dataset(make_config(tmp_path / name, rules), 5, make_bars()).dataset_id
+
+
+def test_hash_covers_only_the_building_instruments_relevant_rules(tmp_path):
+    # acknowledged-missing entries must sit inside [build]; put them before other tables
+    base_rules = ack("EURUSD", "2024-02", "feed outage") + ack("GBPUSD", "2024-02")
+    base = hashed_id(tmp_path, "base", base_rules)
+
+    reworded = ack("EURUSD", "2024-02", "reworded") + ack("GBPUSD", "2024-02")
+    other_pair_ack = ack("EURUSD", "2024-02", "feed outage") + ack("GBPUSD", "2024-03")
+    other_scale = base_rules + "\n[instruments.USDJPY]\nprice_scale = 2\n"
+    assert hashed_id(tmp_path, "reason", reworded) == base
+    assert hashed_id(tmp_path, "other-ack", other_pair_ack) == base
+    assert hashed_id(tmp_path, "other-scale", other_scale) == base
+
+    own_ack = ack("EURUSD", "2024-03", "feed outage") + ack("GBPUSD", "2024-02")
+    own_scale = base_rules + "\n[instruments.EURUSD]\nprice_scale = 4\n"
+    assert hashed_id(tmp_path, "own-ack", own_ack) != base
+    assert hashed_id(tmp_path, "own-scale", own_scale) != base
