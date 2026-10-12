@@ -103,6 +103,10 @@ class _ClosedSlot:
     revision: int = 0
 
 
+def _discard(bar: Bar, revision: int) -> None:
+    """The default sink: Bars are still kept in ``LiveIngester.revisions``."""
+
+
 class LiveIngester:
     """Turns one Instrument's quote stream into closed Bars at one bar size."""
 
@@ -111,7 +115,7 @@ class LiveIngester:
         config: Config,
         adapter: QuoteStream,
         *,
-        sink: BarSink,
+        sink: BarSink = _discard,
         bar_size: int | None = None,
         start: datetime | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),

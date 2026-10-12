@@ -193,6 +193,15 @@ def build_backfill(
         raise
 
 
+def build_dataset(config: Config, bar_size: int) -> DatasetRef:
+    """Build a backfill Dataset at ``bar_size`` from the raw cache (spec API).
+
+    The CLI ``build`` command and this share ``build_backfill``; use that for
+    the warnings and the build report.
+    """
+    return build_backfill(config, bar_size).ref
+
+
 def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
     cache = RawCache(config.paths.data_root)
     build = config.build

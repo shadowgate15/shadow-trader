@@ -16,10 +16,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .backfill import BuildFailure, build_backfill
+from .bars import Bar
 from .config import Config, ConfigError, load_config
 from .dataset import DatasetError, RawCache
+from .live import LiveIngester
 from .livedataset import build_live
 from .reconcile import ReconciliationRefused, reconcile
+from .replay import live_adapter
 from .report import console_summary
 from .sources import (
     Transport,
@@ -164,8 +167,25 @@ def _run_diff(config: Config, args: argparse.Namespace) -> int:
 
 
 def _run_live(config: Config, args: argparse.Namespace) -> int:
-    print("ingest live: not implemented yet", file=sys.stderr)
-    return EXIT_BUILD_FAILURE
+    if len(config.build.bar_sizes) != 1:
+        raise ConfigError(
+            "live runs one bar size; pass --bar-sizes N "
+            f"(configured: {', '.join(map(str, config.build.bar_sizes))})"
+        )
+    try:
+        for instrument in config.build.instruments:
+            bars = 0
+
+            def count(bar: Bar, revision: int) -> None:
+                nonlocal bars
+                bars += 1
+
+            LiveIngester(config, live_adapter(config, instrument), sink=count).run()
+            print(f"live {instrument}: {bars} bar emissions")
+    except (BuildFailure, OSError) as exc:
+        print(f"live failed: {exc}", file=sys.stderr)
+        return EXIT_BUILD_FAILURE
+    return EXIT_OK
 
 
 _HANDLERS: dict[str, Callable[[Config, argparse.Namespace], int]] = {

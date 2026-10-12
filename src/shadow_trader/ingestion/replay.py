@@ -14,6 +14,11 @@ from .session import session_of
 from .sources import months_between
 
 
+def live_adapter(config: Config, instrument: str) -> ReplayAdapter:
+    """The adapter named by ``[live].adapter`` (v1 supports only ``replay``)."""
+    return ReplayAdapter.from_raw_cache(config, instrument)
+
+
 class ReplayAdapter:
     """The only v1 live adapter. Replays an event iterable in order."""
 

@@ -6,6 +6,7 @@ import pytest
 
 from shadow_trader import main
 from shadow_trader.ingestion import cli
+from shadow_trader.ingestion.config import load_config
 from shadow_trader.ingestion.sources import Response
 
 SUBCOMMANDS = ("fetch", "build", "live", "build-live", "diff")
@@ -41,17 +42,45 @@ def test_ingest_help_lists_the_five_subcommands(capsys):
         assert name in out
 
 
-@pytest.mark.parametrize(
-    "command",
-    [c for c in SUBCOMMANDS if c not in ("fetch", "build", "build-live", "diff")],
-)
-def test_every_stub_subcommand_takes_config(command, config_path, capsys):
-    code = run(["ingest", command, "--config", str(config_path)])
+def live_config(tmp_path: Path, bar_sizes: str = "[5]") -> Path:
+    path = tmp_path / "live.toml"
+    path.write_text(
+        f'[paths]\ndata_root = "{tmp_path / "data"}"\n'
+        f'[build]\ninstruments = ["EURUSD"]\nbar_sizes = {bar_sizes}\n'
+        'start = "2024-01"\nend = "2024-01"\n'
+        '[live]\nadapter = "replay"\n'
+    )
+    return path
 
-    # The skeleton commands are stubs: they load the config, then report
-    # that they are not implemented yet (build failure, exit 1).
-    assert code == 1
-    assert "not implemented" in capsys.readouterr().err
+
+def test_live_runs_the_configured_replay_adapter_through_the_live_ingester(
+    tmp_path, capsys
+):
+    from .test_backfill import fixture_csv, install_raw
+
+    path = live_config(tmp_path)
+    install_raw(load_config(path), "EURUSD", "202401", fixture_csv("eurusd_winter"))
+
+    assert run(["ingest", "live", "--config", str(path)]) == 0
+
+    assert "EURUSD" in capsys.readouterr().out
+    data = tmp_path / "data"
+    assert list((data / "reports/live/replay/EURUSD").glob("*.json"))
+    assert list((data / "raw/live/replay/EURUSD").glob("*.jsonl*"))
+
+
+def test_live_exits_1_when_the_replayed_raw_month_is_missing(tmp_path, capsys):
+    assert run(["ingest", "live", "--config", str(live_config(tmp_path))]) == 1
+
+    assert "202401" in capsys.readouterr().err
+
+
+def test_live_runs_one_bar_size_so_several_is_a_config_error(tmp_path, capsys):
+    path = live_config(tmp_path, "[5, 15]")
+
+    assert run(["ingest", "live", "--config", str(path)]) == 2
+
+    assert "one bar size" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("command", SUBCOMMANDS)
