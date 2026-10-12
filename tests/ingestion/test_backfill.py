@@ -86,7 +86,9 @@ def assert_matches_reference(bars, ticks, minutes: int) -> None:
     for bar, row in zip(bars, expected, strict=True):
         for key, value in row.items():
             assert getattr(bar, key) == value, (key, bar.open_time)
-        assert bar.quality_flags == ()
+        # only Gap rows may carry a flag here: a long enough run is an outage
+        assert bar.quality_flags in ((), ("suspected_outage",))
+        assert bar.is_gap or bar.quality_flags == ()
 
 
 def build_fixture(tmp_path, name, pair, month, minutes=5, scale_toml=""):
