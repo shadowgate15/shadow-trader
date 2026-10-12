@@ -98,3 +98,35 @@ def test_replay_from_raw_cache_defaults_end_to_the_last_complete_month(tmp_path)
 
     with pytest.raises(BuildFailure, match=r"EURUSD.*202402"):
         list(adapter.events())
+
+
+def test_replay_grid_is_clipped_to_the_range_start_like_backfill(tmp_path):
+    # The Session opened Sun 2023-12-31 17:00 NY; the range starts Mon 2024-01-01.
+    from .test_acceptance import prices, replay_bars
+
+    config = make_config(tmp_path, "EURUSD", "2024-01")
+    install_raw(config, "EURUSD", "202401", b"20240102 090000000,1.1,1.2,0\n")
+    batch = open_dataset(
+        config.paths.data_root, build_backfill(config, 60).ref.dataset_id
+    ).read("EURUSD")
+
+    _ingester, sealed = replay_bars(config, 60)
+
+    assert batch[0].open_time == datetime(2024, 1, 1, 5, 0, tzinfo=UTC)
+    assert sealed[0][0].open_time == batch[0].open_time
+    assert prices([bar for bar, _ in sealed]) == prices(batch)
+
+
+def test_replay_grid_is_clipped_to_the_range_end_like_backfill(tmp_path):
+    # The Session Sun 2024-01-28 .. Fri 02-02 runs past the range end 2024-02-01.
+    from .test_acceptance import prices, replay_bars
+
+    config = make_config(tmp_path, "EURUSD", "2024-01")
+    install_raw(config, "EURUSD", "202401", b"20240129 090000000,1.1,1.2,0\n")
+    batch = open_dataset(
+        config.paths.data_root, build_backfill(config, 60).ref.dataset_id
+    ).read("EURUSD")
+
+    _ingester, sealed = replay_bars(config, 60)
+
+    assert prices([bar for bar, _ in sealed]) == prices(batch)
