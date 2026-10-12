@@ -13,6 +13,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+from shadow_trader.ingestion.backfill import BuildFailure, build_backfill
 from shadow_trader.ingestion.config import Config, ConfigError, load_config
 from shadow_trader.ingestion.dataset import RawCache
 from shadow_trader.ingestion.sources import (
@@ -91,6 +92,19 @@ def _run_fetch(config: Config) -> int:
     return EXIT_OK if report.ok else EXIT_BUILD_FAILURE
 
 
+def _run_build(config: Config) -> int:
+    try:
+        for bar_size in config.build.bar_sizes:
+            result = build_backfill(config, bar_size)
+            for warning in result.warnings:
+                print(f"warning: {warning.code}: {warning.message}")
+            print(f"built {bar_size} min dataset {result.ref.dataset_id}")
+    except BuildFailure as exc:
+        print(f"build failed: {exc}", file=sys.stderr)
+        return EXIT_BUILD_FAILURE
+    return EXIT_OK
+
+
 def run_ingest(args: argparse.Namespace) -> int:
     try:
         config = load_config(args.config).with_overrides(
@@ -105,6 +119,8 @@ def run_ingest(args: argparse.Namespace) -> int:
 
     if args.command == "fetch":
         return _run_fetch(config)
+    if args.command == "build":
+        return _run_build(config)
 
     del config  # consumed by the real commands in later tickets
     print(f"ingest {args.command}: not implemented yet", file=sys.stderr)

@@ -41,7 +41,9 @@ def test_ingest_help_lists_the_five_subcommands(capsys):
         assert name in out
 
 
-@pytest.mark.parametrize("command", [c for c in SUBCOMMANDS if c != "fetch"])
+@pytest.mark.parametrize(
+    "command", [c for c in SUBCOMMANDS if c not in ("fetch", "build")]
+)
 def test_every_stub_subcommand_takes_config(command, config_path, capsys):
     extra = ["--from", "2024-01", "--to", "2024-02"] if command == "build-live" else []
 

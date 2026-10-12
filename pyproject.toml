@@ -38,3 +38,5 @@ python-version = "3.13"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = ["slow: full-month runs against the real raw cache; opt in with -m slow"]
