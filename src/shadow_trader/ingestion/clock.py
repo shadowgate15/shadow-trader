@@ -23,8 +23,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from .session import NY, open_of, week_sunday
+
+ZURICH = ZoneInfo("Europe/Zurich")
+ERA_SWITCH = date(2018, 12, 16)  # first Session week stamped on the EU calendar
 
 FIXED_OFFSET = timedelta(hours=-5)
 TOLERANCE = timedelta(minutes=30)
@@ -76,6 +80,25 @@ def rule_of(sunday: date, offset: timedelta) -> str | None:
     if ny == FIXED_OFFSET:
         return None
     return NEW_YORK_LOCAL if offset == ny else FIXED_UTC_MINUS_5
+
+
+def calendar_offset(sunday: date) -> timedelta:
+    """The raw-clock offset the calendar predicts for the Session opening ``sunday``.
+
+    Before ``ERA_SWITCH`` the stamps are New York local time; from then they are
+    Europe/Zurich local time minus six hours (UTC-5 in EU winter, UTC-4 in EU
+    summer). Independent of any tick, so it can cross-check the inference.
+    """
+    if sunday < ERA_SWITCH:
+        return ny_offset(sunday)
+    utcoffset = open_of(sunday).astimezone(ZURICH).utcoffset()
+    assert utcoffset is not None
+    return utcoffset - timedelta(hours=6)
+
+
+def calendar_rule(sunday: date) -> str | None:
+    """The rule the calendar predicts for that week; None when the rules coincide."""
+    return rule_of(sunday, calendar_offset(sunday))
 
 
 def offset_of(sunday: date, rule: str) -> timedelta:
@@ -166,6 +189,13 @@ class WeekEvidence:
 
     def infer(self) -> WeekClock:
         """The clock of every week seen; raises ``WeekClockError`` for the rest."""
+        clock, failures = self.analyse()
+        if failures:
+            raise WeekClockError(failures)
+        return clock
+
+    def analyse(self) -> tuple[WeekClock, dict[date, str]]:
+        """The clock of the weeks that could be decided, and why the others failed."""
         weeks = self._weeks()
         decided: dict[date, timedelta] = {}
         single_end: set[date] = set()
@@ -194,9 +224,10 @@ class WeekEvidence:
             else:
                 inherited.add(sunday)
                 decided[sunday] = offset
-        if failures:
-            raise WeekClockError(dict(sorted(failures.items())))
-        return WeekClock(decided, frozenset(inherited), frozenset(single_end))
+        return (
+            WeekClock(decided, frozenset(inherited), frozenset(single_end)),
+            dict(sorted(failures.items())),
+        )
 
 
 def _deltas(
