@@ -74,7 +74,7 @@ def test_real_eurusd_weeks_decided_on_evidence_agree_with_the_calendar():
     for period in periods:
         evidence.add_text(read_raw_month(cache, "EURUSD", period))
 
-    clock, _ = evidence.analyse()
+    clock, failures = evidence.analyse()
 
     soft = clock.inherited | clock.single_end
     decided = {w: o for w, o in clock.offsets.items() if w not in soft}
@@ -83,6 +83,15 @@ def test_real_eurusd_weeks_decided_on_evidence_agree_with_the_calendar():
         for week, offset in sorted(decided.items())
         if offset != calendar_offset(week)
     }
-    print(f"{len(decided)} evidence-decided weeks, disagreements: {disagreements}")
+    weak = {
+        week.isoformat()
+        for week in soft
+        if clock.offsets[week] != calendar_offset(week)
+    }
+    print(
+        f"{len(decided)} evidence-decided weeks, disagreements: {disagreements}; "
+        f"failing weeks: {sorted(map(str, failures))}; "
+        f"inherited/single_end weeks off the calendar: {sorted(weak)}"
+    )
     assert decided
     assert not disagreements

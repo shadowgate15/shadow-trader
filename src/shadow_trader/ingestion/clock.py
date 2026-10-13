@@ -15,7 +15,9 @@ candidate survives (winter: the rules coincide), or when one candidate fits both
 ends, or, weaker, when only one candidate fits an end (recorded as
 ``single_end``). A week still undecided (no end fits, or the ends fit different
 rules) inherits the rule of its adjacent weeks if every one that exists is
-decided on a rule and they agree; any other week fails.
+decided on a rule and they agree. Failing that, the calendar rule (see
+``calendar_offset``) decides it, provided the week's ticks do not contradict it
+(recorded as ``calendar``); any other week fails.
 """
 
 from __future__ import annotations
@@ -112,6 +114,7 @@ class WeekClock:
     offsets: Mapping[date, timedelta]
     inherited: frozenset[date] = frozenset()
     single_end: frozenset[date] = frozenset()
+    calendar: frozenset[date] = frozenset()
 
     def to_utc(self, naive: datetime) -> datetime:
         return (naive - self.offsets[week_of(naive)]).replace(tzinfo=UTC)
@@ -135,6 +138,7 @@ class WeekClock:
             "offsets": self.minutes(),
             "inherited": sorted(week.isoformat() for week in self.inherited),
             "single_end": sorted(week.isoformat() for week in self.single_end),
+            "calendar": sorted(week.isoformat() for week in self.calendar),
         }
 
     def summary(self) -> dict[str, object]:
@@ -216,16 +220,25 @@ class WeekEvidence:
             else:
                 undecided[sunday] = alive
         inherited: set[date] = set()
+        from_calendar: set[date] = set()
         direct = dict(decided)  # inheritance never chains through inherited weeks
         for sunday, alive in undecided.items():
             offset, reason = _inherit(sunday, alive, direct, weeks)
-            if offset is None:
+            if offset is None and (expected := calendar_offset(sunday)) in alive:
+                from_calendar.add(sunday)
+                decided[sunday] = expected
+            elif offset is None:
                 failures[sunday] = reason
             else:
                 inherited.add(sunday)
                 decided[sunday] = offset
         return (
-            WeekClock(decided, frozenset(inherited), frozenset(single_end)),
+            WeekClock(
+                decided,
+                frozenset(inherited),
+                frozenset(single_end),
+                frozenset(from_calendar),
+            ),
             dict(sorted(failures.items())),
         )
 

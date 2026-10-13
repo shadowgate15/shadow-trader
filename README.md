@@ -86,10 +86,10 @@ All paths are under `data_root`:
 
 ### Tests
 
-`uv run pytest` skips the slow acceptance tests (`-m 'not slow'` is the default). To run them against real EUR/USD history, fetch 2009-01 onwards first with `ingest fetch`, then:
+`uv run pytest` skips the slow acceptance tests (`-m 'not slow'` is the default). To run them against real EUR/USD history, point them at a raw cache holding the months you want to cover (fetched with `ingest fetch`); each test is range-driven and uses only the months its range names, so a partial cache is fine:
 
 ```sh
 SHADOW_TRADER_RAW_ROOT=/data/shadow-trader uv run pytest -m slow
 ```
 
-`SHADOW_TRADER_RAW_ROOT` is the `data_root` holding the raw cache. `SHADOW_TRADER_REPLAY_RANGE` (`YYYY-MM` or `YYYY-MM:YYYY-MM`, default `2024-01`) picks the range for the replay-versus-batch parity test.
+`SHADOW_TRADER_RAW_ROOT` is the `data_root` holding the raw cache. `SHADOW_TRADER_REPLAY_RANGE` (`YYYY-MM` or `YYYY-MM:YYYY-MM`, default `2024-01`) picks the range for the replay-versus-batch parity test, and `SHADOW_TRADER_BUILD_RANGE` (same form, default every cached month) the range for the build and `dataset_id` reproducibility test. The raw-clock calendar cross-check reads every cached month and checks each week decided on tick evidence against the HistData calendar rule (New York local before 2018-12-16, Europe/Zurich minus 6 h after).
