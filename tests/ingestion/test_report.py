@@ -18,6 +18,7 @@ SPEC_WARNING_CODES = {
     "thin_data",
     "anomaly_alert_fraction_exceeded",
     "live_quote_after_seal",
+    "late_ticks_dropped",  # additive: stale ticks behind a closed slot (backfill)
 }
 
 

@@ -10,7 +10,7 @@ reads only ticks, against this independent calendar.
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -72,7 +72,7 @@ def test_real_eurusd_weeks_decided_on_evidence_agree_with_the_calendar():
     )
     evidence = WeekEvidence()
     for period in periods:
-        evidence.add_text(read_raw_month(cache, "EURUSD", period))
+        evidence.add_text(read_raw_month(cache, "EURUSD", period), period)
 
     clock, failures = evidence.analyse()
 
@@ -92,6 +92,13 @@ def test_real_eurusd_weeks_decided_on_evidence_agree_with_the_calendar():
         f"{len(decided)} evidence-decided weeks, disagreements: {disagreements}; "
         f"failing weeks: {sorted(map(str, failures))}; "
         f"inherited/single_end weeks off the calendar: {sorted(weak)}"
+    )
+    # a raw clock that steps back inside a week must be a replayed block (the scan
+    # raises otherwise); the repeats are the hour after the EU clock change
+    replays = [r for each in clock.replays.values() for r in each]
+    print(f"replayed blocks: {[(r.label, r.row, r.rows, r.first) for r in replays]}")
+    assert all(
+        datetime.strptime(r.first, "%Y%m%d %H%M%S").weekday() == 6 for r in replays
     )
     assert decided
     assert not disagreements

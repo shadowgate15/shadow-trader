@@ -209,3 +209,21 @@ def test_real_eurusd_replay_live_sealed_bars_equal_batch(tmp_path):
 
     assert ingester.late_dropped == 0
     assert prices(ingester.revisions.latest()) == prices(batch)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("year", [2019, 2020, 2021, 2022, 2023, 2025])
+def test_real_eurusd_week_with_a_replayed_hour_builds_without_out_of_order(
+    tmp_path, year
+):
+    root = _real_root()
+    have = set(_periods(root))
+    if not {f"{year}10", f"{year}11"} <= have:
+        pytest.skip(f"cache lacks {year}-10 and {year}-11")
+    config = _real_config(tmp_path, root, f"{year}-10", f"{year}-11")
+
+    result = build_backfill(config, 5)
+
+    replays = result.ref.manifest["session_clock"]["EURUSD"]["replays"]
+    assert len(replays) == 1  # the repeated hour on the EU fall-back Sunday
+    assert replays[0]["from"].endswith("190000")

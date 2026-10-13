@@ -27,6 +27,7 @@ WARNING_CODES = (
     "thin_data",
     "anomaly_alert_fraction_exceeded",
     "live_quote_after_seal",
+    "late_ticks_dropped",
 )
 
 REPORT_VERSION = 1
