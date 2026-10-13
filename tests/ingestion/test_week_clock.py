@@ -291,3 +291,60 @@ def test_single_end_choice_that_matches_the_calendar_stays_single_end(tmp_path):
     assert result.ref.manifest["session_clock"]["EURUSD"]["single_end"] == [
         "2024-04-07"
     ]
+
+
+def replay_week(replayed: list[str] | None = None, *, twice: bool = True):
+    """A New York local week of 2024-04-07 with Sunday ticks 19:00-19:59 listed
+    twice, the way HistData repeats the hour at the EU clock change."""
+    sunday = date(2024, 4, 7)
+    block = [
+        f"{sunday:%Y%m%d} 190000000,1.10000,1.10010,0",
+        f"{sunday:%Y%m%d} 193000000,1.10020,1.10030,0",
+        f"{sunday:%Y%m%d} 195959000,1.10040,1.10050,0",
+    ]
+    week = session_lines(sunday, *NY_WEEK)
+    again = (replayed or block) if twice else []
+    return [week[0], *block, *again, *week[1:]]
+
+
+def test_replayed_hour_is_dropped_and_recorded_not_a_failure(tmp_path):
+    (tmp_path / "plain").mkdir()
+    config, run = build(tmp_path, replay_week(), "2024-04")
+    plain_config, plain_run = build(
+        tmp_path / "plain", replay_week(twice=False), "2024-04"
+    )
+
+    result, plain = run(), plain_run()
+
+    bars = open_dataset(config.paths.data_root, result.ref.dataset_id).read("EURUSD")
+    expected = open_dataset(plain_config.paths.data_root, plain.ref.dataset_id).read(
+        "EURUSD"
+    )
+    assert bars == expected
+    assert result.ref.manifest["session_clock"]["EURUSD"]["replays"] == [
+        {
+            "label": "EURUSD/202404",
+            "row": 5,
+            "rows": 3,
+            "from": "20240407 190000",
+            "to": "20240407 195959",
+        }
+    ]
+    assert offsets(result) == {"2024-04-07": EDT}
+
+
+def test_backward_jump_that_is_not_a_replay_fails_naming_the_row(tmp_path):
+    different = replay_week()[4:7]
+    different[1] = different[1].replace("1.10020", "1.10999")
+    _, run = build(tmp_path, replay_week(different), "2024-04")
+
+    with pytest.raises(BuildFailure, match=r"EURUSD/202404 row 5.*not a replay") as e:
+        run()
+
+    assert e.value.locator == "EURUSD/202404 row 5"
+
+
+def test_week_without_a_jump_records_no_replays(tmp_path):
+    _, run = build(tmp_path, replay_week(twice=False), "2024-04")
+
+    assert run().ref.manifest["session_clock"]["EURUSD"]["replays"] == []

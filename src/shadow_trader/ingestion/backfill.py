@@ -23,7 +23,7 @@ from pathlib import Path
 from . import dataset
 from .anomaly import FlaggingBarBuilder, summarize_flags
 from .bars import Bar, Quote
-from .clock import WeekClock, WeekClockError, WeekEvidence
+from .clock import UnexplainedJump, WeekClock, WeekClockError, WeekEvidence
 from .config import (
     DEFAULT_START,
     Config,
@@ -104,7 +104,13 @@ def infer_week_clock(
     """The raw-clock offset of every Session week in ``periods`` (a pre-pass)."""
     evidence = WeekEvidence()
     for period in periods:
-        evidence.add_text(read_raw_month(cache, instrument, period))
+        label = f"{instrument}/{period}"
+        try:
+            evidence.add_text(read_raw_month(cache, instrument, period), label)
+        except UnexplainedJump as jump:
+            raise BuildFailure(
+                f"ticks out of order at {jump}", f"{jump.label} row {jump.row}"
+            ) from None
     try:
         return evidence.infer()
     except WeekClockError as error:
@@ -155,7 +161,12 @@ def _alignment_warning(
 def parse_ticks(
     text: str, label: str, price_scale: int, clock: WeekClock
 ) -> Iterator[Quote]:
+    dropped = {r.row: r.rows for r in clock.replays.get(label, ())}
+    skip_until = 0
     for row, line in enumerate(text.splitlines(), start=1):
+        skip_until = row + dropped[row] if row in dropped else skip_until
+        if row < skip_until:
+            continue  # a replayed block (see ``clock.Replay``)
         where = f"{label} row {row}"
         try:
             stamp, bid, ask, *_ = line.split(",")

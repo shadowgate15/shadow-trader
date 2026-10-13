@@ -24,8 +24,9 @@ decided on a rule and they agree. Failing that, the calendar rule (see
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -40,6 +41,62 @@ NEW_YORK_LOCAL = "new_york_local"
 FIXED_UTC_MINUS_5 = "fixed_utc_minus_5"
 _LEAD = timedelta(hours=10)  # Sunday ticks before 10:00 belong to the week before
 _SUNDAY_NOON = "12"
+
+
+BACKWARD_TOLERANCE = timedelta(seconds=60)  # smaller backward steps are jitter
+
+
+class UnexplainedJump(Exception):
+    """A backward jump in the raw stamps that is not a replay of earlier ticks."""
+
+    def __init__(self, label: str, row: int, reason: str) -> None:
+        self.label = label
+        self.row = row
+        super().__init__(f"{label} row {row}: {reason}")
+
+
+@dataclass(frozen=True)
+class Replay:
+    """A block of ticks the raw file lists twice (HistData repeats the hour at an
+    EU clock change). The repeat is byte-identical, so the stamps are not a shift
+    of the clock: the second listing is dropped and the offset is unchanged."""
+
+    label: str
+    row: int  # first replayed row (1-based); the block is dropped
+    rows: int
+    first: str  # stamps of the repeated block, to the second
+    last: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "label": self.label,
+            "row": self.row,
+            "rows": self.rows,
+            "from": self.first,
+            "to": self.last,
+        }
+
+
+def find_replay(lines: list[str], index: int, label: str, high: str) -> Replay | None:
+    """The replay starting at ``lines[index]``, which stepped back from ``high``.
+
+    None for a step back under ``BACKWARD_TOLERANCE``; raises ``UnexplainedJump``
+    unless the ticks from ``index`` repeat, line for line, the ticks since the
+    first one with the same stamp.
+    """
+    stamp = lines[index][:15]
+    if _naive(high) - _naive(stamp) < BACKWARD_TOLERANCE:
+        return None
+    start = bisect_left(lines, stamp, 0, index, key=lambda line: line[:15])
+    rows = index - start
+    if lines[index : index + rows] != lines[start:index]:
+        raise UnexplainedJump(
+            label,
+            index + 1,
+            f"stamps step back from {high} to {stamp} and the ticks are not a "
+            "replay of the preceding ones",
+        )
+    return Replay(label, index + 1, rows, lines[start][:15], lines[index - 1][:15])
 
 
 class WeekClockError(Exception):
@@ -117,6 +174,7 @@ class WeekClock:
     inherited: frozenset[date] = frozenset()
     single_end: frozenset[date] = frozenset()
     calendar: frozenset[date] = frozenset()
+    replays: Mapping[str, tuple[Replay, ...]] = field(default_factory=dict)
 
     def to_utc(self, naive: datetime) -> datetime:
         return (naive - self.offsets[week_of(naive)]).replace(tzinfo=UTC)
@@ -141,6 +199,11 @@ class WeekClock:
             "inherited": sorted(week.isoformat() for week in self.inherited),
             "single_end": sorted(week.isoformat() for week in self.single_end),
             "calendar": sorted(week.isoformat() for week in self.calendar),
+            "replays": [
+                replay.as_dict()
+                for label in sorted(self.replays)
+                for replay in self.replays[label]
+            ],
         }
 
     def summary(self) -> dict[str, object]:
@@ -153,13 +216,29 @@ class WeekEvidence:
     def __init__(self) -> None:
         # naive day -> [first stamp, last stamp, first Sunday stamp from 12:00]
         self._days: dict[str, list[str | None]] = {}
+        self._replays: dict[str, tuple[Replay, ...]] = {}
 
-    def add_text(self, text: str) -> None:
+    def add_text(self, text: str, label: str = "") -> None:
+        """Add one raw month; raises ``UnexplainedJump`` for a stamp step back that
+        is not a replay. Replayed ticks are not evidence."""
         days = self._days
         current: str | None = None
         record: list[str | None] | None = None
         sunday = False
-        for line in text.splitlines():
+        lines = text.splitlines()
+        high = ""
+        skip_until = 0
+        replays: list[Replay] = []
+        for index, line in enumerate(lines):
+            if index < skip_until:
+                continue
+            stamp = line[:15]
+            if stamp >= high:
+                high = stamp
+            elif replay := find_replay(lines, index, label, high):
+                replays.append(replay)
+                skip_until = index + replay.rows
+                continue
             day = line[:8]
             if day != current:
                 current = day
@@ -174,6 +253,8 @@ class WeekEvidence:
             record[1] = line[:15]
             if sunday and record[2] is None and line[9:11] >= _SUNDAY_NOON:
                 record[2] = line[:15]
+        if replays:
+            self._replays[label] = tuple(replays)
 
     def _weeks(self) -> dict[date, list[str | None]]:
         """Per week: [first Sunday tick, last tick]; either may be missing."""
@@ -245,6 +326,7 @@ class WeekEvidence:
                 frozenset(inherited),
                 frozenset(single_end),
                 frozenset(from_calendar),
+                dict(self._replays),
             ),
             dict(sorted(failures.items())),
         )
