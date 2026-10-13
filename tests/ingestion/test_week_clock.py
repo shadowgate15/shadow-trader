@@ -257,3 +257,37 @@ def test_thin_week_next_to_a_winter_week_falls_back_to_the_calendar(tmp_path):
 
     assert offsets(result)["2024-03-10"] == EST
     assert calendar_weeks(result) == ["2024-03-10"]
+
+
+def single_end_week(open_hour: int, close_tick: str) -> list[str]:
+    sunday = date(2024, 4, 7)
+    return [
+        stamp(sunday, open_hour),
+        stamp(sunday + timedelta(days=2), 12),
+        f"{sunday + timedelta(days=5):%Y%m%d} {close_tick}000,{TICK}",
+    ]
+
+
+def test_single_end_choice_against_the_calendar_defers_to_the_calendar(tmp_path):
+    # both clocks on summer time: the calendar says New York local. Only the last
+    # tick (1 s before the close on a fixed UTC-5 reading) backs the other rule,
+    # and both ends sit inside the session under New York local.
+    _, run = build(tmp_path, single_end_week(18, "155959"), "2024-04")
+
+    result = run()
+
+    assert offsets(result) == {"2024-04-07": EDT}
+    assert calendar_weeks(result) == ["2024-04-07"]
+    assert result.ref.manifest["session_clock"]["EURUSD"]["single_end"] == []
+
+
+def test_single_end_choice_that_matches_the_calendar_stays_single_end(tmp_path):
+    _, run = build(tmp_path, single_end_week(17, "140000"), "2024-04")
+
+    result = run()
+
+    assert offsets(result) == {"2024-04-07": EDT}
+    assert calendar_weeks(result) == []
+    assert result.ref.manifest["session_clock"]["EURUSD"]["single_end"] == [
+        "2024-04-07"
+    ]

@@ -132,20 +132,22 @@ def test_summer_week_first_bar_opens_2100_utc(tmp_path):
     assert session_first_opens(bars) == [datetime(2024, 7, 14, 21, 0, tzinfo=UTC)]
 
 
-def test_dst_edge_spanning_fixture_converts_each_side_of_the_clock_change(tmp_path):
+def test_dst_edge_spanning_fixture_follows_the_calendar_in_the_gap_week(tmp_path):
     config, result = build_fixture(tmp_path, "eurusd_dst_edge", "EURUSD", "2024-03")
 
     bars = open_dataset(config.paths.data_root, result.ref.dataset_id).read("EURUSD")
-    # US clocks moved forward Sun 2024-03-10 02:00 local, while the market is closed.
-    ticks = oracle_ticks(
-        fixture_csv("eurusd_dst_edge"),
-        lambda naive: -5 if naive < datetime(2024, 3, 10, 2) else -4,
-    )
+    # The fixture's week of 2024-03-10 has only an opening tick (17:00 raw), which
+    # fits New York local exactly and fixed UTC-5 an hour late: weak evidence. US
+    # clocks moved forward that morning but EU clocks have not, so the calendar
+    # rule is fixed UTC-5 and wins; both weeks are then read at UTC-5.
+    ticks = oracle_ticks(fixture_csv("eurusd_dst_edge"), lambda _: -5)
     assert_matches_reference(bars, ticks, 5)
     assert session_first_opens(bars) == [
-        datetime(2024, 3, 3, 22, 0, tzinfo=UTC),  # EST session
-        datetime(2024, 3, 10, 21, 0, tzinfo=UTC),  # EDT session
+        datetime(2024, 3, 3, 22, 0, tzinfo=UTC),
+        datetime(2024, 3, 10, 21, 0, tzinfo=UTC),  # session open; first tick 22:00
     ]
+    clock = result.ref.manifest["session_clock"]["EURUSD"]
+    assert clock["calendar"] == ["2024-03-10"]
 
 
 @pytest.mark.parametrize("minutes", [1, 15, 60])

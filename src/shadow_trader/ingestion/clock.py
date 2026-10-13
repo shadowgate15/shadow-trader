@@ -13,7 +13,9 @@ weeks only ever deviate inwards, which says nothing about the clock. A week with
 no surviving candidate fits no rule and fails. Otherwise it is decided when one
 candidate survives (winter: the rules coincide), or when one candidate fits both
 ends, or, weaker, when only one candidate fits an end (recorded as
-``single_end``). A week still undecided (no end fits, or the ends fit different
+``single_end``, unless that choice disagrees with the calendar rule and the
+calendar's is not contradicted, when the calendar wins and the week is recorded
+as ``calendar``). A week still undecided (no end fits, or the ends fit different
 rules) inherits the rule of its adjacent weeks if every one that exists is
 decided on a rule and they agree. Failing that, the calendar rule (see
 ``calendar_offset``) decides it, provided the week's ticks do not contradict it
@@ -204,6 +206,7 @@ class WeekEvidence:
         decided: dict[date, timedelta] = {}
         single_end: set[date] = set()
         undecided: dict[date, list[timedelta]] = {}
+        from_calendar: set[date] = set()
         failures: dict[date, str] = {}
         for sunday, (first, last) in sorted(weeks.items()):
             alive, reason = _alive(sunday, first, last)
@@ -215,12 +218,16 @@ class WeekEvidence:
             elif both := [o for o in alive if fits[o] == 2]:
                 decided[sunday] = both[0]
             elif len(backed := [o for o in alive if fits[o]]) == 1:
-                decided[sunday] = backed[0]
-                single_end.add(sunday)
+                expected = calendar_offset(sunday)
+                if backed[0] != expected and expected in alive:
+                    decided[sunday] = expected  # one end is weak evidence: defer
+                    from_calendar.add(sunday)
+                else:
+                    decided[sunday] = backed[0]
+                    single_end.add(sunday)
             else:
                 undecided[sunday] = alive
         inherited: set[date] = set()
-        from_calendar: set[date] = set()
         direct = dict(decided)  # inheritance never chains through inherited weeks
         for sunday, alive in undecided.items():
             offset, reason = _inherit(sunday, alive, direct, weeks)
