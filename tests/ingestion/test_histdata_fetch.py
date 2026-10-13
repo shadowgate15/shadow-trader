@@ -26,14 +26,22 @@ def make_zip(pair: str, month: str, csv: bytes = b"20240301 000000000,1.1,1.2,0\
 class StubTransport:
     """Recorded-response stand-in for the HistData site. Never touches a network."""
 
-    def __init__(self, posts):
-        # posts: {datemonth: [Response, ...]}; the last response repeats.
+    def __init__(self, posts, pages=None):
+        # posts: {datemonth: [Response, ...]}; the last response repeats, and so
+        # does the last of ``pages`` (month-page replies, default one good page).
         self.posts = {k: list(v) for k, v in posts.items()}
+        self.pages = list(pages or [Response(200, PAGE.encode(), {})])
         self.calls: list[tuple] = []
 
     def get(self, url, headers):
         self.calls.append(("GET", url, dict(headers)))
-        return Response(200, PAGE.encode(), {})
+        page = self.pages.pop(0) if len(self.pages) > 1 else self.pages[0]
+        if isinstance(page, Exception):
+            raise page
+        return page
+
+    def gets(self):
+        return [c for c in self.calls if c[0] == "GET"]
 
     def post(self, url, form, headers):
         self.calls.append(("POST", url, dict(form), dict(headers)))
@@ -45,7 +53,13 @@ class StubTransport:
 
 
 def run(
-    tmp_path, transport, *, instruments=("EURUSD",), start="2024-03", end="2024-03"
+    tmp_path,
+    transport,
+    *,
+    instruments=("EURUSD",),
+    start="2024-03",
+    end="2024-03",
+    now=NOW,
 ):
     sleeps: list[float] = []
     report = fetch_months(
@@ -55,7 +69,7 @@ def run(
         start,
         end,
         sleep=sleeps.append,
-        now=lambda: NOW,
+        now=lambda: now,
     )
     return report, sleeps
 
@@ -187,3 +201,113 @@ def test_range_spans_instruments_and_defaults_end_to_last_complete_month(tmp_pat
 
     # NOW is 2026-10-12, so the last complete month is 2026-09.
     assert [m for _, m in report.fetched] == ["202608", "202609"]
+
+
+def page_with(token: str) -> Response:
+    return Response(200, PAGE.replace("TOKEN123", token).encode(), {})
+
+
+def backoffs(sleeps):
+    """The waits between attempts (pacing waits are all under a second)."""
+    return [s for s in sleeps if s >= 1]
+
+
+def test_failed_attempts_back_off_exponentially_before_succeeding(tmp_path):
+    bad = Response(503, b"busy", {})
+    transport = StubTransport({"202403": [bad, bad, ok()]})
+
+    report, sleeps = run(tmp_path, transport)
+
+    assert report.fetched == [("EURUSD", "202403")]
+    assert backoffs(sleeps) == [1.0, 2.0]
+
+
+def test_every_attempt_fetches_a_fresh_form_token(tmp_path):
+    transport = StubTransport(
+        {"202403": [Response(200, b"", {}), ok()]},
+        pages=[page_with("FIRST"), page_with("SECOND")],
+    )
+
+    run(tmp_path, transport)
+
+    assert [c[2]["tk"] for c in transport.posts_for("202403")] == ["FIRST", "SECOND"]
+    assert len(transport.gets()) == 2
+
+
+def test_empty_token_means_no_such_month_without_posting_or_retrying(tmp_path):
+    transport = StubTransport({"202403": [ok()]}, pages=[page_with("")])
+
+    report, sleeps = run(tmp_path, transport)
+
+    assert report.absent == [("EURUSD", "202403")]
+    assert report.ok
+    assert transport.posts_for("202403") == []
+    assert len(transport.gets()) == 1
+    assert backoffs(sleeps) == []
+    assert not (tmp_path / "raw" / "histdata" / "EURUSD").exists()
+
+
+def test_month_page_without_a_token_field_is_retried_then_rejected(tmp_path):
+    transport = StubTransport(
+        {"202403": [ok()]}, pages=[Response(200, b"<html></html>", {})]
+    )
+
+    report, sleeps = run(tmp_path, transport)
+
+    assert [m for m, _ in report.rejected] == [("EURUSD", "202403")]
+    assert len(transport.gets()) == 3
+    assert transport.posts_for("202403") == []
+    assert backoffs(sleeps) == [1.0, 2.0]
+
+
+def test_network_error_is_retried(tmp_path):
+    transport = StubTransport(
+        {"202403": [ok()]}, pages=[OSError("reset"), Response(200, PAGE.encode(), {})]
+    )
+
+    report, _ = run(tmp_path, transport)
+
+    assert report.fetched == [("EURUSD", "202403")]
+
+
+def test_requests_carry_a_descriptive_user_agent(tmp_path):
+    transport = StubTransport({"202403": [ok()]})
+
+    run(tmp_path, transport)
+
+    agents = [c[-1].get("User-Agent", "") for c in transport.calls]
+    assert len(agents) == 2
+    assert all(a.startswith("shadow-trader/") and "github.com" in a for a in agents)
+
+
+def test_month_not_yet_settled_is_not_fetched_or_cached_as_final(tmp_path):
+    early = datetime(2026, 10, 6, 23, 0, tzinfo=UTC)  # Sept ended 6 d 23 h ago
+    transport = StubTransport({"202609": [ok(month="202609")]})
+
+    report, _ = run(tmp_path, transport, start="2026-09", end="2026-09", now=early)
+
+    assert report.unsettled == [("EURUSD", "202609")]
+    assert report.fetched == []
+    assert report.ok  # waiting is not a failure
+    assert transport.calls == []
+    assert not (tmp_path / "raw" / "histdata" / "EURUSD").exists()
+
+
+def test_month_is_fetched_once_seven_days_after_it_ended(tmp_path):
+    settled = datetime(2026, 10, 8, 0, 0, tzinfo=UTC)
+    transport = StubTransport({"202609": [ok(month="202609")]})
+
+    report, _ = run(tmp_path, transport, start="2026-09", end="2026-09", now=settled)
+
+    assert report.fetched == [("EURUSD", "202609")]
+    assert report.unsettled == []
+
+
+def test_default_end_is_the_last_settled_month(tmp_path):
+    early = datetime(2026, 10, 5, tzinfo=UTC)  # September has not settled yet
+    transport = StubTransport({"202608": [ok(month="202608")]})
+
+    report, _ = run(tmp_path, transport, start="2026-08", end=None, now=early)
+
+    assert [m for _, m in report.fetched] == ["202608"]
+    assert report.unsettled == []

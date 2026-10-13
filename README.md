@@ -30,7 +30,7 @@ Every command requires `--config` (path to the TOML file) and accepts the three 
 
 | Command | What it does | Extra flags |
 | --- | --- | --- |
-| `fetch` | Downloads each missing month into the write-once raw cache. Cached months are skipped without a network call; months absent at the source are reported as warnings. `end` defaults to the last complete UTC month. | none |
+| `fetch` | Downloads each missing month into the write-once raw cache. Cached months are skipped without a network call; months absent at the source (an empty download token) are reported as warnings. Failed attempts are retried with exponential backoff, each with a fresh token. A month is fetched only once it has settled, 7 days after it ends, so the write-once cache never freezes a still-changing file; months not yet settled are reported as warnings and picked up by a later run. `end` defaults to the last settled UTC month. | none |
 | `build` | Builds one backfill Dataset per configured bar size from the raw cache and writes a build report. A [Gap](GLOSSARY.md) is flagged, never filled. | none |
 | `live` | Runs the live ingester once per Instrument, writing the raw quote log and run reports. Runs a single bar size, so pass `--bar-sizes N` if the config lists several. The only adapter in v1 is `replay`, which feeds the cached HistData ticks through the live path with no network. | none |
 | `build-live` | Builds a live Dataset per bar size from the raw quote log, over sealed slots only (after the [repair window](GLOSSARY.md)), using the latest Revision of each Bar. | `--from`, `--to`: the range `[from, to)`, ISO dates or datetimes (naive values are UTC). Both are required, and `--from` must be before `--to`. |

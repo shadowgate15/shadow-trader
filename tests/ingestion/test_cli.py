@@ -223,3 +223,22 @@ def test_fetch_reports_absent_months_as_warnings_with_exit_0(
 
     assert code == 0
     assert "absent" in capsys.readouterr().out
+
+
+def test_fetch_reports_unsettled_months_as_warnings_without_downloading(
+    tmp_path, monkeypatch, capsys
+):
+    transport = FakeTransport(Response(200, b"", {}))
+    monkeypatch.setattr(cli, "make_transport", lambda: transport)
+    monkeypatch.setattr(cli, "_sleep", lambda s: None)
+    path = tmp_path / "future.toml"
+    path.write_text(
+        f'[paths]\ndata_root = "{tmp_path / "data"}"\n'
+        '[build]\ninstruments = ["EURUSD"]\nstart = "2099-01"\nend = "2099-01"\n'
+    )
+
+    code = run(["ingest", "fetch", "--config", str(path)])
+
+    assert code == 0
+    assert "not settled" in capsys.readouterr().out
+    assert transport.posts == 0
