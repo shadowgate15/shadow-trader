@@ -154,7 +154,15 @@ def test_thin_week_inherits_the_rule_when_both_neighbours_agree(tmp_path):
     assert datetime(2024, 3, 24, 23, 30, tzinfo=UTC) in {b.open_time for b in bars}
 
 
-def test_thin_week_between_disagreeing_neighbours_fails_the_build(tmp_path):
+def calendar_weeks(result):
+    return result.ref.manifest["session_clock"]["EURUSD"]["calendar"]
+
+
+def test_thin_week_between_disagreeing_neighbours_falls_back_to_the_calendar(
+    tmp_path,
+):
+    # the neighbours cannot be inherited, but 2024-03-17 sits in the US-only DST
+    # window, where the calendar says the raw clock is fixed UTC-5
     lines = [
         *session_lines(date(2024, 3, 10), *FIXED_DST_WEEK),
         *thin_week(date(2024, 3, 17)),
@@ -162,11 +170,14 @@ def test_thin_week_between_disagreeing_neighbours_fails_the_build(tmp_path):
     ]
     _, run = build(tmp_path, lines)
 
-    with pytest.raises(BuildFailure, match=r"EURUSD.*2024-03-17"):
-        run()
+    result = run()
+
+    assert offsets(result)["2024-03-17"] == EST
+    assert calendar_weeks(result) == ["2024-03-17"]
+    assert result.ref.manifest["session_clock"]["EURUSD"]["inherited"] == []
 
 
-def test_thin_week_next_to_another_thin_week_fails_the_build(tmp_path):
+def test_thin_week_next_to_another_thin_week_falls_back_to_the_calendar(tmp_path):
     lines = [
         *session_lines(date(2024, 3, 17), *NY_WEEK),
         *thin_week(date(2024, 3, 24)),
@@ -174,7 +185,37 @@ def test_thin_week_next_to_another_thin_week_fails_the_build(tmp_path):
     ]
     _, run = build(tmp_path, lines)
 
-    with pytest.raises(BuildFailure, match=r"2024-03-24|2024-03-31"):
+    result = run()
+
+    # US-only window, then both on summer time from the EU change on 03-31
+    assert offsets(result)["2024-03-24"] == EST
+    assert offsets(result)["2024-03-31"] == EDT
+    assert calendar_weeks(result) == ["2024-03-24", "2024-03-31"]
+
+
+def test_inherited_and_decided_weeks_are_not_recorded_as_calendar(tmp_path):
+    lines = [
+        *session_lines(date(2024, 3, 17), *NY_WEEK),
+        *thin_week(date(2024, 3, 24)),
+        *session_lines(date(2024, 3, 31), *NY_WEEK),
+    ]
+    _, run = build(tmp_path, lines)
+
+    assert calendar_weeks(run()) == []
+
+
+def test_calendar_does_not_rescue_a_week_whose_ticks_contradict_every_rule(tmp_path):
+    # a thin week is undecided, but a stray tick 3 h before the open kills both
+    # candidates, so the calendar has nothing to confirm
+    lines = [
+        *session_lines(date(2024, 3, 17), *NY_WEEK),
+        stamp(date(2024, 3, 24), 13, 50),
+        stamp(date(2024, 3, 26), 12),
+        stamp(date(2024, 3, 29), 13),
+    ]
+    _, run = build(tmp_path, lines)
+
+    with pytest.raises(BuildFailure, match=r"2024-03-24.*fits no raw-clock rule"):
         run()
 
 
@@ -204,13 +245,49 @@ def test_tick_in_the_dst_change_hour_is_dropped_not_fatal(tmp_path):
     assert any(w.code == "out_of_session_ticks" for w in result.warnings)
 
 
-def test_thin_week_next_to_a_winter_week_fails_the_build(tmp_path):
-    # the rule may change at the clock change, and a winter week says nothing
+def test_thin_week_next_to_a_winter_week_falls_back_to_the_calendar(tmp_path):
+    # a winter neighbour says nothing about the rule, so the calendar decides
     lines = [
         *session_lines(date(2024, 3, 3), *NY_WEEK),
         *thin_week(date(2024, 3, 10)),
     ]
     _, run = build(tmp_path, lines)
 
-    with pytest.raises(BuildFailure, match=r"2024-03-10.*winter"):
-        run()
+    result = run()
+
+    assert offsets(result)["2024-03-10"] == EST
+    assert calendar_weeks(result) == ["2024-03-10"]
+
+
+def single_end_week(open_hour: int, close_tick: str) -> list[str]:
+    sunday = date(2024, 4, 7)
+    return [
+        stamp(sunday, open_hour),
+        stamp(sunday + timedelta(days=2), 12),
+        f"{sunday + timedelta(days=5):%Y%m%d} {close_tick}000,{TICK}",
+    ]
+
+
+def test_single_end_choice_against_the_calendar_defers_to_the_calendar(tmp_path):
+    # both clocks on summer time: the calendar says New York local. Only the last
+    # tick (1 s before the close on a fixed UTC-5 reading) backs the other rule,
+    # and both ends sit inside the session under New York local.
+    _, run = build(tmp_path, single_end_week(18, "155959"), "2024-04")
+
+    result = run()
+
+    assert offsets(result) == {"2024-04-07": EDT}
+    assert calendar_weeks(result) == ["2024-04-07"]
+    assert result.ref.manifest["session_clock"]["EURUSD"]["single_end"] == []
+
+
+def test_single_end_choice_that_matches_the_calendar_stays_single_end(tmp_path):
+    _, run = build(tmp_path, single_end_week(17, "140000"), "2024-04")
+
+    result = run()
+
+    assert offsets(result) == {"2024-04-07": EDT}
+    assert calendar_weeks(result) == []
+    assert result.ref.manifest["session_clock"]["EURUSD"]["single_end"] == [
+        "2024-04-07"
+    ]

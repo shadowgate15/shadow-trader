@@ -30,7 +30,7 @@ Every command requires `--config` (path to the TOML file) and accepts the three 
 
 | Command | What it does | Extra flags |
 | --- | --- | --- |
-| `fetch` | Downloads each missing month into the write-once raw cache. Cached months are skipped without a network call; months absent at the source are reported as warnings. `end` defaults to the last complete UTC month. | none |
+| `fetch` | Downloads each missing month into the write-once raw cache. Cached months are skipped without a network call; months absent at the source (an empty download token) are reported as warnings. Failed attempts are retried with exponential backoff, each with a fresh token. A month is fetched only once it has settled, 7 days after it ends, so the write-once cache never freezes a still-changing file; months not yet settled are reported as warnings and picked up by a later run. `end` defaults to the last settled UTC month. | none |
 | `build` | Builds one backfill Dataset per configured bar size from the raw cache and writes a build report. A [Gap](GLOSSARY.md) is flagged, never filled. | none |
 | `live` | Runs the live ingester once per Instrument, writing the raw quote log and run reports. Runs a single bar size, so pass `--bar-sizes N` if the config lists several. The only adapter in v1 is `replay`, which feeds the cached HistData ticks through the live path with no network. | none |
 | `build-live` | Builds a live Dataset per bar size from the raw quote log, over sealed slots only (after the [repair window](GLOSSARY.md)), using the latest Revision of each Bar. | `--from`, `--to`: the range `[from, to)`, ISO dates or datetimes (naive values are UTC). Both are required, and `--from` must be before `--to`. |
@@ -86,10 +86,10 @@ All paths are under `data_root`:
 
 ### Tests
 
-`uv run pytest` skips the slow acceptance tests (`-m 'not slow'` is the default). To run them against real EUR/USD history, fetch 2009-01 onwards first with `ingest fetch`, then:
+`uv run pytest` skips the slow acceptance tests (`-m 'not slow'` is the default). To run them against real EUR/USD history, point them at a raw cache holding the months you want to cover (fetched with `ingest fetch`); each test is range-driven and uses only the months its range names, so a partial cache is fine:
 
 ```sh
 SHADOW_TRADER_RAW_ROOT=/data/shadow-trader uv run pytest -m slow
 ```
 
-`SHADOW_TRADER_RAW_ROOT` is the `data_root` holding the raw cache. `SHADOW_TRADER_REPLAY_RANGE` (`YYYY-MM` or `YYYY-MM:YYYY-MM`, default `2024-01`) picks the range for the replay-versus-batch parity test.
+`SHADOW_TRADER_RAW_ROOT` is the `data_root` holding the raw cache. `SHADOW_TRADER_REPLAY_RANGE` (`YYYY-MM` or `YYYY-MM:YYYY-MM`, default `2024-01`) picks the range for the replay-versus-batch parity test, and `SHADOW_TRADER_BUILD_RANGE` (same form, default every cached month) the range for the build and `dataset_id` reproducibility test. The raw-clock calendar cross-check reads every cached month and checks each week decided on tick evidence against the HistData calendar rule (New York local before 2018-12-16, Europe/Zurich minus 6 h after).

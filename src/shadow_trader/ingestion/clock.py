@@ -13,9 +13,13 @@ weeks only ever deviate inwards, which says nothing about the clock. A week with
 no surviving candidate fits no rule and fails. Otherwise it is decided when one
 candidate survives (winter: the rules coincide), or when one candidate fits both
 ends, or, weaker, when only one candidate fits an end (recorded as
-``single_end``). A week still undecided (no end fits, or the ends fit different
+``single_end``, unless that choice disagrees with the calendar rule and the
+calendar's is not contradicted, when the calendar wins and the week is recorded
+as ``calendar``). A week still undecided (no end fits, or the ends fit different
 rules) inherits the rule of its adjacent weeks if every one that exists is
-decided on a rule and they agree; any other week fails.
+decided on a rule and they agree. Failing that, the calendar rule (see
+``calendar_offset``) decides it, provided the week's ticks do not contradict it
+(recorded as ``calendar``); any other week fails.
 """
 
 from __future__ import annotations
@@ -23,8 +27,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from .session import NY, open_of, week_sunday
+
+ZURICH = ZoneInfo("Europe/Zurich")
+ERA_SWITCH = date(2018, 12, 16)  # first Session week stamped on the EU calendar
 
 FIXED_OFFSET = timedelta(hours=-5)
 TOLERANCE = timedelta(minutes=30)
@@ -78,6 +86,25 @@ def rule_of(sunday: date, offset: timedelta) -> str | None:
     return NEW_YORK_LOCAL if offset == ny else FIXED_UTC_MINUS_5
 
 
+def calendar_offset(sunday: date) -> timedelta:
+    """The raw-clock offset the calendar predicts for the Session opening ``sunday``.
+
+    Before ``ERA_SWITCH`` the stamps are New York local time; from then they are
+    Europe/Zurich local time minus six hours (UTC-5 in EU winter, UTC-4 in EU
+    summer). Independent of any tick, so it can cross-check the inference.
+    """
+    if sunday < ERA_SWITCH:
+        return ny_offset(sunday)
+    utcoffset = open_of(sunday).astimezone(ZURICH).utcoffset()
+    assert utcoffset is not None
+    return utcoffset - timedelta(hours=6)
+
+
+def calendar_rule(sunday: date) -> str | None:
+    """The rule the calendar predicts for that week; None when the rules coincide."""
+    return rule_of(sunday, calendar_offset(sunday))
+
+
 def offset_of(sunday: date, rule: str) -> timedelta:
     return ny_offset(sunday) if rule == NEW_YORK_LOCAL else FIXED_OFFSET
 
@@ -89,6 +116,7 @@ class WeekClock:
     offsets: Mapping[date, timedelta]
     inherited: frozenset[date] = frozenset()
     single_end: frozenset[date] = frozenset()
+    calendar: frozenset[date] = frozenset()
 
     def to_utc(self, naive: datetime) -> datetime:
         return (naive - self.offsets[week_of(naive)]).replace(tzinfo=UTC)
@@ -112,6 +140,7 @@ class WeekClock:
             "offsets": self.minutes(),
             "inherited": sorted(week.isoformat() for week in self.inherited),
             "single_end": sorted(week.isoformat() for week in self.single_end),
+            "calendar": sorted(week.isoformat() for week in self.calendar),
         }
 
     def summary(self) -> dict[str, object]:
@@ -166,10 +195,18 @@ class WeekEvidence:
 
     def infer(self) -> WeekClock:
         """The clock of every week seen; raises ``WeekClockError`` for the rest."""
+        clock, failures = self.analyse()
+        if failures:
+            raise WeekClockError(failures)
+        return clock
+
+    def analyse(self) -> tuple[WeekClock, dict[date, str]]:
+        """The clock of the weeks that could be decided, and why the others failed."""
         weeks = self._weeks()
         decided: dict[date, timedelta] = {}
         single_end: set[date] = set()
         undecided: dict[date, list[timedelta]] = {}
+        from_calendar: set[date] = set()
         failures: dict[date, str] = {}
         for sunday, (first, last) in sorted(weeks.items()):
             alive, reason = _alive(sunday, first, last)
@@ -181,22 +218,36 @@ class WeekEvidence:
             elif both := [o for o in alive if fits[o] == 2]:
                 decided[sunday] = both[0]
             elif len(backed := [o for o in alive if fits[o]]) == 1:
-                decided[sunday] = backed[0]
-                single_end.add(sunday)
+                expected = calendar_offset(sunday)
+                if backed[0] != expected and expected in alive:
+                    decided[sunday] = expected  # one end is weak evidence: defer
+                    from_calendar.add(sunday)
+                else:
+                    decided[sunday] = backed[0]
+                    single_end.add(sunday)
             else:
                 undecided[sunday] = alive
         inherited: set[date] = set()
         direct = dict(decided)  # inheritance never chains through inherited weeks
         for sunday, alive in undecided.items():
             offset, reason = _inherit(sunday, alive, direct, weeks)
-            if offset is None:
+            if offset is None and (expected := calendar_offset(sunday)) in alive:
+                from_calendar.add(sunday)
+                decided[sunday] = expected
+            elif offset is None:
                 failures[sunday] = reason
             else:
                 inherited.add(sunday)
                 decided[sunday] = offset
-        if failures:
-            raise WeekClockError(dict(sorted(failures.items())))
-        return WeekClock(decided, frozenset(inherited), frozenset(single_end))
+        return (
+            WeekClock(
+                decided,
+                frozenset(inherited),
+                frozenset(single_end),
+                frozenset(from_calendar),
+            ),
+            dict(sorted(failures.items())),
+        )
 
 
 def _deltas(

@@ -110,8 +110,11 @@ def _run_fetch(config: Config, args: argparse.Namespace) -> int:
     )
     print(
         f"fetched {len(report.fetched)}, skipped {len(report.skipped)} cached, "
-        f"absent {len(report.absent)}, rejected {len(report.rejected)}"
+        f"absent {len(report.absent)}, unsettled {len(report.unsettled)}, "
+        f"rejected {len(report.rejected)}"
     )
+    for instrument, period in report.unsettled:
+        print(f"warning: {instrument} {period} not settled yet; fetch it later")
     for instrument, period in report.absent:
         print(f"warning: {instrument} {period} absent at source")
     for (instrument, period), reason in report.rejected:
