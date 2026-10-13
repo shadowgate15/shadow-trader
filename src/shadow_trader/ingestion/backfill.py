@@ -23,7 +23,13 @@ from pathlib import Path
 from . import dataset
 from .anomaly import FlaggingBarBuilder, summarize_flags
 from .bars import Bar, Quote
-from .clock import UnexplainedJump, WeekClock, WeekClockError, WeekEvidence
+from .clock import (
+    BACKWARD_TOLERANCE,
+    UnexplainedJump,
+    WeekClock,
+    WeekClockError,
+    WeekEvidence,
+)
 from .config import (
     DEFAULT_START,
     Config,
@@ -242,6 +248,8 @@ def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
             a.month for a in build.acknowledged_missing if a.instrument == instrument
         }
         missing: dict[datetime, Bar] = {}
+        newest: datetime | None = None
+        late_dropped = 0
         clocks[instrument] = clock = infer_week_clock(
             cache,
             instrument,
@@ -275,10 +283,16 @@ def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
                 try:
                     bars.extend(builder.push(quote))
                 except ValueError as exc:
-                    where = f"{label} row {row}"
-                    raise BuildFailure(
-                        f"ticks out of order at {where}: {exc}", where
-                    ) from None
+                    # a stale tick a second or so behind a closed slot (HistData's
+                    # 2026 files); the pre-pass already failed any bigger step back
+                    if newest is None or newest - quote.ts >= BACKWARD_TOLERANCE:
+                        where = f"{label} row {row}"
+                        raise BuildFailure(
+                            f"ticks out of order at {where}: {exc}", where
+                        ) from None
+                    late_dropped += 1
+                    continue
+                newest = quote.ts if newest is None else max(newest, quote.ts)
         bars.extend(builder.flush())
         bars = [bar for bar in bars if lo <= bar.open_time < hi]
         for opened, first in first_ticks.items():
@@ -300,6 +314,16 @@ def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
         warnings.extend(
             BuildWarning(w.code, w.message, instrument) for w in summary.warnings
         )
+        if late_dropped:
+            warnings.append(
+                BuildWarning(
+                    "late_ticks_dropped",
+                    f"{late_dropped} {instrument} tick(s) arrived up to "
+                    f"{BACKWARD_TOLERANCE.seconds} s behind a closed slot and "
+                    "were dropped",
+                    instrument,
+                )
+            )
         if builder.dropped_out_of_session:
             dropped[instrument] = builder.dropped_out_of_session
             warnings.append(

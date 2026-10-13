@@ -348,3 +348,37 @@ def test_week_without_a_jump_records_no_replays(tmp_path):
     _, run = build(tmp_path, replay_week(twice=False), "2024-04")
 
     assert run().ref.manifest["session_clock"]["EURUSD"]["replays"] == []
+
+
+def late_tick_week(*, late: bool = True) -> list[str]:
+    """Sunday 17:35:00 tick followed by a stale 17:34:59 one: a step back of 1 s
+    across a 5-minute slot boundary, as HistData's 2026 files have."""
+    sunday = date(2024, 4, 7)
+    week = session_lines(sunday, *NY_WEEK)
+    stale = [f"{sunday:%Y%m%d} 173459000,1.10000,1.10010,0"] if late else []
+    return [
+        week[0],
+        f"{sunday:%Y%m%d} 173459000,1.10000,1.10010,0",
+        f"{sunday:%Y%m%d} 173500000,1.10005,1.10015,0",
+        *stale,
+        *week[1:],
+    ]
+
+
+def test_stale_tick_in_a_closed_slot_is_dropped_with_a_warning_not_a_failure(tmp_path):
+    (tmp_path / "plain").mkdir()
+    config, run = build(tmp_path, late_tick_week(), "2024-04")
+    plain_config, plain_run = build(
+        tmp_path / "plain", late_tick_week(late=False), "2024-04"
+    )
+
+    result, plain = run(), plain_run()
+
+    [warning] = [w for w in result.warnings if w.code == "late_ticks_dropped"]
+    assert "1 EURUSD tick" in warning.message
+    assert warning.locator == "EURUSD"
+    bars = open_dataset(config.paths.data_root, result.ref.dataset_id).read("EURUSD")
+    expected = open_dataset(plain_config.paths.data_root, plain.ref.dataset_id).read(
+        "EURUSD"
+    )
+    assert bars == expected
