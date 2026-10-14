@@ -280,3 +280,15 @@ def test_fetch_rejects_a_non_positive_workers_option(
     assert code == 2
     assert "workers" in capsys.readouterr().err
     assert transport.posts == 0
+
+
+def test_fetch_exits_non_zero_after_an_interrupt(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli, "fetch_months", lambda *a, **k: FetchReport(interrupted=True)
+    )
+    path = fetch_config(tmp_path)
+
+    code = run(["ingest", "fetch", "--config", str(path)])
+
+    assert code == cli.EXIT_INTERRUPTED
+    assert "interrupted" in capsys.readouterr().out

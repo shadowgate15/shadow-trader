@@ -168,6 +168,9 @@ def _run_fetch(config: Config, args: argparse.Namespace, progress: RichProgress)
         print(f"warning: {instrument} {period} absent at source")
     for (instrument, period), reason in report.rejected:
         print(f"error: {instrument} {period} rejected: {reason}", file=sys.stderr)
+    if report.interrupted:
+        print("interrupted: partial fetch; re-run to fetch the missing months")
+        return EXIT_INTERRUPTED
     return EXIT_OK if report.ok else EXIT_BUILD_FAILURE
 
 
