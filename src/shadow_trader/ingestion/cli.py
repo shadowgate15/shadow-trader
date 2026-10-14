@@ -1,6 +1,10 @@
 """``shadow-trader ingest`` command group.
 
-Exit codes: 0 success (warnings included), 1 build failure, 2 config error.
+Exit codes: 0 success (warnings included), 1 build failure, 2 config error,
+130 interrupted (Ctrl-C).
+Progress (phases, bars, tolerated warnings) goes to stderr through ``rich``;
+stdout carries only the final result lines. ``-q`` silences progress, ``-v``
+adds per-month detail.
 Flags may override only instruments, time range and bar sizes, never rule
 values; argparse rejects any other flag with exit code 2.
 """
@@ -15,8 +19,11 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+from rich.console import Console
+
 from .backfill import BuildFailure, build_backfill
 from .bars import Bar
+from .cli_progress import NORMAL, QUIET, VERBOSE, RichProgress
 from .config import Config, ConfigError, load_config
 from .dataset import DatasetError, RawCache
 from .live import LiveIngester
@@ -33,6 +40,7 @@ from .sources import (
 EXIT_OK = 0
 EXIT_BUILD_FAILURE = 1
 EXIT_CONFIG_ERROR = 2
+EXIT_INTERRUPTED = 130
 
 _COMMANDS = {
     "fetch": "Fetch raw months into the cache (the only network command).",
@@ -56,9 +64,11 @@ def _int_csv(value: str) -> tuple[int, ...]:
 
 def add_ingest_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     ingest = subparsers.add_parser("ingest", help="Market data ingestion.")
+    _add_verbosity(ingest, default=False)
     commands = ingest.add_subparsers(dest="command", required=True, metavar="COMMAND")
     for name, help_text in _COMMANDS.items():
         command = commands.add_parser(name, help=help_text, description=help_text)
+        _add_verbosity(command, default=argparse.SUPPRESS)
         command.add_argument(
             "--config", type=Path, required=True, help="Path to the TOML config."
         )
@@ -76,6 +86,36 @@ def add_ingest_parser(subparsers: argparse._SubParsersAction) -> None:  # type: 
             command.add_argument(
                 "--backfill", dest="backfill_id", help="Backfill dataset_id."
             )
+
+
+def _add_verbosity(parser: argparse.ArgumentParser, default: object) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        default=default,
+        help="No progress: only the final result lines and errors.",
+    )
+    group.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=default,
+        help="Per-month detail, including every tolerated warning.",
+    )
+
+
+def make_console() -> Console:
+    """The progress console: stderr, so stdout keeps only the result lines."""
+    return Console(stderr=True)
+
+
+def _fail(progress: RichProgress, message: str) -> None:
+    """Stop the live display, then print an error naming the phase it hit."""
+    progress.close()
+    where = f" during {progress.phase}" if progress.phase else ""
+    print(message.replace("{where}", where), file=sys.stderr)
 
 
 def _parse_utc(value: str | None, flag: str) -> datetime:
@@ -99,7 +139,7 @@ def make_transport() -> Transport:
 _sleep = time.sleep
 
 
-def _run_fetch(config: Config, args: argparse.Namespace) -> int:
+def _run_fetch(config: Config, args: argparse.Namespace, progress: RichProgress) -> int:
     report = fetch_months(
         RawCache(config.paths.data_root),
         make_transport(),
@@ -107,7 +147,9 @@ def _run_fetch(config: Config, args: argparse.Namespace) -> int:
         config.build.start,
         config.build.end,
         sleep=_sleep,
+        progress=progress,
     )
+    progress.close()
     print(
         f"fetched {len(report.fetched)}, skipped {len(report.skipped)} cached, "
         f"absent {len(report.absent)}, unsettled {len(report.unsettled)}, "
@@ -122,16 +164,19 @@ def _run_fetch(config: Config, args: argparse.Namespace) -> int:
     return EXIT_OK if report.ok else EXIT_BUILD_FAILURE
 
 
-def _run_build(config: Config, args: argparse.Namespace) -> int:
+def _run_build(config: Config, args: argparse.Namespace, progress: RichProgress) -> int:
     try:
         for bar_size in config.build.bar_sizes:
-            result = build_backfill(config, bar_size)
+            result = build_backfill(config, bar_size, progress=progress)
+            progress.close()
             print(f"built {bar_size} min dataset {result.ref.dataset_id}")
             assert result.report_path is not None
             report = json.loads(result.report_path.read_text())
             for line in console_summary(report, result.report_path):
                 print(line)
     except BuildFailure as exc:
+        at = f" at {exc.locator}" if exc.locator else ""
+        _fail(progress, f"build failed{{where}}{at}")
         if exc.report_path is not None:
             report = json.loads(exc.report_path.read_text())
             for line in console_summary(report, exc.report_path):
@@ -142,26 +187,30 @@ def _run_build(config: Config, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _run_build_live(config: Config, args: argparse.Namespace) -> int:
+def _run_build_live(
+    config: Config, args: argparse.Namespace, progress: RichProgress
+) -> int:
     start = _parse_utc(args.range_from, "--from")
     end = _parse_utc(args.range_to, "--to")
     if end <= start:
         raise ConfigError(f"--from {start.isoformat()} is not before --to")
     try:
         for bar_size in config.build.bar_sizes:
-            ref = build_live(config, bar_size, start, end)
+            ref = build_live(config, bar_size, start, end, progress=progress)
+            progress.close()
             print(f"built live {bar_size} min dataset {ref.dataset_id}")
     except (DatasetError, OSError) as exc:
-        print(f"build-live failed: {exc}", file=sys.stderr)
+        _fail(progress, f"build-live failed{{where}}: {exc}")
         return EXIT_BUILD_FAILURE
     return EXIT_OK
 
 
-def _run_diff(config: Config, args: argparse.Namespace) -> int:
+def _run_diff(config: Config, args: argparse.Namespace, progress: RichProgress) -> int:
     if not (args.live_id and args.backfill_id):
         raise ConfigError("diff needs --live and --backfill dataset ids")
     try:
-        path = reconcile(config, args.live_id, args.backfill_id)
+        path = reconcile(config, args.live_id, args.backfill_id, progress=progress)
+        progress.close()
     except ReconciliationRefused as exc:
         print(f"diff refused: {exc}", file=sys.stderr)
         return EXIT_BUILD_FAILURE
@@ -169,7 +218,7 @@ def _run_diff(config: Config, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _run_live(config: Config, args: argparse.Namespace) -> int:
+def _run_live(config: Config, args: argparse.Namespace, progress: RichProgress) -> int:
     if len(config.build.bar_sizes) != 1:
         raise ConfigError(
             "live runs one bar size; pass --bar-sizes N "
@@ -183,15 +232,21 @@ def _run_live(config: Config, args: argparse.Namespace) -> int:
                 nonlocal bars
                 bars += 1
 
-            LiveIngester(config, live_adapter(config, instrument), sink=count).run()
+            LiveIngester(
+                config,
+                live_adapter(config, instrument),
+                sink=count,
+                progress=progress,
+            ).run()
+            progress.close()
             print(f"live {instrument}: {bars} bar emissions")
     except (BuildFailure, OSError) as exc:
-        print(f"live failed: {exc}", file=sys.stderr)
+        _fail(progress, f"live failed{{where}}: {exc}")
         return EXIT_BUILD_FAILURE
     return EXIT_OK
 
 
-_HANDLERS: dict[str, Callable[[Config, argparse.Namespace], int]] = {
+_HANDLERS: dict[str, Callable[[Config, argparse.Namespace, RichProgress], int]] = {
     "fetch": _run_fetch,
     "build": _run_build,
     "live": _run_live,
@@ -212,11 +267,16 @@ def run_ingest(args: argparse.Namespace) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
 
-    try:
-        return _HANDLERS[args.command](config, args)
-    except ConfigError as exc:
-        print(f"config error: {exc}", file=sys.stderr)
-        return EXIT_CONFIG_ERROR
+    level = QUIET if args.quiet else VERBOSE if args.verbose else NORMAL
+    with RichProgress(make_console(), level) as progress:
+        try:
+            return _HANDLERS[args.command](config, args, progress)
+        except ConfigError as exc:
+            _fail(progress, f"config error: {exc}")
+            return EXIT_CONFIG_ERROR
+        except KeyboardInterrupt:
+            _fail(progress, "interrupted{where}")
+            return EXIT_INTERRUPTED
 
 
 def main(argv: Sequence[str] | None = None) -> int:

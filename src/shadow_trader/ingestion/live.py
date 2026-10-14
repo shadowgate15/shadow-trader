@@ -20,6 +20,7 @@ from .anomaly import FlaggingBarBuilder
 from .bars import Bar, Quote
 from .config import Config
 from .gaps import with_flag
+from .progress import NULL_PROGRESS, ProgressSink
 from .rawlog import RawQuoteLog
 from .report import (
     DROPPED_EXAMPLE_CAP,
@@ -93,6 +94,7 @@ def overlaps_interval(
 
 
 log = logging.getLogger(__name__)
+STATUS_EVERY = 500  # quotes between status lines, besides bar closes and heartbeats
 
 
 @dataclass
@@ -122,10 +124,15 @@ class LiveIngester:
         start: datetime | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         record: bool = True,
+        progress: ProgressSink = NULL_PROGRESS,
     ) -> None:
         self._record = record  # False: a rebuild from the raw log writes nothing
         self._adapter = adapter
         self._sink = sink
+        self._progress = progress
+        self._events_seen = 0
+        self._last_quote: datetime | None = None
+        self._emissions = 0
         self._clock = clock
         self.revisions = RevisionLog()
         minutes = bar_size if bar_size is not None else config.build.bar_sizes[0]
@@ -273,15 +280,45 @@ class LiveIngester:
         """
         self._stopped = True
 
+    def _status(self) -> None:
+        """One status line for the progress sink (never called per quote)."""
+        if self._progress is NULL_PROGRESS:
+            return
+        now = self._clock()
+        session = session_of(now)
+        where = (
+            f"session open until {session[1]:%a %H:%M}Z"
+            if session
+            else f"market closed, opens {upcoming_open(now):%a %H:%M}Z"
+        )
+        age = (
+            "no tick yet"
+            if self._last_quote is None
+            else f"last tick {int((now - self._last_quote).total_seconds())}s ago"
+        )
+        self._progress.status(
+            f"{self._adapter.instrument}: {self._emissions} bar emissions, "
+            f"{age}, {where}"
+        )
+
     def _handle(self, event: Event) -> None:
+        self._events_seen += 1
         if isinstance(event, Quote):
+            self._last_quote = event.ts
             self._on_quote(event)
+            if self._events_seen % STATUS_EVERY == 0:
+                self._status()
         elif isinstance(event, Heartbeat):
             self._advance_watermark(event.ts)
+            self._status()
         elif isinstance(event, SourceDown):
+            self._progress.warn(
+                f"{self._adapter.instrument}: source down since {event.start:%H:%M:%S}Z"
+            )
             self._down_since = event.start
             self.outages.append(SourceInterval(event.start, None, "adapter"))
         elif isinstance(event, SourceUp):
+            self._progress.warn(f"{self._adapter.instrument}: source back up")
             self._end_outage(event.ts)
             self._advance_watermark(event.ts)
             self._catch_up(event.ts)
@@ -398,11 +435,13 @@ class LiveIngester:
         self._cursor = self._after(slot)
         if repairable:
             self._report("running")
+            self._status()
 
     def _emit(self, bar: Bar, revision: int) -> None:
         self.revisions.append(bar, revision, self._clock())
         self._bars_by_revision[revision] += 1
         self._gap_bars += bar.is_gap
+        self._emissions += 1
         self._sink(bar, revision)
 
     def _build(self, slot: datetime, closed: _ClosedSlot) -> Bar:

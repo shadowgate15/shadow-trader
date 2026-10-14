@@ -40,6 +40,7 @@ from .config import (
 )
 from .dataset import DatasetRef, RawCache
 from .gaps import flag_suspected_outages, month_bounds, source_missing_bars
+from .progress import NULL_PROGRESS, ProgressSink
 from .report import (
     WARNING_CODES,
     Alignment,
@@ -105,11 +106,17 @@ def read_raw_month(cache: RawCache, instrument: str, period: str) -> str:
 
 
 def infer_week_clock(
-    cache: RawCache, instrument: str, periods: Iterable[str]
+    cache: RawCache,
+    instrument: str,
+    periods: Iterable[str],
+    *,
+    progress: ProgressSink = NULL_PROGRESS,
 ) -> WeekClock:
     """The raw-clock offset of every Session week in ``periods`` (a pre-pass)."""
     evidence = WeekEvidence()
-    for period in periods:
+    months = list(periods)
+    progress.start("scanning clocks", len(months))
+    for period in months:
         label = f"{instrument}/{period}"
         try:
             evidence.add_text(read_raw_month(cache, instrument, period), label)
@@ -117,13 +124,38 @@ def infer_week_clock(
             raise BuildFailure(
                 f"ticks out of order at {jump}", f"{jump.label} row {jump.row}"
             ) from None
+        progress.advance(f"{instrument} {period}")
     try:
-        return evidence.infer()
+        clock = evidence.infer()
     except WeekClockError as error:
         week = next(iter(error.failures))
         raise BuildFailure(
             f"{instrument} {error}", f"{instrument}/week-{week}"
         ) from None
+    progress.done()
+    _announce_fallbacks(instrument, clock, progress)
+    return clock
+
+
+def _announce_fallbacks(
+    instrument: str, clock: WeekClock, progress: ProgressSink
+) -> None:
+    """Surface the tolerated clock decisions (they are also in the build report)."""
+    for replays in clock.replays.values():
+        for r in replays:
+            progress.warn(
+                f"{instrument}: dropped replayed block in {r.label} row {r.row} "
+                f"({r.rows} rows, {r.first} to {r.last})"
+            )
+    for weeks, what in (
+        (clock.inherited, "inherited the adjacent weeks' clock rule"),
+        (clock.single_end, "decided from one end of the week only"),
+        (clock.calendar, "fell back to the calendar clock rule"),
+    ):
+        if weeks:
+            listed = ", ".join(w.isoformat() for w in sorted(weeks)[:5])
+            more = f" (+{len(weeks) - 5} more)" if len(weeks) > 5 else ""
+            progress.warn(f"{instrument}: {len(weeks)} week(s) {what}: {listed}{more}")
 
 
 ALIGNMENT_TOLERANCE = timedelta(hours=1)
@@ -194,7 +226,11 @@ def parse_ticks(
 
 
 def build_backfill(
-    config: Config, bar_size: int, *, now: datetime | None = None
+    config: Config,
+    bar_size: int,
+    *,
+    now: datetime | None = None,
+    progress: ProgressSink = NULL_PROGRESS,
 ) -> BackfillResult:
     """Build one Dataset (all configured Instruments) at ``bar_size`` minutes.
 
@@ -205,7 +241,7 @@ def build_backfill(
     """
     validate_bar_sizes((bar_size,))
     try:
-        return _build(config, bar_size, now or datetime.now(UTC))
+        return _build(config, bar_size, now or datetime.now(UTC), progress)
     except BuildFailure as failure:
         # an unwritable report must not mask the failure itself
         with contextlib.suppress(OSError):
@@ -224,7 +260,9 @@ def build_dataset(config: Config, bar_size: int) -> DatasetRef:
     return build_backfill(config, bar_size).ref
 
 
-def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
+def _build(
+    config: Config, bar_size: int, now: datetime, progress: ProgressSink
+) -> BackfillResult:
     cache = RawCache(config.paths.data_root)
     build = config.build
     end = build.end or last_complete_month(now)
@@ -235,6 +273,11 @@ def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
     lo, hi = month_bounds(build.start)[0], month_bounds(end)[1]
     series: dict[str, list[Bar]] = {}
     warnings: list[BuildWarning] = []
+
+    def warn(warning: BuildWarning) -> None:
+        warnings.append(warning)
+        progress.warn(f"{warning.code}: {warning.message}")
+
     dropped: dict[str, int] = {}
     tick_flags: dict[str, dict[str, int]] = {}
     alignments: dict[str, list[Alignment]] = {}
@@ -258,16 +301,20 @@ def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
                 for period in months_between(build.start, end)
                 if to_month(period) not in acknowledged
             ],
+            progress=progress,
         )
-        for period in months_between(build.start, end):
+        periods = months_between(build.start, end)
+        progress.start("building months", len(periods))
+        for period in periods:
             month = to_month(period)
             if month in acknowledged:
                 for gap in source_missing_bars(instrument, month, bar_size):
                     missing[gap.open_time] = gap
+                progress.advance(f"{instrument} {period}", "acknowledged missing")
                 continue
             text = read_raw_month(cache, instrument, period)
             if month < DEFAULT_START:
-                warnings.append(
+                warn(
                     BuildWarning(
                         "thin_data",
                         f"{instrument} {period} is before the history floor "
@@ -293,11 +340,13 @@ def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
                     late_dropped += 1
                     continue
                 newest = quote.ts if newest is None else max(newest, quote.ts)
+            progress.advance(f"{instrument} {period}")
         bars.extend(builder.flush())
+        progress.done()
         bars = [bar for bar in bars if lo <= bar.open_time < hi]
         for opened, first in first_ticks.items():
             if (off := _alignment_warning(instrument, opened, first)) is not None:
-                warnings.append(off[0])
+                warn(off[0])
                 alignments.setdefault(instrument, []).append(off[1])
         merged = {bar.open_time: bar for bar in bars} | missing
         series[instrument] = flag_suspected_outages(
@@ -311,11 +360,10 @@ def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
             builder.tick_flag_counts,
             config.anomaly_rule.alert_fraction,
         )
-        warnings.extend(
-            BuildWarning(w.code, w.message, instrument) for w in summary.warnings
-        )
+        for w in summary.warnings:
+            warn(BuildWarning(w.code, w.message, instrument))
         if late_dropped:
-            warnings.append(
+            warn(
                 BuildWarning(
                     "late_ticks_dropped",
                     f"{late_dropped} {instrument} tick(s) arrived up to "
@@ -326,7 +374,7 @@ def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
             )
         if builder.dropped_out_of_session:
             dropped[instrument] = builder.dropped_out_of_session
-            warnings.append(
+            warn(
                 BuildWarning(
                     "out_of_session_ticks",
                     f"{builder.dropped_out_of_session} {instrument} ticks fell "
@@ -334,6 +382,7 @@ def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
                     instrument,
                 )
             )
+    progress.start("writing dataset")
     ref = dataset.write_dataset(
         config,
         bar_size,
@@ -359,6 +408,7 @@ def _build(config: Config, bar_size: int, now: datetime) -> BackfillResult:
             config=config,
         ),
     )
+    progress.done()
     return BackfillResult(ref, tuple(warnings), dropped, report_path)
 
 

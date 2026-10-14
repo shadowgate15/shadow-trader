@@ -46,6 +46,7 @@ from typing import Protocol
 
 from .config import last_complete_month, month_parts
 from .dataset import SOURCE, RawCache
+from .progress import NULL_PROGRESS, ProgressSink
 
 BASE_URL = "https://www.histdata.com"
 POST_URL = f"{BASE_URL}/get.php"
@@ -186,6 +187,7 @@ def fetch_months(
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     supersede: bool = False,
+    progress: ProgressSink = NULL_PROGRESS,
 ) -> FetchReport:
     """Fetch HistData tick months into the raw cache.
 
@@ -205,26 +207,35 @@ def fetch_months(
         return call()
 
     clock = now()
+    periods = months_between(start, end or last_settled_month(clock))
+    progress.start("fetching months", len(instruments) * len(periods))
     for instrument in instruments:
-        for period in months_between(start, end or last_settled_month(clock)):
+        for period in periods:
             key = (instrument, period)
             if not supersede and cache.has(SOURCE, instrument, period, "zip"):
                 report.skipped.append(key)
-                continue
-            if not is_settled(period, clock):
+                outcome = "cached"
+            elif not is_settled(period, clock):
                 report.unsettled.append(key)
-                continue
-            _fetch_one(
-                cache,
-                transport,
-                paced,
-                sleep,
-                report,
-                instrument,
-                period,
-                now,
-                supersede,
-            )
+                outcome = "unsettled"
+            else:
+                outcome = _fetch_one(
+                    cache,
+                    transport,
+                    paced,
+                    sleep,
+                    report,
+                    instrument,
+                    period,
+                    now,
+                    supersede,
+                )
+                if outcome == "rejected":
+                    progress.warn(
+                        f"{instrument} {period} rejected: {report.rejected[-1][1]}"
+                    )
+            progress.advance(f"{instrument} {period}", outcome)
+    progress.done()
     return report
 
 
@@ -238,7 +249,8 @@ def _fetch_one(
     period: str,
     now: Callable[[], datetime],
     supersede: bool,
-) -> None:
+) -> str:
+    """Fetch one month; return its outcome: fetched, absent or rejected."""
     key = (instrument, period)
     page_url = month_page_url(instrument, period)
     headers = {"User-Agent": USER_AGENT}
@@ -256,7 +268,7 @@ def _fetch_one(
                 continue
             if not token:
                 report.absent.append(key)  # an empty token: no file for the month
-                return
+                return "absent"
             form = {
                 "tk": token,
                 "date": period[:4],
@@ -300,8 +312,9 @@ def _fetch_one(
             supersede=supersede,
         )
         report.fetched.append(key)
-        return
+        return "fetched"
     if problem:
         report.rejected.append((key, problem))
-    else:
-        report.absent.append(key)
+        return "rejected"
+    report.absent.append(key)
+    return "absent"

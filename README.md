@@ -43,6 +43,33 @@ Every command requires `--config` (path to the TOML file) and accepts the three 
 | 0 | Success. Warnings (for example months absent at the source) still exit 0. |
 | 1 | Build failure: a rejected download, a failed `build`, `live` or `build-live` run, or a refused `diff`. |
 | 2 | Config error: a missing or invalid config, an unknown key, a missing required flag value, or an unknown flag. |
+| 130 | Interrupted with Ctrl-C. One `interrupted during <phase>` line on stderr, no traceback. |
+
+### Progress and status
+
+Long commands report that they are working. Progress is drawn with [rich](https://rich.readthedocs.io) and goes to **stderr**; **stdout** carries only the final result lines (`built ...`, `fetched ...`, `report: ...`), exactly as before, so scripts can keep parsing it.
+
+| Flag | Effect |
+| --- | --- |
+| (default) | Progress on, tolerated warnings shown as they happen (the first 20; the rest are counted). |
+| `-q`, `--quiet` | No progress and no warnings: only the final result lines and errors. |
+| `-v`, `--verbose` | Per-month detail (including cached months in `fetch`) and every tolerated warning. |
+
+`-q` and `-v` are exclusive and work on every command, before or after it (`ingest -q build ...` or `ingest build ... -q`).
+
+- `fetch`: one outcome per month (`fetched`, `cached`, `absent`, `unsettled`, `rejected`) and a final tally.
+- `build`: phases `scanning clocks`, then `building months` (n/total, current month), then `writing dataset`. Dropped replay hours, clock-rule fallbacks, late ticks, thin data and misaligned opens are printed as `warning: ...` when found; the end-of-run summary and build report are unchanged. A failure names the phase and the month, for example `build failed during scanning clocks at EURUSD/202401`.
+- `build-live` and `diff` show their phases; `live` shows a status line (bar emissions, age of the last tick, Session state), refreshed on each closed Bar.
+- On an interactive terminal each phase is a live bar with spinner, n/total, elapsed time, ETA and the current month. When stderr is not a terminal (pipes, CI) or `TERM=dumb`, the output is plain lines with no control characters: one per month (`[3/48] EURUSD 202403`), phase start and end lines with timings, and for `live` at most one status line a minute. `NO_COLOR` drops colour.
+
+```text
+scanning clocks: 2 step(s)
+[1/2] EURUSD 202401
+[2/2] EURUSD 202402
+scanning clocks: done in 0.9s
+building months: 2 step(s)
+...
+```
 
 ### Config
 
