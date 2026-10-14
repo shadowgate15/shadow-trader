@@ -29,6 +29,12 @@ Observed behaviour this code relies on:
   pacing: the worker count is the only speed control. An earlier sequential
   run saw no rate limit at ~400 requests spaced 0.2-0.5 s; behaviour under
   concurrent load is unmeasured, so keep the worker count modest.
+* HTTP 429 is the throttle signal (and the only one, for now: see
+  ``THROTTLE_STATUS``). Any worker's 429 starts a global cooldown that every
+  worker waits out before its next request: ``Retry-After`` (integer seconds or
+  an HTTP date) when usable, else exponential backoff, always capped at 5
+  minutes. A 429 does not consume one of a month's ``ATTEMPTS``; the same month
+  is retried, and after ``MAX_THROTTLES`` throttles it is rejected as throttled.
 
 This is the only code in the project that touches the network, and it does so
 only through the ``Transport`` seam so tests run on stubbed responses.
@@ -38,6 +44,7 @@ from __future__ import annotations
 
 import io
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -47,6 +54,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Protocol
 
 from .config import last_complete_month, month_parts
@@ -58,6 +66,9 @@ POST_URL = f"{BASE_URL}/get.php"
 ATTEMPTS = 3
 BACKOFF_SECONDS = (1.0, 30.0)  # first wait between attempts, and the cap; doubles
 DEFAULT_WORKERS = 8
+THROTTLE_STATUS = 429  # the only throttle signal for now
+MAX_THROTTLES = 10  # per month, then it is rejected as throttled
+MAX_COOLDOWN_SECONDS = 300.0
 SETTLE_DAYS = 7
 USER_AGENT = (
     "shadow-trader/0.1 raw-cache fetcher "
@@ -183,6 +194,63 @@ def _validate_zip(data: bytes, instrument: str, period: str) -> str | None:
     return None
 
 
+def _retry_after(headers: Mapping[str, str], now: datetime) -> float | None:
+    """Seconds a ``Retry-After`` header asks for (integer or HTTP date), if usable."""
+    value = next((v for k, v in headers.items() if k.lower() == "retry-after"), None)
+    if value is None:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - now).total_seconds())
+
+
+class _Limiter:
+    """Shared by all workers: a global cooldown after a throttle reply."""
+
+    def __init__(
+        self, sleep: Callable[[float], None], now: Callable[[], datetime]
+    ) -> None:
+        self._sleep = sleep
+        self._now = now
+        self._lock = threading.Lock()
+        self._until: datetime | None = None
+        self._streak = 0  # consecutive throttles, for the backoff fallback
+
+    def wait(self) -> None:
+        """Block until any cooldown has passed; call before every request."""
+        while True:
+            with self._lock:
+                if self._until is None:
+                    return
+                remaining = (self._until - self._now()).total_seconds()
+            if remaining <= 0:
+                return
+            self._sleep(remaining)
+
+    def throttled(self, headers: Mapping[str, str]) -> None:
+        """A throttle reply: start or extend the cooldown for every worker."""
+        with self._lock:
+            now = self._now()
+            seconds = _retry_after(headers, now)
+            if seconds is None:
+                seconds = BACKOFF_SECONDS[0] * 2**self._streak
+            self._streak += 1
+            until = now + timedelta(seconds=min(seconds, MAX_COOLDOWN_SECONDS))
+            if self._until is None or until > self._until:
+                self._until = until
+
+    def succeeded(self) -> None:
+        with self._lock:
+            self._streak = 0
+
+
 @dataclass(frozen=True)
 class _Outcome:
     """What one (Instrument, month) task did: its label and any rejection reason."""
@@ -223,6 +291,7 @@ def fetch_months(
     tasks = [(i, p) for i in instruments for p in periods]
     progress.start("fetching months", len(tasks))
     outcomes: dict[Month, _Outcome] = {}
+    limiter = _Limiter(sleep, now)
     interrupted = False
 
     def record(outcome: _Outcome) -> None:
@@ -249,6 +318,7 @@ def fetch_months(
                             now,
                             clock,
                             supersede,
+                            limiter,
                             *task,
                         )
                     )
@@ -291,6 +361,7 @@ def _fetch_task(
     now: Callable[[], datetime],
     clock: datetime,
     supersede: bool,
+    limiter: _Limiter,
     instrument: str,
     period: str,
 ) -> _Outcome:
@@ -300,7 +371,9 @@ def _fetch_task(
         return _Outcome(key, "cached")
     if not is_settled(period, clock):
         return _Outcome(key, "unsettled")
-    return _fetch_one(cache, transport, sleep, instrument, period, now, supersede)
+    return _fetch_one(
+        cache, transport, sleep, instrument, period, now, supersede, limiter
+    )
 
 
 def _fetch_one(
@@ -311,6 +384,7 @@ def _fetch_one(
     period: str,
     now: Callable[[], datetime],
     supersede: bool,
+    limiter: _Limiter,
 ) -> _Outcome:
     """Fetch one month; its outcome is fetched, absent or rejected."""
     key = (instrument, period)
@@ -318,12 +392,25 @@ def _fetch_one(
     headers = {"User-Agent": USER_AGENT}
     delay, cap = BACKOFF_SECONDS
     problem = ""  # why the last attempt failed; empty after only 0-byte replies
-    for attempt in range(1, ATTEMPTS + 1):
-        if attempt > 1:
+    attempt = 0  # failed-or-current non-throttle attempts; a 429 does not count
+    throttles = 0
+    backoff = False  # a non-throttle failure is awaiting its backoff sleep
+    while attempt < ATTEMPTS:
+        if throttles >= MAX_THROTTLES:
+            return _Outcome(key, "rejected", f"throttled {throttles} times")
+        if backoff:
             sleep(delay)
             delay = min(delay * 2, cap)
+            backoff = False
+        attempt += 1
+        backoff = True  # unless this attempt is throttled, a failure backs off
         try:
+            limiter.wait()
             page = transport.get(page_url, headers)
+            if page.status == THROTTLE_STATUS:
+                limiter.throttled(page.headers)
+                throttles, attempt, backoff = throttles + 1, attempt - 1, False
+                continue
             token = _token(page.body.decode("utf-8", "replace"))
             if page.status != 200 or token is None:
                 problem = f"no token on month page (HTTP {page.status})"
@@ -338,9 +425,14 @@ def _fetch_one(
                 "timeframe": "T",
                 "fxpair": instrument,
             }
+            limiter.wait()
             reply = transport.post(POST_URL, form, {**headers, "Referer": page_url})
         except (OSError, urllib.error.URLError) as exc:
             problem = f"network error: {exc}"
+            continue
+        if reply.status == THROTTLE_STATUS:
+            limiter.throttled(reply.headers)
+            throttles, attempt, backoff = throttles + 1, attempt - 1, False
             continue
         if reply.status != 200:
             problem = f"HTTP {reply.status}"
@@ -368,6 +460,7 @@ def _fetch_one(
             },
             supersede=supersede,
         )
+        limiter.succeeded()
         return _Outcome(key, "fetched")
     if problem:
         return _Outcome(key, "rejected", problem)
