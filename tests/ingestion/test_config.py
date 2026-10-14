@@ -28,6 +28,7 @@ def test_minimal_config_gets_spec_defaults(tmp_path):
     assert config.build.bar_sizes == (5,)
     assert config.build.start == "2009-01"
     assert config.build.end is None
+    assert config.build.workers == 8
     assert config.build.acknowledged_missing == ()
     assert config.gap_rule.outage_threshold_minutes == 30
     assert config.anomaly_rule.alert_fraction == 0.01
@@ -82,6 +83,8 @@ def test_acknowledged_missing_entries_are_parsed(tmp_path):
         (MINIMAL + 'start = "2020-05"\nend = "2020-01"\n', "start"),
         (MINIMAL + "\n[rules.gap]\noutage_threshold_minutes = 0\n", "outage"),
         (MINIMAL + "\n[live]\nadapter = 'oanda'\n", "adapter"),
+        (MINIMAL + "workers = 0\n", "workers"),
+        (MINIMAL + "workers = -2\n", "workers"),
         ("this is not toml [", "TOML"),
     ],
 )

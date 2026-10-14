@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import threading
 import zipfile
 from datetime import UTC, datetime
 
@@ -32,10 +33,12 @@ class StubTransport:
         self.posts = {k: list(v) for k, v in posts.items()}
         self.pages = list(pages or [Response(200, PAGE.encode(), {})])
         self.calls: list[tuple] = []
+        self._lock = threading.Lock()
 
     def get(self, url, headers):
-        self.calls.append(("GET", url, dict(headers)))
-        page = self.pages.pop(0) if len(self.pages) > 1 else self.pages[0]
+        with self._lock:
+            self.calls.append(("GET", url, dict(headers)))
+            page = self.pages.pop(0) if len(self.pages) > 1 else self.pages[0]
         if isinstance(page, Exception):
             raise page
         return page
@@ -44,9 +47,10 @@ class StubTransport:
         return [c for c in self.calls if c[0] == "GET"]
 
     def post(self, url, form, headers):
-        self.calls.append(("POST", url, dict(form), dict(headers)))
-        queue = self.posts[form["datemonth"]]
-        return queue.pop(0) if len(queue) > 1 else queue[0]
+        with self._lock:
+            self.calls.append(("POST", url, dict(form), dict(headers)))
+            queue = self.posts[form["datemonth"]]
+            return queue.pop(0) if len(queue) > 1 else queue[0]
 
     def posts_for(self, month):
         return [c for c in self.calls if c[0] == "POST" and c[2]["datemonth"] == month]
@@ -60,6 +64,8 @@ def run(
     start="2024-03",
     end="2024-03",
     now=NOW,
+    workers=8,
+    progress=None,
 ):
     sleeps: list[float] = []
     report = fetch_months(
@@ -70,6 +76,8 @@ def run(
         end,
         sleep=sleeps.append,
         now=lambda: now,
+        workers=workers,
+        **({"progress": progress} if progress else {}),
     )
     return report, sleeps
 
@@ -181,14 +189,13 @@ def test_rerun_skips_cached_months_without_any_network_or_rewrite(tmp_path):
     assert (cached.stat().st_mtime_ns, cached.read_bytes()) == before
 
 
-def test_requests_are_paced_politely(tmp_path):
+def test_no_fixed_pacing_sleep_between_requests(tmp_path):
     transport = StubTransport({"202403": [ok()], "202404": [ok(month="202404")]})
 
     report, sleeps = run(tmp_path, transport, end="2024-04")
 
     assert report.fetched == [("EURUSD", "202403"), ("EURUSD", "202404")]
-    assert sleeps  # waits happen between requests
-    assert all(0.2 <= s <= 0.5 for s in sleeps)
+    assert sleeps == []
 
 
 def test_range_spans_instruments_and_defaults_end_to_last_complete_month(tmp_path):
@@ -311,3 +318,112 @@ def test_default_end_is_the_last_settled_month(tmp_path):
 
     assert [m for _, m in report.fetched] == ["202608"]
     assert report.unsettled == []
+
+
+class GateTransport:
+    """Blocks every month-page request until ``size`` are in flight at once."""
+
+    def __init__(self, size):
+        self.barrier = threading.Barrier(size, timeout=10)
+        self.lock = threading.Lock()
+        self.inflight = 0
+        self.peak = 0
+
+    def get(self, url, headers):
+        with self.lock:
+            self.inflight += 1
+            self.peak = max(self.peak, self.inflight)
+        try:
+            self.barrier.wait()
+        finally:
+            with self.lock:
+                self.inflight -= 1
+        return Response(200, PAGE.encode(), {})
+
+    def post(self, url, form, headers):
+        month = form["datemonth"]
+        return ok(month=month)
+
+
+def test_up_to_n_requests_are_in_flight_and_never_more(tmp_path):
+    transport = GateTransport(3)
+
+    report, _ = run(tmp_path, transport, start="2024-01", end="2024-06", workers=3)
+
+    assert len(report.fetched) == 6
+    assert transport.peak == 3  # the barrier only opens with 3 in flight
+
+
+class Recorder:
+    def __init__(self, on_advance=None):
+        self.threads: set[int] = set()
+        self.events: list[tuple] = []
+        self.on_advance = on_advance
+
+    def _note(self, *event):
+        self.threads.add(threading.get_ident())
+        self.events.append(event)
+
+    def start(self, phase, total=None):
+        self._note("start", phase, total)
+
+    def advance(self, detail="", outcome=None):
+        self._note("advance", detail, outcome)
+        if self.on_advance:
+            self.on_advance(detail)
+
+    def warn(self, message):
+        self._note("warn", message)
+
+    def status(self, text):
+        self._note("status", text)
+
+    def done(self):
+        self._note("done")
+
+
+class LaggingTransport(StubTransport):
+    """The 202403 download only finishes once 202404 has been reported."""
+
+    def __init__(self, posts):
+        super().__init__(posts)
+        self.april_reported = threading.Event()
+
+    def post(self, url, form, headers):
+        if form["datemonth"] == "202403":
+            assert self.april_reported.wait(10)
+        return super().post(url, form, headers)
+
+
+def test_report_keeps_input_order_and_progress_stays_on_the_calling_thread(tmp_path):
+    transport = LaggingTransport({"202403": [ok()], "202404": [ok(month="202404")]})
+    sink = Recorder(
+        on_advance=lambda d: transport.april_reported.set() if "202404" in d else None
+    )
+
+    report, _ = run(tmp_path, transport, end="2024-04", workers=2, progress=sink)
+
+    advanced = [e[1] for e in sink.events if e[0] == "advance"]
+    assert advanced == ["EURUSD 202404", "EURUSD 202403"]  # completion order
+    assert report.fetched == [("EURUSD", "202403"), ("EURUSD", "202404")]
+    assert sink.threads == {threading.get_ident()}
+    assert sink.events[0] == ("start", "fetching months", 2)
+    assert sink.events[-1] == ("done",)
+
+
+def test_rejected_month_warns_from_the_calling_thread(tmp_path):
+    sink = Recorder()
+    transport = StubTransport({"202403": [Response(200, b"junk", {})]})
+
+    run(tmp_path, transport, progress=sink)
+
+    assert [e for e in sink.events if e[0] == "warn"]
+    assert sink.threads == {threading.get_ident()}
+
+
+def test_workers_must_be_positive(tmp_path):
+    import pytest
+
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="workers"):
+            run(tmp_path, StubTransport({"202403": [ok()]}), workers=bad)
