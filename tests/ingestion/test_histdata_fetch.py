@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import threading
+import time
 import zipfile
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
@@ -643,3 +644,136 @@ def test_an_uninterrupted_run_is_not_marked_interrupted(tmp_path):
     report, _ = run(tmp_path, StubTransport({"202403": [ok()]}))
 
     assert not report.interrupted
+
+
+class AdaptiveClock(FakeClock):
+    """FakeClock that flags the first cooldown wait: the throttle is fully handled."""
+
+    def __init__(self):
+        super().__init__()
+        self.cooling = threading.Event()
+
+    def sleep(self, seconds):
+        super().sleep(seconds)
+        self.cooling.set()
+
+
+class ScriptedTransport:
+    """Requests are numbered in start order.
+
+    The first ``workers`` requests are the initial group: request 1 is throttled
+    and the rest stay in flight until the cooldown begins, then succeed. Later
+    requests (numbered from 1 as ``m``) are "new": ``throttle_at`` makes some
+    throttled, ``barriers`` makes some wait for company, and ``at_start`` records
+    how many new requests were in flight (itself included) when each started.
+    """
+
+    def __init__(self, clock, workers, throttle_at=(), barriers=None):
+        self.clock = clock
+        self.workers = workers
+        self.throttle_at = set(throttle_at)
+        self.barriers = barriers or {}
+        self.lock = threading.Lock()
+        self.count = 0
+        self.new_inflight = 0
+        self.at_start: dict[int, int] = {}
+
+    def get(self, url, headers):
+        if self._request():
+            return throttled("1")
+        return Response(200, PAGE.encode(), {})
+
+    def post(self, url, form, headers):
+        if self._request():
+            return throttled("1")
+        return ok(month=form["datemonth"])
+
+    def _request(self) -> bool:
+        """Block as scripted; True when this request is to be throttled."""
+        with self.lock:
+            self.count += 1
+            n = self.count
+            m = n - self.workers
+            if m > 0:
+                self.new_inflight += 1
+                self.at_start[m] = self.new_inflight
+        try:
+            if n == 1:
+                return True
+            if m <= 0:
+                assert self.clock.cooling.wait(timeout=10)
+                return False
+            if m in self.barriers:
+                self.barriers[m].wait()
+            else:
+                time.sleep(0.005)  # give any permitted overlap a chance to occur
+            return m in self.throttle_at
+        finally:
+            if m > 0:
+                with self.lock:
+                    self.new_inflight -= 1
+
+    def peak(self, lo, hi):
+        return max(v for m, v in self.at_start.items() if lo <= m <= hi)
+
+
+def run_adaptive(tmp_path, transport, clock, workers):
+    return run_clocked(
+        tmp_path, transport, clock, workers=workers, start="2023-01", end="2024-04"
+    )
+
+
+def test_a_throttle_halves_the_requests_in_flight_with_a_floor_of_one(tmp_path):
+    clock = AdaptiveClock()
+    transport = ScriptedTransport(clock, workers=4)
+
+    report = run_adaptive(tmp_path, transport, clock, workers=4)
+
+    assert report.ok
+    # 4 -> 2. Three initial successes plus seven more are needed to regrow.
+    assert transport.peak(1, 7) <= 2
+
+
+def test_a_throttle_at_one_active_worker_keeps_one(tmp_path):
+    clock = AdaptiveClock()
+    transport = ScriptedTransport(clock, workers=2, throttle_at={3})
+
+    report = run_adaptive(tmp_path, transport, clock, workers=2)
+
+    assert report.ok
+    assert transport.peak(1, 9) == 1  # 2 -> 1, then another 429 leaves 1
+
+
+def test_active_workers_grow_by_one_per_ten_consecutive_successes(tmp_path):
+    clock = AdaptiveClock()
+    # 3 workers, throttled to 1. The 2 initial successes count towards the run,
+    # so the 8th new success is the 10th (limit 2) and the 18th is the 20th (3).
+    pair, trio = threading.Barrier(2, timeout=10), threading.Barrier(3, timeout=10)
+    barriers = {9: pair, 10: pair, 19: trio, 20: trio, 21: trio}
+    transport = ScriptedTransport(clock, workers=3, barriers=barriers)
+
+    report = run_adaptive(tmp_path, transport, clock, workers=3)
+
+    assert report.ok
+    assert transport.peak(1, 8) == 1
+    assert transport.peak(9, 10) == 2  # barrier: two ran together
+    assert transport.peak(11, 18) <= 2
+    assert transport.peak(19, 21) == 3  # barrier: three ran together
+    assert transport.peak(1, 60) == 3  # never above the configured maximum
+
+
+def test_a_throttle_resets_the_success_run(tmp_path):
+    clock = AdaptiveClock()
+    # 2 workers, throttled to 1. Request m=7 is throttled again, after which 10
+    # more successes (m=8..17) are needed. Without a reset the limit would grow
+    # earlier, once 10 successes in all had been seen.
+    pair = threading.Barrier(2, timeout=10)
+    transport = ScriptedTransport(
+        clock, workers=2, throttle_at={7}, barriers={18: pair, 19: pair}
+    )
+
+    report = run_adaptive(tmp_path, transport, clock, workers=2)
+
+    assert report.ok
+    assert transport.peak(8, 17) == 1
+    assert transport.peak(18, 19) == 2
