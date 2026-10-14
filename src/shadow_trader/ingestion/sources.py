@@ -44,7 +44,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -115,6 +115,7 @@ class FetchReport:
     absent: list[Month] = field(default_factory=list)
     rejected: list[tuple[Month, str]] = field(default_factory=list)
     unsettled: list[Month] = field(default_factory=list)
+    interrupted: bool = False
 
     @property
     def ok(self) -> bool:
@@ -222,23 +223,52 @@ def fetch_months(
     tasks = [(i, p) for i in instruments for p in periods]
     progress.start("fetching months", len(tasks))
     outcomes: dict[Month, _Outcome] = {}
+    interrupted = False
+
+    def record(outcome: _Outcome) -> None:
+        outcomes[outcome.key] = outcome
+        instrument, period = outcome.key
+        if outcome.label == "rejected":
+            progress.warn(f"{instrument} {period} rejected: {outcome.reason}")
+        progress.advance(f"{instrument} {period}", outcome.label)
+
+    queue = iter(tasks)
+    pending: set[Future[_Outcome]] = set()
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(
-                _fetch_task, cache, transport, sleep, now, clock, supersede, *task
-            )
-            for task in tasks
-        ]
-        for future in as_completed(futures):
+        # Tasks are handed out lazily (at most ``workers`` in flight), so after
+        # an interrupt no further month ever starts.
+        try:
+            while True:
+                while len(pending) < workers and (task := next(queue, None)):
+                    pending.add(
+                        pool.submit(
+                            _fetch_task,
+                            cache,
+                            transport,
+                            sleep,
+                            now,
+                            clock,
+                            supersede,
+                            *task,
+                        )
+                    )
+                if not pending:
+                    break
+                finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    pending.discard(future)
+                    record(future.result())
+        except KeyboardInterrupt:
+            interrupted = True
+        # In-flight months finish and are stored; their outcomes are kept.
+        for future in pending:
             outcome = future.result()
             outcomes[outcome.key] = outcome
-            instrument, period = outcome.key
-            if outcome.label == "rejected":
-                progress.warn(f"{instrument} {period} rejected: {outcome.reason}")
-            progress.advance(f"{instrument} {period}", outcome.label)
     progress.done()
-    report = FetchReport()
+    report = FetchReport(interrupted=interrupted)
     for task in tasks:
+        if task not in outcomes:
+            continue  # never started: the run was interrupted
         outcome = outcomes[task]
         match outcome.label:
             case "fetched":
