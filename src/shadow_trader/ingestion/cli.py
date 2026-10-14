@@ -24,7 +24,7 @@ from rich.console import Console
 from .backfill import BuildFailure, build_backfill
 from .bars import Bar
 from .cli_progress import NORMAL, QUIET, VERBOSE, RichProgress
-from .config import Config, ConfigError, load_config
+from .config import DEFAULT_WORKERS, Config, ConfigError, load_config
 from .dataset import DatasetError, RawCache
 from .live import LiveIngester
 from .livedataset import build_live
@@ -82,7 +82,8 @@ def add_ingest_parser(subparsers: argparse._SubParsersAction) -> None:  # type: 
             command.add_argument(
                 "--workers",
                 type=int,
-                help="Concurrent fetch workers (positive; default from config, 8).",
+                help="Concurrent fetch workers (positive; default from config, "
+                f"{DEFAULT_WORKERS}).",
             )
         if name == "build-live":
             command.add_argument("--from", dest="range_from", help="Range start.")
