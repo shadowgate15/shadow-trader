@@ -427,3 +427,75 @@ def test_workers_must_be_positive(tmp_path):
     for bad in (0, -1):
         with pytest.raises(ValueError, match="workers"):
             run(tmp_path, StubTransport({"202403": [ok()]}), workers=bad)
+
+
+class InterruptingSink:
+    """Releases the in-flight month, then raises Ctrl-C when March is reported."""
+
+    def __init__(self, release):
+        self.release = release
+
+    def start(self, phase, total=None):
+        pass
+
+    def advance(self, detail="", outcome=None):
+        if "202403" in detail:
+            self.release.set()
+            raise KeyboardInterrupt
+
+    def warn(self, message):
+        pass
+
+    def status(self, text):
+        pass
+
+    def done(self):
+        pass
+
+
+class GatedTransport(StubTransport):
+    """April's download blocks until released, so it is in flight at the interrupt."""
+
+    def __init__(self, posts, gate):
+        super().__init__(posts)
+        self.gate = gate
+
+    def post(self, url, form, headers):
+        if form["datemonth"] == "202404":
+            assert self.gate.wait(timeout=10)
+        return super().post(url, form, headers)
+
+
+def test_interrupt_stops_dispatch_finishes_in_flight_and_rerun_fetches_the_rest(
+    tmp_path,
+):
+    gate = threading.Event()
+    posts = {m: [ok(month=m)] for m in ("202403", "202404", "202405", "202406")}
+    transport = GatedTransport(posts, gate)
+
+    report, _ = run(
+        tmp_path,
+        transport,
+        end="2024-06",
+        workers=2,
+        progress=InterruptingSink(gate),
+    )
+
+    assert report.interrupted
+    assert report.fetched == [("EURUSD", "202403"), ("EURUSD", "202404")]
+    assert transport.posts_for("202405") == []
+    assert transport.posts_for("202406") == []
+    assert (tmp_path / "raw" / "histdata" / "EURUSD" / "202404.zip").exists()
+
+    again = StubTransport(posts)
+    rerun, _ = run(tmp_path, again, end="2024-06", workers=2)
+
+    assert not rerun.interrupted
+    assert rerun.skipped == [("EURUSD", "202403"), ("EURUSD", "202404")]
+    assert rerun.fetched == [("EURUSD", "202405"), ("EURUSD", "202406")]
+
+
+def test_an_uninterrupted_run_is_not_marked_interrupted(tmp_path):
+    report, _ = run(tmp_path, StubTransport({"202403": [ok()]}))
+
+    assert not report.interrupted
