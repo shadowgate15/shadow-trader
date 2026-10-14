@@ -13,10 +13,20 @@ from __future__ import annotations
 
 import contextlib
 import io
+import multiprocessing
+import signal
 import time
 import zipfile
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import (
+    Callable,
+    Generator,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -68,6 +78,9 @@ class BuildFailure(Exception):
         self.locator = locator
         self.report_path: Path | None = None  # the failure report, once written
 
+    def __reduce__(self):  # keeps ``locator`` when raised in a pool worker
+        return (BuildFailure, (str(self), self.locator))
+
 
 @dataclass(frozen=True)
 class BuildWarning:
@@ -110,8 +123,82 @@ def read_raw_month(cache: RawCache, instrument: str, period: str) -> str:
     return text
 
 
-def _month_evidence(cache: RawCache, instrument: str, period: str) -> MonthEvidence:
+def _ignore_interrupt() -> None:
+    """Pool workers leave Ctrl-C to the parent, which shuts the pool down."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+@contextlib.contextmanager
+def worker_pool(jobs: int) -> Generator[ProcessPoolExecutor | None]:
+    """A process pool of ``jobs`` workers, or ``None`` for in-process (``jobs`` 1).
+
+    Any exit through an exception (Ctrl-C included) terminates the workers, so
+    none outlives the build.
+    """
+    if jobs <= 1:
+        yield None
+        return
+    pool = ProcessPoolExecutor(
+        jobs,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=_ignore_interrupt,
+    )
+    try:
+        yield pool
+    except BaseException:
+        for process in list(getattr(pool, "_processes", {}).values()):
+            process.terminate()
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def run_tasks[T, R](
+    pool: ProcessPoolExecutor | None,
+    task: Callable[[T], R],
+    items: Sequence[T],
+    on_done: Callable[[int, R], None] = lambda index, result: None,
+) -> list[R]:
+    """``task`` over ``items``, results in item order whatever the finish order.
+
+    ``on_done`` sees each result as it arrives. On a failure, queued items after
+    the failed one are cancelled and running ones finish; the failure raised is
+    the earliest by item order, which is what a serial run hits first.
+    """
+    if pool is None:
+        results = []
+        for index, item in enumerate(items):
+            results.append(task(item))
+            on_done(index, results[-1])
+        return results
+    futures = [pool.submit(task, item) for item in items]
+    position = {future: index for index, future in enumerate(futures)}
+    pending: set[Future[R]] = set(futures)
+    failed: int | None = None
+    while pending:
+        finished, pending = wait(pending, return_when=FIRST_COMPLETED)
+        for future in sorted(finished, key=position.__getitem__):
+            if future.cancelled():
+                continue
+            index = position[future]
+            if future.exception() is not None:
+                if failed is None or index < failed:
+                    failed = index
+                for other in pending:
+                    if position[other] > failed:
+                        other.cancel()
+            elif failed is None:
+                on_done(index, future.result())
+    if failed is not None:
+        error = futures[failed].exception()
+        assert error is not None
+        raise error
+    return [future.result() for future in futures]
+
+
+def _month_evidence(task: tuple[RawCache, str, str]) -> MonthEvidence:
     """One clock pre-pass task: unzip a raw month and return its week-clock evidence."""
+    cache, instrument, period = task
     label = f"{instrument}/{period}"
     try:
         return month_evidence(read_raw_month(cache, instrument, period), label)
@@ -127,14 +214,24 @@ def infer_week_clock(
     periods: Iterable[str],
     *,
     progress: ProgressSink = NULL_PROGRESS,
+    pool: ProcessPoolExecutor | None = None,
 ) -> WeekClock:
-    """The raw-clock offset of every Session week in ``periods`` (a pre-pass)."""
+    """The raw-clock offset of every Session week in ``periods`` (a pre-pass).
+
+    With a ``pool`` each month is scanned in a worker; the evidence merges in
+    month order either way.
+    """
     evidence = WeekEvidence()
     months = list(periods)
     progress.start("scanning clocks", len(months))
-    for period in months:
-        evidence.merge(_month_evidence(cache, instrument, period))
-        progress.advance(f"{instrument} {period}")
+    scanned = run_tasks(
+        pool,
+        _month_evidence,
+        [(cache, instrument, period) for period in months],
+        lambda index, _: progress.advance(f"{instrument} {months[index]}"),
+    )
+    for month in scanned:
+        evidence.merge(month)
     try:
         clock = evidence.infer()
     except WeekClockError as error:
@@ -398,6 +495,35 @@ def build_chunk(
     )
 
 
+@dataclass(frozen=True)
+class ChunkTask:
+    """The arguments of one bar-pass chunk, as one picklable pool-task item."""
+
+    cache: RawCache
+    instrument: str
+    bar_size: int
+    price_scale: int
+    anomaly_rule: AnomalyRuleConfig
+    clock: WeekClock
+    periods: list[str]
+    acknowledged: frozenset[str]
+    span: WeekSpan
+
+
+def _chunk_task(task: ChunkTask) -> ChunkResult:
+    return build_chunk(
+        task.cache,
+        task.instrument,
+        task.bar_size,
+        task.price_scale,
+        task.anomaly_rule,
+        task.clock,
+        task.periods,
+        task.acknowledged,
+        task.span,
+    )
+
+
 def _once_per_month(
     progress: ProgressSink, instrument: str
 ) -> Callable[[str, str | None], None]:
@@ -410,6 +536,22 @@ def _once_per_month(
             progress.advance(f"{instrument} {period}", note)
 
     return on_month
+
+
+def _chunk_months(
+    tasks: Sequence[ChunkTask],
+    on_month: Callable[[str, str | None], None],
+    acknowledged: frozenset[str],
+) -> Callable[[int, ChunkResult], None]:
+    """Completion callback: a chunk's months advance (once each) when it returns,
+    so progress stays right when chunks finish out of order."""
+
+    def chunk_done(index: int, _: ChunkResult) -> None:
+        for period in tasks[index].periods:
+            note = "acknowledged missing" if to_month(period) in acknowledged else None
+            on_month(period, note)
+
+    return chunk_done
 
 
 def _empty_sessions(last: Bar, following: Bar, bar_size: int) -> list[Bar]:
@@ -465,11 +607,17 @@ def build_backfill(
     (no Dataset directory exists) and re-raises ``BuildFailure``. Without a
     configured end month the range runs to the last complete UTC month before
     ``now`` (default: the current time). ``chunk_weeks`` is a test-only override
-    of the bar-pass chunk size; the Dataset never depends on it.
+    of the bar-pass chunk size; the Dataset never depends on it. With
+    ``config.build.jobs`` above 1 the clock pre-pass months and bar-pass chunks
+    run in a process pool; the parent alone merges and writes, so the Dataset,
+    report and warnings are the same at any job count.
     """
     validate_bar_sizes((bar_size,))
     try:
-        return _build(config, bar_size, now or datetime.now(UTC), progress, chunk_weeks)
+        with worker_pool(config.build.jobs) as pool:
+            return _build(
+                config, bar_size, now or datetime.now(UTC), progress, chunk_weeks, pool
+            )
     except BuildFailure as failure:
         # an unwritable report must not mask the failure itself
         with contextlib.suppress(OSError):
@@ -494,6 +642,7 @@ def _build(
     now: datetime,
     progress: ProgressSink,
     chunk_weeks: int,
+    pool: ProcessPoolExecutor | None,
 ) -> BackfillResult:
     cache = RawCache(config.paths.data_root)
     build = config.build
@@ -531,6 +680,7 @@ def _build(
                 if to_month(period) not in acknowledged
             ],
             progress=progress,
+            pool=pool,
         )
         pre_pass = time.perf_counter() - pre_pass_began
         timings["clock_pre_pass"] += pre_pass
@@ -550,8 +700,9 @@ def _build(
         progress.start("building months", len(periods))
         on_month = _once_per_month(progress, instrument)
 
-        chunks = [
-            build_chunk(
+        spans = week_chunks(session_weeks(lo, hi), chunk_weeks)
+        tasks = [
+            ChunkTask(
                 cache,
                 instrument,
                 bar_size,
@@ -561,10 +712,16 @@ def _build(
                 span_periods(periods, span),
                 acknowledged,
                 span,
-                on_month=on_month,
             )
-            for span in week_chunks(session_weeks(lo, hi), chunk_weeks)
+            for span in spans
         ]
+
+        chunks = run_tasks(
+            pool,
+            _chunk_task,
+            tasks,
+            _chunk_months(tasks, on_month, acknowledged),
+        )
         chunk = merge_chunks(chunks, bar_size)
         progress.done()
         timings["bar_pass"] += time.perf_counter() - instrument_began - pre_pass
