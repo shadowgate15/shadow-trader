@@ -95,6 +95,7 @@ class BuildConfig:
     start: str = DEFAULT_START
     end: str | None = None
     acknowledged_missing: tuple[AcknowledgedMissing, ...] = ()
+    workers: int = 8  # concurrent fetch workers; never affects Dataset content
 
 
 @dataclass(frozen=True)
@@ -186,14 +187,16 @@ class Config:
         bar_sizes: tuple[int, ...] | None = None,
         start: str | None = None,
         end: str | None = None,
+        workers: int | None = None,
     ) -> Config:
-        """Apply CLI overrides. Only instruments, time range and bar sizes."""
+        """Apply CLI overrides: instruments, time range, bar sizes, workers."""
         build = dataclasses.replace(
             self.build,
             instruments=instruments or self.build.instruments,
             bar_sizes=bar_sizes or self.build.bar_sizes,
             start=start or self.build.start,
             end=end or self.build.end,
+            workers=self.build.workers if workers is None else workers,
         )
         _validate_build(build, self.instruments)
         return dataclasses.replace(self, build=build)
@@ -255,6 +258,7 @@ def _validate_build(build: BuildConfig, instruments: Mapping[str, Any]) -> None:
                 f"{', '.join(SUPPORTED_INSTRUMENTS)}"
             )
     validate_bar_sizes(build.bar_sizes)
+    _positive(build.workers, "workers")
     _validate_month(build.start, "build.start")
     if build.end is not None:
         _validate_month(build.end, "build.end")
@@ -271,7 +275,7 @@ def _default_scale(pair: str) -> int:
 def _parse_build(raw: Mapping[str, Any]) -> BuildConfig:
     _check_keys(
         raw,
-        {"instruments", "bar_sizes", "start", "end", "acknowledged_missing"},
+        {"instruments", "bar_sizes", "start", "end", "acknowledged_missing", "workers"},
         "[build]",
     )
     instruments = tuple(_checked(raw.get("instruments", []), list, "build.instruments"))
@@ -301,6 +305,7 @@ def _parse_build(raw: Mapping[str, Any]) -> BuildConfig:
         start=_checked(raw.get("start", DEFAULT_START), str, "build.start"),
         end=None if end is None else _checked(end, str, "build.end"),
         acknowledged_missing=tuple(acknowledged),
+        workers=_checked(raw.get("workers", 8), int, "build.workers"),
     )
 
 

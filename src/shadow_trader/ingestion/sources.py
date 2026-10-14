@@ -23,7 +23,12 @@ Observed behaviour this code relies on:
   cache is write-once, so a premature download would be frozen as final; an
   unsettled month is reported and left for a later run.
 * No checksums are published, so the zip is validated structurally.
-* No rate limit was hit at ~400 requests spaced 0.2-0.5 s; we keep that pace.
+* Months are fetched concurrently by a pool of worker threads (``workers``),
+  one task per (Instrument, month); a month's token-page and zip requests run
+  in the same worker, so the token never crosses threads. There is no fixed
+  pacing: the worker count is the only speed control. An earlier sequential
+  run saw no rate limit at ~400 requests spaced 0.2-0.5 s; behaviour under
+  concurrent load is unmeasured, so keep the worker count modest.
 
 This is the only code in the project that touches the network, and it does so
 only through the ``Transport`` seam so tests run on stubbed responses.
@@ -32,7 +37,6 @@ only through the ``Transport`` seam so tests run on stubbed responses.
 from __future__ import annotations
 
 import io
-import random
 import re
 import time
 import urllib.error
@@ -40,6 +44,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -52,7 +57,7 @@ BASE_URL = "https://www.histdata.com"
 POST_URL = f"{BASE_URL}/get.php"
 ATTEMPTS = 3
 BACKOFF_SECONDS = (1.0, 30.0)  # first wait between attempts, and the cap; doubles
-PACE_SECONDS = (0.2, 0.5)
+DEFAULT_WORKERS = 8
 SETTLE_DAYS = 7
 USER_AGENT = (
     "shadow-trader/0.1 raw-cache fetcher "
@@ -177,6 +182,15 @@ def _validate_zip(data: bytes, instrument: str, period: str) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class _Outcome:
+    """What one (Instrument, month) task did: its label and any rejection reason."""
+
+    key: Month
+    label: str  # fetched, cached, absent, unsettled or rejected
+    reason: str = ""
+
+
 def fetch_months(
     cache: RawCache,
     transport: Transport,
@@ -188,6 +202,7 @@ def fetch_months(
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     supersede: bool = False,
     progress: ProgressSink = NULL_PROGRESS,
+    workers: int = DEFAULT_WORKERS,
 ) -> FetchReport:
     """Fetch HistData tick months into the raw cache.
 
@@ -195,62 +210,79 @@ def fetch_months(
     ``supersede`` is set, in which case the download becomes a new revision
     file (the old one is kept). ``end`` defaults to the last settled month, and
     a month in range that has not settled yet is not fetched (``unsettled``).
+
+    Months are fetched by ``workers`` threads draining one flat queue across all
+    Instruments. Only the calling thread touches ``progress``; the report lists
+    are in (Instrument, month) order whatever order the months finish in.
     """
-    report = FetchReport()
-    first_request = True
-
-    def paced[T](call: Callable[[], T]) -> T:
-        nonlocal first_request
-        if not first_request:
-            sleep(random.uniform(*PACE_SECONDS))
-        first_request = False
-        return call()
-
+    if workers < 1:
+        raise ValueError(f"workers must be positive, got {workers}")
     clock = now()
     periods = months_between(start, end or last_settled_month(clock))
-    progress.start("fetching months", len(instruments) * len(periods))
-    for instrument in instruments:
-        for period in periods:
-            key = (instrument, period)
-            if not supersede and cache.has(SOURCE, instrument, period, "zip"):
-                report.skipped.append(key)
-                outcome = "cached"
-            elif not is_settled(period, clock):
-                report.unsettled.append(key)
-                outcome = "unsettled"
-            else:
-                outcome = _fetch_one(
-                    cache,
-                    transport,
-                    paced,
-                    sleep,
-                    report,
-                    instrument,
-                    period,
-                    now,
-                    supersede,
-                )
-                if outcome == "rejected":
-                    progress.warn(
-                        f"{instrument} {period} rejected: {report.rejected[-1][1]}"
-                    )
-            progress.advance(f"{instrument} {period}", outcome)
+    tasks = [(i, p) for i in instruments for p in periods]
+    progress.start("fetching months", len(tasks))
+    outcomes: dict[Month, _Outcome] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(
+                _fetch_task, cache, transport, sleep, now, clock, supersede, *task
+            )
+            for task in tasks
+        ]
+        for future in as_completed(futures):
+            outcome = future.result()
+            outcomes[outcome.key] = outcome
+            instrument, period = outcome.key
+            if outcome.label == "rejected":
+                progress.warn(f"{instrument} {period} rejected: {outcome.reason}")
+            progress.advance(f"{instrument} {period}", outcome.label)
     progress.done()
+    report = FetchReport()
+    for task in tasks:
+        outcome = outcomes[task]
+        match outcome.label:
+            case "fetched":
+                report.fetched.append(task)
+            case "cached":
+                report.skipped.append(task)
+            case "absent":
+                report.absent.append(task)
+            case "unsettled":
+                report.unsettled.append(task)
+            case _:
+                report.rejected.append((task, outcome.reason))
     return report
+
+
+def _fetch_task(
+    cache: RawCache,
+    transport: Transport,
+    sleep: Callable[[float], None],
+    now: Callable[[], datetime],
+    clock: datetime,
+    supersede: bool,
+    instrument: str,
+    period: str,
+) -> _Outcome:
+    """One self-contained (Instrument, month) task; returns its outcome."""
+    key = (instrument, period)
+    if not supersede and cache.has(SOURCE, instrument, period, "zip"):
+        return _Outcome(key, "cached")
+    if not is_settled(period, clock):
+        return _Outcome(key, "unsettled")
+    return _fetch_one(cache, transport, sleep, instrument, period, now, supersede)
 
 
 def _fetch_one(
     cache: RawCache,
     transport: Transport,
-    paced: Callable,
     sleep: Callable[[float], None],
-    report: FetchReport,
     instrument: str,
     period: str,
     now: Callable[[], datetime],
     supersede: bool,
-) -> str:
-    """Fetch one month; return its outcome: fetched, absent or rejected."""
+) -> _Outcome:
+    """Fetch one month; its outcome is fetched, absent or rejected."""
     key = (instrument, period)
     page_url = month_page_url(instrument, period)
     headers = {"User-Agent": USER_AGENT}
@@ -261,14 +293,13 @@ def _fetch_one(
             sleep(delay)
             delay = min(delay * 2, cap)
         try:
-            page = paced(lambda: transport.get(page_url, headers))
+            page = transport.get(page_url, headers)
             token = _token(page.body.decode("utf-8", "replace"))
             if page.status != 200 or token is None:
                 problem = f"no token on month page (HTTP {page.status})"
                 continue
             if not token:
-                report.absent.append(key)  # an empty token: no file for the month
-                return "absent"
+                return _Outcome(key, "absent")  # an empty token: no such month
             form = {
                 "tk": token,
                 "date": period[:4],
@@ -277,11 +308,7 @@ def _fetch_one(
                 "timeframe": "T",
                 "fxpair": instrument,
             }
-            reply = paced(
-                lambda form=form: transport.post(
-                    POST_URL, form, {**headers, "Referer": page_url}
-                )
-            )
+            reply = transport.post(POST_URL, form, {**headers, "Referer": page_url})
         except (OSError, urllib.error.URLError) as exc:
             problem = f"network error: {exc}"
             continue
@@ -311,10 +338,7 @@ def _fetch_one(
             },
             supersede=supersede,
         )
-        report.fetched.append(key)
-        return "fetched"
+        return _Outcome(key, "fetched")
     if problem:
-        report.rejected.append((key, problem))
-        return "rejected"
-    report.absent.append(key)
-    return "absent"
+        return _Outcome(key, "rejected", problem)
+    return _Outcome(key, "absent")

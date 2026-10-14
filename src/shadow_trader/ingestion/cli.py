@@ -78,6 +78,12 @@ def add_ingest_parser(subparsers: argparse._SubParsersAction) -> None:  # type: 
         command.add_argument(
             "--bar-sizes", type=_int_csv, help="Override bar sizes in minutes."
         )
+        if name == "fetch":
+            command.add_argument(
+                "--workers",
+                type=int,
+                help="Concurrent fetch workers (positive; default from config, 8).",
+            )
         if name == "build-live":
             command.add_argument("--from", dest="range_from", help="Range start.")
             command.add_argument("--to", dest="range_to", help="Range end.")
@@ -148,6 +154,7 @@ def _run_fetch(config: Config, args: argparse.Namespace, progress: RichProgress)
         config.build.end,
         sleep=_sleep,
         progress=progress,
+        workers=config.build.workers,
     )
     progress.close()
     print(
@@ -262,6 +269,7 @@ def run_ingest(args: argparse.Namespace) -> int:
             bar_sizes=args.bar_sizes,
             start=args.start,
             end=args.end,
+            workers=getattr(args, "workers", None),
         )
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
