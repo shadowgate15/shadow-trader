@@ -511,16 +511,14 @@ def test_retry_after_http_date_is_honoured(tmp_path):
 
 def test_missing_retry_after_backs_off_exponentially(tmp_path):
     clock = FakeClock()
-    transport = TimedTransport(
-        clock, {"202403": [throttled(), throttled(), throttled(), ok()]}
-    )
+    # Month pages are throttled, so no good reply restarts the backoff between.
+    pages = [throttled()] * 3 + [Response(200, PAGE.encode(), {})]
+    transport = TimedTransport(clock, {"202403": [ok()]}, pages=pages)
 
     report = run_clocked(tmp_path, transport, clock)
 
     assert report.fetched == [("EURUSD", "202403")]
-    waits = clock.slept
-    assert len(waits) == 3
-    assert waits[0] < waits[1] < waits[2]
+    assert clock.slept == [1.0, 2.0, 4.0]
 
 
 def test_cooldown_is_capped_at_five_minutes(tmp_path):
@@ -668,10 +666,12 @@ class ScriptedTransport:
     how many new requests were in flight (itself included) when each started.
     """
 
-    def __init__(self, clock, workers, throttle_at=(), barriers=None):
+    def __init__(self, clock, workers, throttle_at=(), barriers=None, fail_at=()):
         self.clock = clock
         self.workers = workers
         self.throttle_at = set(throttle_at)
+        self.fail_at = set(fail_at)
+        self.broken: set[int] = set()  # barrier requests that found no company
         self.barriers = barriers or {}
         self.lock = threading.Lock()
         self.count = 0
@@ -679,17 +679,23 @@ class ScriptedTransport:
         self.at_start: dict[int, int] = {}
 
     def get(self, url, headers):
-        if self._request():
-            return throttled("1")
+        match self._request():
+            case "throttle":
+                return throttled("1")
+            case "fail":
+                return Response(500, b"", {})
         return Response(200, PAGE.encode(), {})
 
     def post(self, url, form, headers):
-        if self._request():
-            return throttled("1")
+        match self._request():
+            case "throttle":
+                return throttled("1")
+            case "fail":
+                return Response(500, b"", {})
         return ok(month=form["datemonth"])
 
-    def _request(self) -> bool:
-        """Block as scripted; True when this request is to be throttled."""
+    def _request(self) -> str:
+        """Block as scripted; the reply wanted: "throttle", "fail" or "ok"."""
         with self.lock:
             self.count += 1
             n = self.count
@@ -699,15 +705,18 @@ class ScriptedTransport:
                 self.at_start[m] = self.new_inflight
         try:
             if n == 1:
-                return True
+                return "throttle"
             if m <= 0:
                 assert self.clock.cooling.wait(timeout=10)
-                return False
+                return "ok"
             if m in self.barriers:
-                self.barriers[m].wait()
-            else:
-                time.sleep(0.005)  # give any permitted overlap a chance to occur
-            return m in self.throttle_at
+                try:
+                    self.barriers[m].wait()
+                except threading.BrokenBarrierError:
+                    self.broken.add(m)
+            if m in self.throttle_at:
+                return "throttle"
+            return "fail" if m in self.fail_at else "ok"
         finally:
             if m > 0:
                 with self.lock:
@@ -777,3 +786,210 @@ def test_a_throttle_resets_the_success_run(tmp_path):
     assert report.ok
     assert transport.peak(8, 17) == 1
     assert transport.peak(18, 19) == 2
+
+
+def test_a_failed_request_resets_the_success_run(tmp_path):
+    clock = AdaptiveClock()
+    # 2 workers, throttled to 1; the initial success starts the run at 1 and
+    # m=1..6 make 7. m=7 fails (HTTP 500), so only 10 more good replies (m=8..17)
+    # regrow the limit. If the failure did not reset the run, the 10th good reply
+    # would come at m=10 and m=11 and m=12 would overlap.
+    early = threading.Barrier(2, timeout=0.2)
+    late = threading.Barrier(2, timeout=10)
+    transport = ScriptedTransport(
+        clock,
+        workers=2,
+        fail_at={7},
+        barriers={11: early, 12: early, 18: late, 19: late},
+    )
+
+    report = run_adaptive(tmp_path, transport, clock, workers=2)
+
+    assert report.ok
+    assert 11 in transport.broken  # m=11 ran alone: the limit was still 1
+    assert not {18, 19} & transport.broken  # and by m=18 it had regrown to 2
+
+
+class BurstTransport:
+    """Every month's first page request waits until all are in flight, then 429s."""
+
+    def __init__(self, size):
+        self.barrier = threading.Barrier(size, timeout=10)
+        self.lock = threading.Lock()
+        self.seen: set[str] = set()
+
+    def get(self, url, headers):
+        with self.lock:
+            first = url not in self.seen
+            self.seen.add(url)
+        if first:
+            self.barrier.wait()
+            return throttled()
+        return Response(200, PAGE.encode(), {})
+
+    def post(self, url, form, headers):
+        return ok(month=form["datemonth"])
+
+
+def test_a_burst_of_simultaneous_throttles_counts_as_one(tmp_path):
+    clock = FakeClock()
+    transport = BurstTransport(4)
+
+    report = run_clocked(
+        tmp_path, transport, clock, workers=4, start="2024-01", end="2024-04"
+    )
+
+    assert report.ok and len(report.fetched) == 4
+    assert max(clock.slept) == 1.0  # one cooldown step, not four
+
+
+def test_the_backoff_survives_thousands_of_throttles(tmp_path):
+    clock = FakeClock()
+    transport = TimedTransport(clock, {}, pages=[throttled()])
+
+    report = run_clocked(
+        tmp_path, transport, clock, workers=1, start="2010-01", end="2019-06"
+    )
+
+    assert len(report.rejected) == 114  # 1140 throttles, no OverflowError
+    assert max(clock.slept) == 300
+
+
+def test_any_good_reply_resets_the_backoff_not_only_a_stored_month(tmp_path):
+    clock = FakeClock()
+    transport = TimedTransport(clock, {"202403": [throttled()] * 3 + [ok()]})
+
+    report = run_clocked(tmp_path, transport, clock)
+
+    assert report.fetched == [("EURUSD", "202403")]
+    assert clock.slept == [1.0, 1.0, 1.0]  # each good month page restarts at 1 s
+
+
+class FailingDownload(GatedTransport):
+    """April's download fails with a bug (not a network error) once released."""
+
+    def post(self, url, form, headers):
+        if form["datemonth"] == "202404":
+            assert self.gate.wait(timeout=10)
+            raise RuntimeError("boom")
+        return super().post(url, form, headers)
+
+
+class EventSink(InterruptingSink):
+    """Ctrl-C when March is reported; keeps every call it receives."""
+
+    def __init__(self, release, *, repeat=False, fail=None):
+        super().__init__(release)
+        self.repeat = repeat  # also Ctrl-C when any later month is reported
+        self.fail = fail
+        self.advanced: list[tuple] = []
+        self.finished = False
+
+    def advance(self, detail="", outcome=None):
+        self.advanced.append((detail, outcome))
+        if self.fail:
+            raise self.fail
+        if self.repeat and "202403" not in detail:
+            raise KeyboardInterrupt
+        super().advance(detail, outcome)
+
+    def done(self):
+        self.finished = True
+
+
+POSTS = {m: [ok(month=m)] for m in ("202403", "202404", "202405", "202406")}
+
+
+def test_interrupt_keeps_the_partial_report_when_an_in_flight_month_blows_up(tmp_path):
+    gate = threading.Event()
+    sink = EventSink(gate)
+
+    report, _ = run(
+        tmp_path,
+        FailingDownload(POSTS, gate),
+        end="2024-06",
+        workers=2,
+        progress=sink,
+    )
+
+    assert report.interrupted
+    assert report.fetched == [("EURUSD", "202403")]
+    assert sink.finished
+
+
+def test_a_second_ctrl_c_while_draining_still_returns_the_partial_report(tmp_path):
+    gate = threading.Event()
+    sink = EventSink(gate, repeat=True)
+
+    report, _ = run(
+        tmp_path,
+        GatedTransport(POSTS, gate),
+        end="2024-06",
+        workers=2,
+        progress=sink,
+    )
+
+    assert report.interrupted
+    assert report.fetched == [("EURUSD", "202403"), ("EURUSD", "202404")]
+    assert sink.finished
+
+
+def test_drained_months_are_reported_to_progress(tmp_path):
+    gate = threading.Event()
+    sink = EventSink(gate)
+
+    run(tmp_path, GatedTransport(POSTS, gate), end="2024-06", workers=2, progress=sink)
+
+    assert sink.advanced == [
+        ("EURUSD 202403", "fetched"),
+        ("EURUSD 202404", "fetched"),
+    ]
+
+
+def test_progress_is_finished_even_when_a_sink_call_raises(tmp_path):
+    import pytest
+
+    sink = EventSink(threading.Event(), fail=ValueError("sink bug"))
+
+    with pytest.raises(ValueError, match="sink bug"):
+        run(tmp_path, StubTransport({"202403": [ok()]}), progress=sink)
+
+    assert sink.finished
+
+
+class CooldownTransport(StubTransport):
+    """April finishes first; then March is throttled for 5 minutes."""
+
+    def __init__(self, posts):
+        super().__init__(posts)
+        self.april_done = threading.Event()
+
+    def post(self, url, form, headers):
+        if form["datemonth"] == "202404":
+            try:
+                return super().post(url, form, headers)
+            finally:
+                self.april_done.set()
+        assert self.april_done.wait(timeout=10)
+        return throttled("300")
+
+
+def test_interrupt_does_not_wait_out_a_cooldown(tmp_path):
+    transport = CooldownTransport({"202403": [ok()], "202404": [ok(month="202404")]})
+    sink = EventSink(threading.Event(), fail=KeyboardInterrupt())
+    started = time.monotonic()
+
+    report = fetch_months(
+        RawCache(tmp_path),
+        transport,
+        ("EURUSD",),
+        "2024-03",
+        "2024-04",
+        workers=2,
+        progress=sink,
+        now=lambda: NOW,
+    )  # real time.sleep: a 300 s cooldown would block here
+
+    assert time.monotonic() - started < 30
+    assert report.interrupted
+    assert report.fetched == [("EURUSD", "202404")]

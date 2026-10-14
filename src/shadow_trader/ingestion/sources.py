@@ -37,7 +37,13 @@ Observed behaviour this code relies on:
   is retried, and after ``MAX_THROTTLES`` throttles it is rejected as throttled.
 * Each 429 also halves the number of requests allowed in flight (minimum 1);
   every ``GROW_AFTER`` consecutive successful requests raise it by one, never
-  above ``workers``, and a 429 restarts that run.
+  above ``workers``, and a 429 restarts that run. Only a genuinely good reply
+  (a month page with a form, a valid zip) counts towards that run; any other
+  failure (HTTP 500, network error, bad or empty reply) restarts it too.
+* 429s from requests that were already in flight when a cooldown began are one
+  throttle, not several: they do not escalate the backoff or halve the limit
+  again. A good reply restarts the backoff.
+* Cooldown and backoff waits end early on Ctrl-C, so the run stops promptly.
 
 This is the only code in the project that touches the network, and it does so
 only through the ``Transport`` seam so tests run on stubbed responses.
@@ -54,14 +60,16 @@ import urllib.parse
 import urllib.request
 import zipfile
 from collections.abc import Callable, Generator, Mapping, Sequence
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
+from enum import StrEnum
 from typing import Protocol
 
-from .config import last_complete_month, month_parts
+from .config import DEFAULT_WORKERS, last_complete_month, month_parts
 from .dataset import SOURCE, RawCache
 from .progress import NULL_PROGRESS, ProgressSink
 
@@ -69,11 +77,11 @@ BASE_URL = "https://www.histdata.com"
 POST_URL = f"{BASE_URL}/get.php"
 ATTEMPTS = 3
 BACKOFF_SECONDS = (1.0, 30.0)  # first wait between attempts, and the cap; doubles
-DEFAULT_WORKERS = 8
 THROTTLE_STATUS = 429  # the only throttle signal for now
 MAX_THROTTLES = 10  # per month, then it is rejected as throttled
 GROW_AFTER = 10  # consecutive successful requests per +1 active worker
 MAX_COOLDOWN_SECONDS = 300.0
+MAX_BACKOFF_EXPONENT = 10  # 2**10 s already exceeds the cooldown cap
 SETTLE_DAYS = 7
 USER_AGENT = (
     "shadow-trader/0.1 raw-cache fetcher "
@@ -216,12 +224,16 @@ def _retry_after(headers: Mapping[str, str], now: datetime) -> float | None:
     return max(0.0, (when - now).total_seconds())
 
 
+class _Aborted(Exception):
+    """A wait was cut short because the run was interrupted."""
+
+
 class _Limiter:
     """Shared by all workers: a global cooldown and an adaptive request limit.
 
     ``slot()`` admits at most ``allowed`` requests at once. A throttle halves
-    ``allowed`` (floor 1); every ``GROW_AFTER`` consecutive successful requests
-    raise it by one, up to ``maximum``.
+    ``allowed`` (floor 1); every ``GROW_AFTER`` consecutive good replies raise it
+    by one, up to ``maximum``. ``abort`` ends waits early (``pause`` raises).
     """
 
     def __init__(
@@ -229,20 +241,29 @@ class _Limiter:
         sleep: Callable[[float], None],
         now: Callable[[], datetime],
         maximum: int = 1,
+        abort: threading.Event | None = None,
     ) -> None:
         self._sleep = sleep
         self._now = now
+        self._abort = abort or threading.Event()
         self._cond = threading.Condition()
-        self._until: datetime | None = None
+        self._until: datetime | None = None  # the cooldown ends here
+        self._started: datetime | None = None  # when the active cooldown began
         self._streak = 0  # consecutive throttles, for the backoff fallback
         self._maximum = maximum
         self._allowed = maximum
         self._active = 0  # requests currently holding a slot
-        self._successes = 0  # consecutive successful requests
+        self._good_run = 0  # consecutive good replies
+
+    def pause(self, seconds: float) -> None:
+        """Wait ``seconds`` (a cooldown or retry backoff); raise if interrupted."""
+        self._sleep(seconds)
+        if self._abort.is_set():
+            raise _Aborted
 
     @contextmanager
-    def slot(self) -> Generator[None]:
-        """Hold a request slot, after any cooldown has passed."""
+    def slot(self) -> Generator[datetime]:
+        """Hold a request slot after any cooldown; yields when the request began."""
         while True:
             with self._cond:
                 remaining = (
@@ -253,50 +274,72 @@ class _Limiter:
                 if remaining <= 0:
                     if self._active < self._allowed:
                         self._active += 1
+                        sent = self._now()
                         break
                     self._cond.wait()
                     continue
-            self._sleep(remaining)
+            self.pause(remaining)
         try:
-            yield
+            yield sent
         finally:
             with self._cond:
                 self._active -= 1
                 self._cond.notify_all()
 
-    def throttled(self, headers: Mapping[str, str]) -> None:
-        """A throttle reply: start or extend the cooldown, and ease off."""
+    def throttled(self, headers: Mapping[str, str], sent: datetime) -> None:
+        """A 429 to a request sent at ``sent``: start or extend the cooldown."""
         with self._cond:
             now = self._now()
-            seconds = _retry_after(headers, now)
-            if seconds is None:
-                seconds = BACKOFF_SECONDS[0] * 2**self._streak
-            self._streak += 1
-            until = now + timedelta(seconds=min(seconds, MAX_COOLDOWN_SECONDS))
-            if self._until is None or until > self._until:
-                self._until = until
+            retry_after = _retry_after(headers, now)
+            if self._started is not None and sent <= self._started:
+                # Already in flight when the last cooldown began: same throttle.
+                if retry_after is not None:
+                    self._extend(now, retry_after)
+                return
+            if retry_after is None:
+                exponent = min(self._streak, MAX_BACKOFF_EXPONENT)
+                retry_after = BACKOFF_SECONDS[0] * 2**exponent
+            self._streak = min(self._streak + 1, MAX_BACKOFF_EXPONENT)
+            self._started = now
+            self._extend(now, retry_after)
             self._allowed = max(1, self._allowed // 2)
-            self._successes = 0
+            self._good_run = 0
 
-    def reply(self, response: Response) -> None:
-        """Account for a reply: a throttle eases off, a good run speeds up."""
+    def _extend(self, now: datetime, seconds: float) -> None:
+        until = now + timedelta(seconds=min(seconds, MAX_COOLDOWN_SECONDS))
+        if self._until is None or until > self._until:
+            self._until = until
+
+    def observe(self, response: Response, sent: datetime) -> None:
+        """Account for a reply: 429 eases off, any other bad status is a failure."""
         if response.status == THROTTLE_STATUS:
-            self.throttled(response.headers)
-        elif response.status == 200:
-            self._request_ok()
+            self.throttled(response.headers, sent)
+        elif response.status != 200:
+            self.failed()
 
-    def _request_ok(self) -> None:
+    def good(self) -> None:
+        """A genuinely good reply: restart the backoff; a good run speeds up."""
         with self._cond:
-            self._successes += 1
-            if self._successes >= GROW_AFTER:
-                self._successes = 0
+            self._streak = 0
+            self._good_run += 1
+            if self._good_run >= GROW_AFTER:
+                self._good_run = 0
                 if self._allowed < self._maximum:
                     self._allowed += 1
                     self._cond.notify_all()
 
-    def succeeded(self) -> None:
+    def failed(self) -> None:
+        """A non-throttle failure: the run of good replies starts over."""
         with self._cond:
-            self._streak = 0
+            self._good_run = 0
+
+
+class _Label(StrEnum):
+    FETCHED = "fetched"
+    CACHED = "cached"
+    ABSENT = "absent"
+    UNSETTLED = "unsettled"
+    REJECTED = "rejected"
 
 
 @dataclass(frozen=True)
@@ -304,7 +347,7 @@ class _Outcome:
     """What one (Instrument, month) task did: its label and any rejection reason."""
 
     key: Month
-    label: str  # fetched, cached, absent, unsettled or rejected
+    label: _Label
     reason: str = ""
 
 
@@ -339,65 +382,85 @@ def fetch_months(
     tasks = [(i, p) for i in instruments for p in periods]
     progress.start("fetching months", len(tasks))
     outcomes: dict[Month, _Outcome] = {}
-    limiter = _Limiter(sleep, now, workers)
+    abort = threading.Event()  # set on Ctrl-C: ends cooldown and backoff waits
+
+    def wait(seconds: float) -> None:
+        if sleep is time.sleep:
+            abort.wait(seconds)
+        else:
+            sleep(seconds)
+
+    limiter = _Limiter(wait, now, workers, abort)
     interrupted = False
 
     def record(outcome: _Outcome) -> None:
         outcomes[outcome.key] = outcome
         instrument, period = outcome.key
-        if outcome.label == "rejected":
+        if outcome.label is _Label.REJECTED:
             progress.warn(f"{instrument} {period} rejected: {outcome.reason}")
         progress.advance(f"{instrument} {period}", outcome.label)
 
     queue = iter(tasks)
     pending: set[Future[_Outcome]] = set()
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        # Tasks are handed out lazily (at most ``workers`` in flight), so after
-        # an interrupt no further month ever starts.
-        try:
-            while True:
-                while len(pending) < workers and (task := next(queue, None)):
-                    pending.add(
-                        pool.submit(
-                            _fetch_task,
-                            cache,
-                            transport,
-                            sleep,
-                            now,
-                            clock,
-                            supersede,
-                            limiter,
-                            *task,
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            # Tasks are handed out lazily (at most ``workers`` in flight), so
+            # after an interrupt no further month ever starts.
+            try:
+                while True:
+                    while len(pending) < workers and (task := next(queue, None)):
+                        pending.add(
+                            pool.submit(
+                                _fetch_task,
+                                cache,
+                                transport,
+                                now,
+                                clock,
+                                supersede,
+                                limiter,
+                                *task,
+                            )
                         )
-                    )
-                if not pending:
-                    break
-                finished, _ = wait(pending, return_when=FIRST_COMPLETED)
-                for future in finished:
-                    pending.discard(future)
+                    if not pending:
+                        break
+                    finished, _ = wait_futures(pending, return_when=FIRST_COMPLETED)
+                    for future in finished:
+                        pending.discard(future)
+                        record(future.result())
+            except KeyboardInterrupt:
+                interrupted = True
+                abort.set()
+            # In-flight months finish and are stored; their outcomes are kept.
+            # Nothing here may lose the partial report: a worker that fails or
+            # was aborted just leaves its month for a re-run, and a second
+            # Ctrl-C stops the draining.
+            for future in list(pending):
+                try:
                     record(future.result())
-        except KeyboardInterrupt:
-            interrupted = True
-        # In-flight months finish and are stored; their outcomes are kept.
-        for future in pending:
-            outcome = future.result()
-            outcomes[outcome.key] = outcome
-    progress.done()
+                except KeyboardInterrupt:
+                    abort.set()
+                    break
+                except _Aborted:
+                    pass
+                except Exception as exc:
+                    progress.warn(f"a month failed while stopping: {exc!r}")
+    finally:
+        progress.done()
     report = FetchReport(interrupted=interrupted)
     for task in tasks:
         if task not in outcomes:
             continue  # never started: the run was interrupted
         outcome = outcomes[task]
         match outcome.label:
-            case "fetched":
+            case _Label.FETCHED:
                 report.fetched.append(task)
-            case "cached":
+            case _Label.CACHED:
                 report.skipped.append(task)
-            case "absent":
+            case _Label.ABSENT:
                 report.absent.append(task)
-            case "unsettled":
+            case _Label.UNSETTLED:
                 report.unsettled.append(task)
-            case _:
+            case _Label.REJECTED:
                 report.rejected.append((task, outcome.reason))
     return report
 
@@ -405,7 +468,6 @@ def fetch_months(
 def _fetch_task(
     cache: RawCache,
     transport: Transport,
-    sleep: Callable[[float], None],
     now: Callable[[], datetime],
     clock: datetime,
     supersede: bool,
@@ -416,18 +478,15 @@ def _fetch_task(
     """One self-contained (Instrument, month) task; returns its outcome."""
     key = (instrument, period)
     if not supersede and cache.has(SOURCE, instrument, period, "zip"):
-        return _Outcome(key, "cached")
+        return _Outcome(key, _Label.CACHED)
     if not is_settled(period, clock):
-        return _Outcome(key, "unsettled")
-    return _fetch_one(
-        cache, transport, sleep, instrument, period, now, supersede, limiter
-    )
+        return _Outcome(key, _Label.UNSETTLED)
+    return _fetch_one(cache, transport, instrument, period, now, supersede, limiter)
 
 
 def _fetch_one(
     cache: RawCache,
     transport: Transport,
-    sleep: Callable[[float], None],
     instrument: str,
     period: str,
     now: Callable[[], datetime],
@@ -445,26 +504,28 @@ def _fetch_one(
     backoff = False  # a non-throttle failure is awaiting its backoff sleep
     while attempt < ATTEMPTS:
         if throttles >= MAX_THROTTLES:
-            return _Outcome(key, "rejected", f"throttled {throttles} times")
+            return _Outcome(key, _Label.REJECTED, f"throttled {throttles} times")
         if backoff:
-            sleep(delay)
+            limiter.pause(delay)
             delay = min(delay * 2, cap)
             backoff = False
         attempt += 1
         backoff = True  # unless this attempt is throttled, a failure backs off
         try:
-            with limiter.slot():
+            with limiter.slot() as sent:
                 page = transport.get(page_url, headers)
-                limiter.reply(page)
+                limiter.observe(page, sent)
             if page.status == THROTTLE_STATUS:
                 throttles, attempt, backoff = throttles + 1, attempt - 1, False
                 continue
             token = _token(page.body.decode("utf-8", "replace"))
             if page.status != 200 or token is None:
+                limiter.failed()
                 problem = f"no token on month page (HTTP {page.status})"
                 continue
+            limiter.good()
             if not token:
-                return _Outcome(key, "absent")  # an empty token: no such month
+                return _Outcome(key, _Label.ABSENT)  # an empty token: no such month
             form = {
                 "tk": token,
                 "date": period[:4],
@@ -473,43 +534,48 @@ def _fetch_one(
                 "timeframe": "T",
                 "fxpair": instrument,
             }
-            with limiter.slot():
-                reply = transport.post(POST_URL, form, {**headers, "Referer": page_url})
-                limiter.reply(reply)
+            with limiter.slot() as sent:
+                download = transport.post(
+                    POST_URL, form, {**headers, "Referer": page_url}
+                )
+                limiter.observe(download, sent)
         except (OSError, urllib.error.URLError) as exc:
+            limiter.failed()
             problem = f"network error: {exc}"
             continue
-        if reply.status == THROTTLE_STATUS:
+        if download.status == THROTTLE_STATUS:
             throttles, attempt, backoff = throttles + 1, attempt - 1, False
             continue
-        if reply.status != 200:
-            problem = f"HTTP {reply.status}"
+        if download.status != 200:
+            problem = f"HTTP {download.status}"
             continue
-        if not reply.body:
+        if not download.body:
+            limiter.failed()
             problem = ""
             continue
-        bad = _validate_zip(reply.body, instrument, period)
+        bad = _validate_zip(download.body, instrument, period)
         if bad is not None:
+            limiter.failed()
             problem = bad
             continue
+        limiter.good()
         cache.store(
             SOURCE,
             instrument,
             period,
             "zip",
-            reply.body,
+            download.body,
             request={**form, "url": POST_URL, "referer": page_url},
             fetched_at=now(),
             http={
-                "status": reply.status,
-                "headers": dict(reply.headers),
-                "content_length": len(reply.body),
+                "status": download.status,
+                "headers": dict(download.headers),
+                "content_length": len(download.body),
                 "attempts": attempt,
             },
             supersede=supersede,
         )
-        limiter.succeeded()
-        return _Outcome(key, "fetched")
+        return _Outcome(key, _Label.FETCHED)
     if problem:
-        return _Outcome(key, "rejected", problem)
-    return _Outcome(key, "absent")
+        return _Outcome(key, _Label.REJECTED, problem)
+    return _Outcome(key, _Label.ABSENT)

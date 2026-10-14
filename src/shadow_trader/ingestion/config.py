@@ -30,6 +30,7 @@ SUPPORTED_INSTRUMENTS = (
 SUPPORTED_BAR_SIZES = (1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60)
 SUPPORTED_LIVE_ADAPTERS = ("replay",)
 DEFAULT_START = "2009-01"
+DEFAULT_WORKERS = 8  # concurrent fetch workers
 _MONTH = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
 
 
@@ -95,7 +96,7 @@ class BuildConfig:
     start: str = DEFAULT_START
     end: str | None = None
     acknowledged_missing: tuple[AcknowledgedMissing, ...] = ()
-    workers: int = 8  # concurrent fetch workers; never affects Dataset content
+    workers: int = DEFAULT_WORKERS  # never affects Dataset content
 
 
 @dataclass(frozen=True)
@@ -305,7 +306,7 @@ def _parse_build(raw: Mapping[str, Any]) -> BuildConfig:
         start=_checked(raw.get("start", DEFAULT_START), str, "build.start"),
         end=None if end is None else _checked(end, str, "build.end"),
         acknowledged_missing=tuple(acknowledged),
-        workers=_checked(raw.get("workers", 8), int, "build.workers"),
+        workers=_checked(raw.get("workers", DEFAULT_WORKERS), int, "build.workers"),
     )
 
 
