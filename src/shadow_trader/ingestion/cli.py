@@ -85,6 +85,13 @@ def add_ingest_parser(subparsers: argparse._SubParsersAction) -> None:  # type: 
                 help="Concurrent fetch workers (positive; default from config, "
                 f"{DEFAULT_WORKERS}).",
             )
+        if name == "build":
+            command.add_argument(
+                "--jobs",
+                type=int,
+                help="Parallel build processes (positive; 1 runs in-process; "
+                "default from config, the CPU count).",
+            )
         if name == "build-live":
             command.add_argument("--from", dest="range_from", help="Range start.")
             command.add_argument("--to", dest="range_to", help="Range end.")
@@ -274,6 +281,7 @@ def run_ingest(args: argparse.Namespace) -> int:
             start=args.start,
             end=args.end,
             workers=getattr(args, "workers", None),
+            jobs=getattr(args, "jobs", None),
         )
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)

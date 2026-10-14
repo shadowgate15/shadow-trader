@@ -9,6 +9,7 @@ recorded as an input to them, so it feeds the Dataset hash) or reporting-only
 from __future__ import annotations
 
 import dataclasses
+import os
 import re
 import tomllib
 from collections.abc import Iterable, Mapping
@@ -31,6 +32,13 @@ SUPPORTED_BAR_SIZES = (1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60)
 SUPPORTED_LIVE_ADAPTERS = ("replay",)
 DEFAULT_START = "2009-01"
 DEFAULT_WORKERS = 8  # concurrent fetch workers
+
+
+def default_jobs() -> int:
+    """The build's default process count: one per available CPU."""
+    return os.process_cpu_count() or 1
+
+
 _MONTH = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
 
 
@@ -96,7 +104,9 @@ class BuildConfig:
     start: str = DEFAULT_START
     end: str | None = None
     acknowledged_missing: tuple[AcknowledgedMissing, ...] = ()
-    workers: int = DEFAULT_WORKERS  # never affects Dataset content
+    workers: int = DEFAULT_WORKERS  # concurrent fetch workers only
+    # parallel build processes (1: in-process, no pool); never affects Dataset content
+    jobs: int = dataclasses.field(default_factory=lambda: default_jobs())
 
 
 @dataclass(frozen=True)
@@ -189,8 +199,9 @@ class Config:
         start: str | None = None,
         end: str | None = None,
         workers: int | None = None,
+        jobs: int | None = None,
     ) -> Config:
-        """Apply CLI overrides: instruments, time range, bar sizes, workers."""
+        """Apply CLI overrides: instruments, time range, bar sizes, workers, jobs."""
         build = dataclasses.replace(
             self.build,
             instruments=instruments or self.build.instruments,
@@ -198,6 +209,7 @@ class Config:
             start=start or self.build.start,
             end=end or self.build.end,
             workers=self.build.workers if workers is None else workers,
+            jobs=self.build.jobs if jobs is None else jobs,
         )
         _validate_build(build, self.instruments)
         return dataclasses.replace(self, build=build)
@@ -260,6 +272,7 @@ def _validate_build(build: BuildConfig, instruments: Mapping[str, Any]) -> None:
             )
     validate_bar_sizes(build.bar_sizes)
     _positive(build.workers, "workers")
+    _positive(build.jobs, "jobs")
     _validate_month(build.start, "build.start")
     if build.end is not None:
         _validate_month(build.end, "build.end")
@@ -276,7 +289,15 @@ def _default_scale(pair: str) -> int:
 def _parse_build(raw: Mapping[str, Any]) -> BuildConfig:
     _check_keys(
         raw,
-        {"instruments", "bar_sizes", "start", "end", "acknowledged_missing", "workers"},
+        {
+            "instruments",
+            "bar_sizes",
+            "start",
+            "end",
+            "acknowledged_missing",
+            "workers",
+            "jobs",
+        },
         "[build]",
     )
     instruments = tuple(_checked(raw.get("instruments", []), list, "build.instruments"))
@@ -307,6 +328,7 @@ def _parse_build(raw: Mapping[str, Any]) -> BuildConfig:
         end=None if end is None else _checked(end, str, "build.end"),
         acknowledged_missing=tuple(acknowledged),
         workers=_checked(raw.get("workers", DEFAULT_WORKERS), int, "build.workers"),
+        jobs=_checked(raw.get("jobs", default_jobs()), int, "build.jobs"),
     )
 
 

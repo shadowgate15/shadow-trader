@@ -109,12 +109,20 @@ def _outage_runs(bars: Sequence[Bar], bar_size: int) -> dict[str, Any]:
 
 
 def resolved_config(config: Config) -> dict[str, Any]:
-    """The whole config as plain JSON-able values, defaults included."""
+    """The whole config as plain JSON-able values, defaults included.
+
+    ``build.jobs`` is left out: how many processes ran must not make otherwise
+    identical reports differ.
+    """
     return json.loads(
         json.dumps(
             {
                 "paths": dataclasses.asdict(config.paths),
-                "build": dataclasses.asdict(config.build),
+                "build": {
+                    key: value
+                    for key, value in dataclasses.asdict(config.build).items()
+                    if key != "jobs"
+                },
                 "instruments": {
                     pair: dataclasses.asdict(value)
                     for pair, value in sorted(config.instruments.items())
