@@ -25,6 +25,7 @@ from typing import Any
 from .bars import Bar
 from .config import Config, pip_size
 from .dataset import Dataset, DatasetError, open_dataset
+from .progress import NULL_PROGRESS, ProgressSink
 from .report import REPORT_VERSION, nearest_rank, write_json
 from .session import NY
 
@@ -274,17 +275,25 @@ def reconciliation_path(data_root: Path, live_id: str, backfill_id: str) -> Path
     )
 
 
-def reconcile(config: Config, live_id: str, backfill_id: str) -> Path:
+def reconcile(
+    config: Config,
+    live_id: str,
+    backfill_id: str,
+    *,
+    progress: ProgressSink = NULL_PROGRESS,
+) -> Path:
     """Write the reconciliation report for two Datasets; return its path.
 
     Raises ``ReconciliationRefused`` if the Datasets are not comparable.
     Neither Dataset is modified.
     """
+    progress.start("reconciling datasets")
     live = _open(config, live_id)
     backfill = _open(config, backfill_id)
     document = build_reconciliation(config, live, backfill)
     path = reconciliation_path(config.paths.data_root, live_id, backfill_id)
     write_json(path, document)
+    progress.done()
     return path
 
 

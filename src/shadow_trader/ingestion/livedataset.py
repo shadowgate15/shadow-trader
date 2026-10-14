@@ -27,6 +27,7 @@ from .config import Config, validate_bar_sizes
 from .dataset import DatasetRef
 from .gaps import flag_suspected_outages, with_flag
 from .live import Event, LiveIngester, overlaps_interval
+from .progress import NULL_PROGRESS, ProgressSink
 from .rawlog import raw_log_dir, read_raw_log
 from .replay import ReplayAdapter
 from .report import live_report_dir
@@ -89,7 +90,12 @@ def _events(data_root: Path, source: str, instrument: str) -> Iterator[Event]:
 
 
 def build_live(
-    config: Config, bar_size: int, start: datetime, end: datetime
+    config: Config,
+    bar_size: int,
+    start: datetime,
+    end: datetime,
+    *,
+    progress: ProgressSink = NULL_PROGRESS,
 ) -> DatasetRef:
     """Build a live Dataset over the closed range ``[start, end)``."""
     validate_bar_sizes((bar_size,))
@@ -100,7 +106,9 @@ def build_live(
     raw_inputs: dict[str, str] = {}
     run_intervals: dict[str, list[dict[str, Any]]] = {}
     down_intervals: dict[str, list[dict[str, Any]]] = {}
-    for instrument in config.build.instruments:
+    instruments = config.build.instruments
+    progress.start("replaying raw logs", len(instruments))
+    for instrument in instruments:
         runs = _runs(data_root, source, instrument)
         down = _down_intervals(runs)
         floor = start
@@ -126,6 +134,7 @@ def build_live(
             bars, bar_size, config.gap_rule.outage_threshold_minutes
         )
         raw_inputs.update(_log_files(data_root, source, instrument))
+        progress.advance(instrument)
         down_intervals[instrument] = down
         run_intervals[instrument] = [
             {
@@ -136,10 +145,12 @@ def build_live(
             }
             for r in runs
         ]
+    progress.done()
     parent = dataset.latest_dataset(
         data_root, source, bar_size, config.build.instruments
     )
-    return dataset.write_dataset(
+    progress.start("writing dataset")
+    ref = dataset.write_dataset(
         config,
         bar_size,
         series,
@@ -161,3 +172,5 @@ def build_live(
             }
         },
     )
+    progress.done()
+    return ref
