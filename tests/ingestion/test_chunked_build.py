@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 
@@ -271,3 +273,48 @@ def test_tolerated_clock_decisions_warn_in_a_parallel_build(tmp_path):
 
     assert any("replayed block" in e[1] for e in warnings(pooled_tape))
     assert warnings(pooled_tape) == warnings(serial_tape)
+
+
+@pytest.mark.parametrize("jobs", [1, 3])
+def test_a_failed_build_writes_the_failure_report_and_no_dataset(tmp_path, jobs):
+    config = install_history(tmp_path, bad_rows=("202401",))
+
+    with pytest.raises(BuildFailure) as raised:
+        build_backfill(with_jobs(config, jobs), 5, chunk_weeks=1)
+
+    report_path = raised.value.report_path
+    assert report_path is not None
+    report = json.loads(report_path.read_text())
+    assert report["status"] == "failed"
+    assert report["locator"] == "EURUSD/202401 row 501"
+    assert not (config.paths.data_root / "datasets").exists()
+
+
+@pytest.mark.parametrize("jobs", [1, 3])
+def test_an_earlier_instruments_bar_failure_outranks_a_later_pre_pass_failure(
+    tmp_path, jobs
+):
+    config = install_history(tmp_path, bad_rows=("202402",))
+    both = replace(config.build, instruments=("EURUSD", "USDJPY"), jobs=jobs)
+
+    with pytest.raises(BuildFailure) as raised:
+        build_backfill(replace(config, build=both), 5, chunk_weeks=1)
+
+    assert raised.value.locator == "EURUSD/202402 row 501"
+
+
+def test_queued_work_is_cancelled_after_the_first_failure():
+    started: list[int] = []
+
+    def task(item: int) -> int:
+        started.append(item)
+        if item == 0:
+            raise BuildFailure("boom", "first")
+        time.sleep(0.3)  # running while the failure arrives
+        return item
+
+    with ThreadPoolExecutor(1) as pool, pytest.raises(BuildFailure) as raised:
+        backfill.run_tasks(pool, task, [0, 1, 2, 3, 4])  # ty: ignore[invalid-argument-type]
+
+    assert raised.value.locator == "first"
+    assert set(started) <= {0, 1}
