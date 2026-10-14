@@ -26,7 +26,13 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Executor,
+    Future,
+    ProcessPoolExecutor,
+    wait,
+)
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -141,12 +147,21 @@ def _drain(events: Any, on_event: Callable[[str, str, str | None], None]) -> Non
         on_event(*events.get())
 
 
+def _terminate(pool: ProcessPoolExecutor) -> None:
+    """Stop a pool's workers now. The executor has no public way to, so this
+    reaches for its worker table; it runs only on Ctrl-C or an unexpected error."""
+    for process in list((getattr(pool, "_processes", None) or {}).values()):
+        process.terminate()
+    pool.shutdown(wait=True, cancel_futures=True)
+
+
 @contextlib.contextmanager
 def worker_pool(jobs: int, events: Any = None) -> Generator[ProcessPoolExecutor | None]:
     """A process pool of ``jobs`` workers, or ``None`` for in-process (``jobs`` 1).
 
-    Any exit through an exception (Ctrl-C included) terminates the workers, so
-    none outlives the build. ``events`` is a queue the workers can send progress
+    A ``BuildFailure`` cancels the queued work and waits for the running chunks;
+    any other exception (Ctrl-C included) terminates the workers at once. None
+    outlives the build. ``events`` is a queue the workers can send progress
     events on (see ``_chunk_task``).
     """
     if jobs <= 1:
@@ -160,16 +175,18 @@ def worker_pool(jobs: int, events: Any = None) -> Generator[ProcessPoolExecutor 
     )
     try:
         yield pool
-    except BaseException:
-        for process in list(getattr(pool, "_processes", {}).values()):
-            process.terminate()
-        raise
-    finally:
+    except BuildFailure:
         pool.shutdown(wait=True, cancel_futures=True)
+        raise
+    except BaseException:
+        _terminate(pool)
+        raise
+    else:
+        pool.shutdown(wait=True)
 
 
 def run_tasks[T, R](
-    pool: ProcessPoolExecutor | None,
+    pool: Executor | None,
     task: Callable[[T], R],
     items: Sequence[T],
     on_done: Callable[[int, R], None] = lambda index, result: None,
@@ -362,6 +379,8 @@ CHUNK_WEEKS = 4
 # Known limit: a stale-quote run that began more than one week before a chunk
 # seam is not reproduced there (it needs a whole week of unchanged quotes). The
 # price-spike window (ticks) and the spread-spike lookback (hours) fit easily.
+# Likewise, if the week before a seam holds no ticks at all, the warm-up is empty
+# and a stale-quote run from before that week is not reproduced either.
 WARM_UP_WEEKS = 1
 
 
@@ -476,8 +495,13 @@ def build_chunk(
             opened = _week_open(quote.ts)
             if span.end is not None and opened >= span.end:
                 if quote.ts >= span.end:
-                    break  # ticks are chronological, apart from late ones
-                continue
+                    # Chronological by now: the pre-pass fails any step back of
+                    # a minute or more and replayed blocks are dropped in
+                    # ``parse_ticks``. A tick up to BACKWARD_TOLERANCE behind
+                    # this one is in the pre-open lead of the next week, so the
+                    # next chunk owns it (the ``continue`` below).
+                    break
+                continue  # pre-open lead tick of the next span's week
             if span.first is not None and opened < span.first:
                 if opened != warm_from:
                     continue
@@ -589,7 +613,7 @@ def _chunk_months(
 
 
 def _relay(
-    events: Any, progress: ProgressSink, on_month: Callable[[str, str | None], None]
+    events: Any, on_month: Callable[[str, str | None], None]
 ) -> Callable[[], None] | None:
     """Parent side of the worker queue: feed worker month events to ``on_month``
     (which advances each month once, whichever chunk reports it first)."""
@@ -643,7 +667,7 @@ def build_backfill(
     *,
     now: datetime | None = None,
     progress: ProgressSink = NULL_PROGRESS,
-    chunk_weeks: int = CHUNK_WEEKS,
+    chunk_weeks: int | None = None,
 ) -> BackfillResult:
     """Build one Dataset (all configured Instruments) at ``bar_size`` minutes.
 
@@ -651,7 +675,9 @@ def build_backfill(
     (no Dataset directory exists) and re-raises ``BuildFailure``. Without a
     configured end month the range runs to the last complete UTC month before
     ``now`` (default: the current time). ``chunk_weeks`` is a test-only override
-    of the bar-pass chunk size; the Dataset never depends on it. With
+    of the bar-pass chunk size (default: ``CHUNK_WEEKS`` with a pool, one
+    full-history chunk at ``jobs`` 1, which needs no warm-up and parses each
+    month once); the Dataset never depends on it. With
     ``config.build.jobs`` above 1 the clock pre-pass months and bar-pass chunks
     run in a process pool; the parent alone merges and writes, so the Dataset,
     report and warnings are the same at any job count.
@@ -696,7 +722,7 @@ def _build(
     bar_size: int,
     now: datetime,
     progress: ProgressSink,
-    chunk_weeks: int,
+    chunk_weeks: int | None,
     pool: ProcessPoolExecutor | None,
     events: Any = None,
 ) -> BackfillResult:
@@ -756,7 +782,10 @@ def _build(
         progress.start("building months", len(periods))
         on_month = _once_per_month(progress, instrument)
 
-        spans = week_chunks(session_weeks(lo, hi), chunk_weeks)
+        if chunk_weeks is None and pool is None:
+            spans = [WeekSpan()]  # one span: no seams, no warm-up replay
+        else:
+            spans = week_chunks(session_weeks(lo, hi), chunk_weeks or CHUNK_WEEKS)
         tasks = [
             ChunkTask(
                 cache,
@@ -777,46 +806,46 @@ def _build(
             _chunk_task,
             tasks,
             _chunk_months(tasks, on_month, acknowledged),
-            poll=_relay(events, progress, on_month),
+            poll=_relay(events, on_month),
         )
-        chunk = merge_chunks(chunks, bar_size)
+        merged_chunk = merge_chunks(chunks, bar_size)
         progress.done()
         timings["bar_pass"] += time.perf_counter() - instrument_began - pre_pass
-        bars = [bar for bar in chunk.bars if lo <= bar.open_time < hi]
-        for opened, first in chunk.first_ticks.items():
+        bars = [bar for bar in merged_chunk.bars if lo <= bar.open_time < hi]
+        for opened, first in merged_chunk.first_ticks.items():
             if (off := _alignment_warning(instrument, opened, first)) is not None:
                 warn(off[0])
                 alignments.setdefault(instrument, []).append(off[1])
-        merged = {bar.open_time: bar for bar in bars} | chunk.missing
+        merged = {bar.open_time: bar for bar in bars} | merged_chunk.missing
         series[instrument] = flag_suspected_outages(
             sorted(merged.values(), key=lambda bar: bar.open_time),
             bar_size,
             config.gap_rule.outage_threshold_minutes,
         )
-        tick_flags[instrument] = dict(chunk.tick_flag_counts)
+        tick_flags[instrument] = dict(merged_chunk.tick_flag_counts)
         summary = summarize_flags(
             series[instrument],
-            chunk.tick_flag_counts,
+            merged_chunk.tick_flag_counts,
             config.anomaly_rule.alert_fraction,
         )
         for w in summary.warnings:
             warn(BuildWarning(w.code, w.message, instrument))
-        if chunk.late_dropped:
+        if merged_chunk.late_dropped:
             warn(
                 BuildWarning(
                     "late_ticks_dropped",
-                    f"{chunk.late_dropped} {instrument} tick(s) arrived up to "
+                    f"{merged_chunk.late_dropped} {instrument} tick(s) arrived up to "
                     f"{BACKWARD_TOLERANCE.seconds} s behind a closed slot and "
                     "were dropped",
                     instrument,
                 )
             )
-        if chunk.dropped_out_of_session:
-            dropped[instrument] = chunk.dropped_out_of_session
+        if merged_chunk.dropped_out_of_session:
+            dropped[instrument] = merged_chunk.dropped_out_of_session
             warn(
                 BuildWarning(
                     "out_of_session_ticks",
-                    f"{chunk.dropped_out_of_session} {instrument} ticks fell "
+                    f"{merged_chunk.dropped_out_of_session} {instrument} ticks fell "
                     "outside any Session and were dropped",
                     instrument,
                 )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
-import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime, timedelta
@@ -304,17 +304,81 @@ def test_an_earlier_instruments_bar_failure_outranks_a_later_pre_pass_failure(
 
 
 def test_queued_work_is_cancelled_after_the_first_failure():
-    started: list[int] = []
+    started: list[int] = []  # two workers: task 1 runs beside the failing 0
+    gate = threading.Event()
+    second_running = threading.Event()
+    polls = 0
 
     def task(item: int) -> int:
         started.append(item)
         if item == 0:
+            second_running.wait(timeout=5)  # fail only once task 1 is running
             raise BuildFailure("boom", "first")
-        time.sleep(0.3)  # running while the failure arrives
+        second_running.set()
+        gate.wait(timeout=5)  # running while the failure arrives
         return item
 
-    with ThreadPoolExecutor(1) as pool, pytest.raises(BuildFailure) as raised:
-        backfill.run_tasks(pool, task, [0, 1, 2, 3, 4])  # ty: ignore[invalid-argument-type]
+    def poll() -> None:
+        nonlocal polls
+        polls += 1
+        if polls >= 2:  # after the failure was seen and the queue cancelled
+            gate.set()
+
+    with ThreadPoolExecutor(2) as pool, pytest.raises(BuildFailure) as raised:
+        backfill.run_tasks(pool, task, [0, 1, 2, 3, 4], poll=poll)
 
     assert raised.value.locator == "first"
-    assert set(started) <= {0, 1}
+    # the worker freed by the failure may pick up task 2 before the cancel lands
+    # (it then blocks on the gate); nothing later can start
+    assert 1 in started
+    assert not {3, 4} & set(started)
+
+
+def seam_lines() -> list[str]:
+    """Ticks around the weekly seams that a chunk boundary must not disturb: a
+    pre-open tick stamped just behind the first tick of the open, and a late
+    tick one slot behind in the new week."""
+    lines = []
+    for week in range(4):
+        sunday = FIRST_SUNDAY + timedelta(weeks=week)
+        opened = datetime(sunday.year, sunday.month, sunday.day, 17)
+        lines.append(_line(opened - timedelta(minutes=30), "1.10000", "1.10010"))
+        lines.append(_line(opened, "1.10001", "1.10011"))
+        lines.append(_line(opened - timedelta(seconds=20), "1.10002", "1.10012"))
+        lines.append(
+            _line(opened + timedelta(minutes=5, seconds=10), "1.10003", "1.10013")
+        )
+        lines.append(
+            _line(opened + timedelta(minutes=4, seconds=50), "1.10004", "1.10014")
+        )
+        lines.append(_line(opened + timedelta(days=4), "1.10005", "1.10015"))
+    return lines
+
+
+def test_late_ticks_at_a_chunk_seam_count_as_in_a_single_chunk(tmp_path):
+    config = make_config(tmp_path, "EURUSD", "2024-01", start="2024-01")
+    install_raw(config, "EURUSD", "202401", ("\n".join(seam_lines()) + "\n").encode())
+
+    single = build_backfill(config, 5, chunk_weeks=1000)
+    chunked = build_backfill(config, 5, chunk_weeks=1)
+
+    assert single.dropped_out_of_session["EURUSD"] > 0
+    assert any(w.code == "late_ticks_dropped" for w in single.warnings)
+    assert chunked.warnings == single.warnings
+    assert chunked.dropped_out_of_session == single.dropped_out_of_session
+    assert chunked.ref.dataset_id == single.ref.dataset_id
+
+
+def test_one_job_runs_one_full_history_chunk(history, monkeypatch):
+    spans = []
+    real = backfill.build_chunk
+
+    def spy(*args, **kwargs):
+        spans.append(args[8])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(backfill, "build_chunk", spy)
+
+    build_backfill(with_jobs(history, 1), 5)
+
+    assert spans == [backfill.WeekSpan()]
