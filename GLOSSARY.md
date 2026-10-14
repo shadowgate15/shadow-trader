@@ -62,3 +62,11 @@ _Avoid_: Data dump, table
 **Seed cohort**:
 A Candidate together with sibling runs that share its training configuration and Dataset but differ in seed. Evaluated together at the backtest Gate to show consistency across seeds. Siblings are evidence only and are never promoted.
 _Avoid_: Ensemble, seed sweep
+
+**Revision**:
+A numbered version of one emitted live Bar. A late or catch-up quote inside the repair window produces the next Revision of the same Bar; earlier Revisions are kept, never overwritten. The as-seen view is the Revision current at a given moment; the latest view is the highest Revision.
+_Avoid_: Correction, patch
+
+**Repair window**:
+The period after a live Bar closes during which late or catch-up quotes may still produce a new Revision. Once it passes, the Bar is sealed and later quotes are dropped and counted.
+_Avoid_: Grace period, lookback
