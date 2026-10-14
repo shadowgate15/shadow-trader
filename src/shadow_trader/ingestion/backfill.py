@@ -15,15 +15,16 @@ import contextlib
 import io
 import time
 import zipfile
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from . import dataset
 from .anomaly import FlaggingBarBuilder, summarize_flags
-from .bars import Bar, Quote
+from .bars import Bar, Quote, gap_bar
 from .clock import (
     BACKWARD_TOLERANCE,
     MonthEvidence,
@@ -52,7 +53,7 @@ from .report import (
     write_build_report,
     write_failed_report,
 )
-from .session import NY, open_of, week_sunday
+from .session import NY, next_open, open_of, slots_per_session, week_sunday
 from .sources import SOURCE, months_between
 
 
@@ -234,6 +235,65 @@ def parse_ticks(
         yield Quote(clock.to_utc(naive), quote_bid, quote_ask)
 
 
+# Whole Session weeks per bar-pass chunk. Internal: not a CLI or config setting
+# (``build_backfill`` takes a test-only override).
+CHUNK_WEEKS = 4
+# A chunk replays this many Session weeks before its own to prime the detectors.
+# Known limit: a stale-quote run that began more than one week before a chunk
+# seam is not reproduced there (it needs a whole week of unchanged quotes). The
+# price-spike window (ticks) and the spread-spike lookback (hours) fit easily.
+WARM_UP_WEEKS = 1
+
+
+@dataclass(frozen=True)
+class WeekSpan:
+    """Whole Session weeks of a chunk, by weekly open (UTC); ``None`` is unbounded.
+
+    ``first`` is the open of the first week, ``end`` the open of the week after
+    the last. A tick belongs to the span by its Session week (``_week_open``),
+    so the pre-open lead window and the weekend closure go with their week.
+    """
+
+    first: datetime | None = None
+    end: datetime | None = None
+
+
+def session_weeks(lo: datetime, hi: datetime) -> list[datetime]:
+    """Weekly opens (UTC) of every Session week that can hold ticks in [lo, hi)."""
+    opens = [_week_open(lo)]
+    # raw files run up to hours past ``hi`` in UTC, so look a day further
+    while (following := _week_open(opens[-1] + timedelta(days=8))) < hi + timedelta(
+        days=1
+    ):
+        opens.append(following)
+    return opens
+
+
+def week_chunks(opens: list[datetime], weeks: int) -> list[WeekSpan]:
+    """Spans of ``weeks`` whole Session weeks; the ends are unbounded."""
+    starts = range(0, len(opens), weeks)
+    return [
+        WeekSpan(
+            opens[start] if start else None,
+            opens[start + weeks] if start + weeks < len(opens) else None,
+        )
+        for start in starts
+    ]
+
+
+def span_periods(periods: list[str], span: WeekSpan) -> list[str]:
+    """The monthly raw files a span (and its warm-up week) can touch."""
+    pad = timedelta(days=1)
+    lo = span.first - timedelta(days=7 * WARM_UP_WEEKS) - pad if span.first else None
+    hi = span.end + pad if span.end else None
+    return [
+        period
+        for period in periods
+        if (lo is None or to_month(period) >= f"{lo.astimezone(NY):%Y-%m}")
+        and (hi is None or to_month(period) <= f"{hi.astimezone(NY):%Y-%m}")
+    ]
+
+
 @dataclass(frozen=True)
 class ChunkResult:
     """Plain, picklable output of one bar-pass chunk (no writes, no I/O handles)."""
@@ -244,7 +304,6 @@ class ChunkResult:
     dropped_out_of_session: int
     late_dropped: int
     first_ticks: dict[datetime, datetime]  # weekly open -> first tick
-    warnings: tuple[BuildWarning, ...]
 
 
 def build_chunk(
@@ -256,19 +315,29 @@ def build_chunk(
     clock: WeekClock,
     periods: Iterable[str],
     acknowledged: frozenset[str] = frozenset(),
+    span: WeekSpan | None = None,
     *,
     on_month: Callable[[str, str | None], None] | None = None,
 ) -> ChunkResult:
-    """Bar pass over ``periods`` (monthly raw files) for one Instrument.
+    """Bar pass over the Session weeks of ``span`` for one Instrument.
+
+    ``periods`` are the monthly raw files to read (see ``span_periods``). The
+    week before ``span.first`` is replayed first to prime the detectors and its
+    output is discarded. Ticks outside the span count nowhere, so chunks that
+    tile the history sum to the single-chunk result.
 
     Returns plain data only; per-Instrument post-processing (outage flagging,
-    flag summaries, alignment warnings) is the merge step's job.
+    flag summaries, alignment and thin-data warnings) is the merge step's job.
     """
+    span = span or WeekSpan()
+    warm_from = (
+        _week_open(span.first - timedelta(days=1)) if span.first is not None else None
+    )
     builder = FlaggingBarBuilder(instrument, bar_size, price_scale, anomaly_rule)
     bars: list[Bar] = []
     first_ticks: dict[datetime, datetime] = {}
     missing: dict[datetime, Bar] = {}
-    warnings: list[BuildWarning] = []
+    warming = warm_from is not None
     newest: datetime | None = None
     late_dropped = 0
     for period in periods:
@@ -280,23 +349,30 @@ def build_chunk(
                 on_month(period, "acknowledged missing")
             continue
         text = read_raw_month(cache, instrument, period)
-        if month < DEFAULT_START:
-            warnings.append(
-                BuildWarning(
-                    "thin_data",
-                    f"{instrument} {period} is before the history floor "
-                    f"{DEFAULT_START}; ticks are sparse",
-                    f"{instrument}/{period}",
-                )
-            )
         label = f"{instrument}/{period}"
         for row, quote in enumerate(
             parse_ticks(text, label, price_scale, clock), start=1
         ):
-            first_ticks.setdefault(_week_open(quote.ts), quote.ts)
+            opened = _week_open(quote.ts)
+            if span.end is not None and opened >= span.end:
+                if quote.ts >= span.end:
+                    break  # ticks are chronological, apart from late ones
+                continue
+            if span.first is not None and opened < span.first:
+                if opened != warm_from:
+                    continue
+            elif warming:
+                builder.end_warm_up()
+                warming = False
+            if not warming:
+                first_ticks.setdefault(opened, quote.ts)
             try:
-                bars.extend(builder.push(quote))
+                pushed = builder.push(quote)
+                if not warming:
+                    bars.extend(pushed)
             except ValueError as exc:
+                if warming:
+                    continue
                 # a stale tick a second or so behind a closed slot (HistData's
                 # 2026 files); the pre-pass already failed any bigger step back
                 if newest is None or newest - quote.ts >= BACKWARD_TOLERANCE:
@@ -309,6 +385,8 @@ def build_chunk(
             newest = quote.ts if newest is None else max(newest, quote.ts)
         if on_month:
             on_month(period, None)
+    if warming:
+        builder.end_warm_up()
     bars.extend(builder.flush())
     return ChunkResult(
         tuple(bars),
@@ -317,8 +395,60 @@ def build_chunk(
         builder.dropped_out_of_session,
         late_dropped,
         first_ticks,
-        tuple(warnings),
     )
+
+
+def _once_per_month(
+    progress: ProgressSink, instrument: str
+) -> Callable[[str, str | None], None]:
+    """Month callback for chunks, which share months: advance once per month."""
+    advanced: set[str] = set()
+
+    def on_month(period: str, note: str | None = None) -> None:
+        if period not in advanced:
+            advanced.add(period)
+            progress.advance(f"{instrument} {period}", note)
+
+    return on_month
+
+
+def _empty_sessions(last: Bar, following: Bar, bar_size: int) -> list[Bar]:
+    """Gap Bars of the Sessions between two Bars that no chunk saw a tick for.
+
+    A serial pass closes every Session that passed between two ticks as Gaps; a
+    chunk whose weeks hold no ticks has no builder to do it.
+    """
+    gaps: list[Bar] = []
+    opened = next_open(last.session_id)
+    while opened < following.session_id:
+        step = timedelta(minutes=bar_size)
+        gaps.extend(
+            gap_bar(last.instrument, opened + slot * step, opened)
+            for slot in range(slots_per_session(bar_size))
+        )
+        opened = next_open(opened)
+    return gaps
+
+
+def merge_chunks(chunks: list[ChunkResult], bar_size: int) -> ChunkResult:
+    """Combine chunks of consecutive week spans into the single-chunk result."""
+    tick_flags: Counter[str] = Counter()
+    merged = ChunkResult((), {}, {}, 0, 0, {})
+    bars: list[Bar] = []
+    for chunk in chunks:
+        if bars and chunk.bars:
+            bars.extend(_empty_sessions(bars[-1], chunk.bars[0], bar_size))
+        bars.extend(chunk.bars)
+        merged.missing.update(chunk.missing)
+        merged.first_ticks.update(chunk.first_ticks)
+        tick_flags.update(chunk.tick_flag_counts)
+        merged = replace(
+            merged,
+            dropped_out_of_session=merged.dropped_out_of_session
+            + chunk.dropped_out_of_session,
+            late_dropped=merged.late_dropped + chunk.late_dropped,
+        )
+    return replace(merged, bars=tuple(bars), tick_flag_counts=dict(tick_flags))
 
 
 def build_backfill(
@@ -327,17 +457,19 @@ def build_backfill(
     *,
     now: datetime | None = None,
     progress: ProgressSink = NULL_PROGRESS,
+    chunk_weeks: int = CHUNK_WEEKS,
 ) -> BackfillResult:
     """Build one Dataset (all configured Instruments) at ``bar_size`` minutes.
 
     A failed build writes a failure report under ``<data_root>/reports/failed``
     (no Dataset directory exists) and re-raises ``BuildFailure``. Without a
     configured end month the range runs to the last complete UTC month before
-    ``now`` (default: the current time).
+    ``now`` (default: the current time). ``chunk_weeks`` is a test-only override
+    of the bar-pass chunk size; the Dataset never depends on it.
     """
     validate_bar_sizes((bar_size,))
     try:
-        return _build(config, bar_size, now or datetime.now(UTC), progress)
+        return _build(config, bar_size, now or datetime.now(UTC), progress, chunk_weeks)
     except BuildFailure as failure:
         # an unwritable report must not mask the failure itself
         with contextlib.suppress(OSError):
@@ -357,7 +489,11 @@ def build_dataset(config: Config, bar_size: int) -> DatasetRef:
 
 
 def _build(
-    config: Config, bar_size: int, now: datetime, progress: ProgressSink
+    config: Config,
+    bar_size: int,
+    now: datetime,
+    progress: ProgressSink,
+    chunk_weeks: int,
 ) -> BackfillResult:
     cache = RawCache(config.paths.data_root)
     build = config.build
@@ -399,23 +535,37 @@ def _build(
         pre_pass = time.perf_counter() - pre_pass_began
         timings["clock_pre_pass"] += pre_pass
         periods = months_between(build.start, end)
+        for period in periods:
+            if (month := to_month(period)) < DEFAULT_START and (
+                month not in acknowledged
+            ):
+                warn(
+                    BuildWarning(
+                        "thin_data",
+                        f"{instrument} {period} is before the history floor "
+                        f"{DEFAULT_START}; ticks are sparse",
+                        f"{instrument}/{period}",
+                    )
+                )
         progress.start("building months", len(periods))
-        # one chunk covering the whole history (see ``build_chunk``)
-        chunk = build_chunk(
-            cache,
-            instrument,
-            bar_size,
-            scale,
-            config.anomaly_rule,
-            clock,
-            periods,
-            acknowledged,
-            on_month=lambda period, note=None, i=instrument: progress.advance(
-                f"{i} {period}", note
-            ),
-        )
-        for warning in chunk.warnings:
-            warn(warning)
+        on_month = _once_per_month(progress, instrument)
+
+        chunks = [
+            build_chunk(
+                cache,
+                instrument,
+                bar_size,
+                scale,
+                config.anomaly_rule,
+                clock,
+                span_periods(periods, span),
+                acknowledged,
+                span,
+                on_month=on_month,
+            )
+            for span in week_chunks(session_weeks(lo, hi), chunk_weeks)
+        ]
+        chunk = merge_chunks(chunks, bar_size)
         progress.done()
         timings["bar_pass"] += time.perf_counter() - instrument_began - pre_pass
         bars = [bar for bar in chunk.bars if lo <= bar.open_time < hi]
