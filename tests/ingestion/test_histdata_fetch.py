@@ -1,8 +1,11 @@
 import hashlib
 import io
 import json
+import threading
+import time
 import zipfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 
 from shadow_trader.ingestion.dataset import RawCache
 from shadow_trader.ingestion.sources import Response, fetch_months
@@ -32,10 +35,12 @@ class StubTransport:
         self.posts = {k: list(v) for k, v in posts.items()}
         self.pages = list(pages or [Response(200, PAGE.encode(), {})])
         self.calls: list[tuple] = []
+        self._lock = threading.Lock()
 
     def get(self, url, headers):
-        self.calls.append(("GET", url, dict(headers)))
-        page = self.pages.pop(0) if len(self.pages) > 1 else self.pages[0]
+        with self._lock:
+            self.calls.append(("GET", url, dict(headers)))
+            page = self.pages.pop(0) if len(self.pages) > 1 else self.pages[0]
         if isinstance(page, Exception):
             raise page
         return page
@@ -44,9 +49,10 @@ class StubTransport:
         return [c for c in self.calls if c[0] == "GET"]
 
     def post(self, url, form, headers):
-        self.calls.append(("POST", url, dict(form), dict(headers)))
-        queue = self.posts[form["datemonth"]]
-        return queue.pop(0) if len(queue) > 1 else queue[0]
+        with self._lock:
+            self.calls.append(("POST", url, dict(form), dict(headers)))
+            queue = self.posts[form["datemonth"]]
+            return queue.pop(0) if len(queue) > 1 else queue[0]
 
     def posts_for(self, month):
         return [c for c in self.calls if c[0] == "POST" and c[2]["datemonth"] == month]
@@ -60,6 +66,8 @@ def run(
     start="2024-03",
     end="2024-03",
     now=NOW,
+    workers=8,
+    progress=None,
 ):
     sleeps: list[float] = []
     report = fetch_months(
@@ -70,6 +78,8 @@ def run(
         end,
         sleep=sleeps.append,
         now=lambda: now,
+        workers=workers,
+        **({"progress": progress} if progress else {}),
     )
     return report, sleeps
 
@@ -181,14 +191,13 @@ def test_rerun_skips_cached_months_without_any_network_or_rewrite(tmp_path):
     assert (cached.stat().st_mtime_ns, cached.read_bytes()) == before
 
 
-def test_requests_are_paced_politely(tmp_path):
+def test_no_fixed_pacing_sleep_between_requests(tmp_path):
     transport = StubTransport({"202403": [ok()], "202404": [ok(month="202404")]})
 
     report, sleeps = run(tmp_path, transport, end="2024-04")
 
     assert report.fetched == [("EURUSD", "202403"), ("EURUSD", "202404")]
-    assert sleeps  # waits happen between requests
-    assert all(0.2 <= s <= 0.5 for s in sleeps)
+    assert sleeps == []
 
 
 def test_range_spans_instruments_and_defaults_end_to_last_complete_month(tmp_path):
@@ -311,3 +320,676 @@ def test_default_end_is_the_last_settled_month(tmp_path):
 
     assert [m for _, m in report.fetched] == ["202608"]
     assert report.unsettled == []
+
+
+class GateTransport:
+    """Blocks every month-page request until ``size`` are in flight at once."""
+
+    def __init__(self, size):
+        self.barrier = threading.Barrier(size, timeout=10)
+        self.lock = threading.Lock()
+        self.inflight = 0
+        self.peak = 0
+
+    def get(self, url, headers):
+        with self.lock:
+            self.inflight += 1
+            self.peak = max(self.peak, self.inflight)
+        try:
+            self.barrier.wait()
+        finally:
+            with self.lock:
+                self.inflight -= 1
+        return Response(200, PAGE.encode(), {})
+
+    def post(self, url, form, headers):
+        month = form["datemonth"]
+        return ok(month=month)
+
+
+def test_up_to_n_requests_are_in_flight_and_never_more(tmp_path):
+    transport = GateTransport(3)
+
+    report, _ = run(tmp_path, transport, start="2024-01", end="2024-06", workers=3)
+
+    assert len(report.fetched) == 6
+    assert transport.peak == 3  # the barrier only opens with 3 in flight
+
+
+class Recorder:
+    def __init__(self, on_advance=None):
+        self.threads: set[int] = set()
+        self.events: list[tuple] = []
+        self.on_advance = on_advance
+
+    def _note(self, *event):
+        self.threads.add(threading.get_ident())
+        self.events.append(event)
+
+    def start(self, phase, total=None):
+        self._note("start", phase, total)
+
+    def advance(self, detail="", outcome=None):
+        self._note("advance", detail, outcome)
+        if self.on_advance:
+            self.on_advance(detail)
+
+    def warn(self, message):
+        self._note("warn", message)
+
+    def status(self, text):
+        self._note("status", text)
+
+    def done(self):
+        self._note("done")
+
+
+class LaggingTransport(StubTransport):
+    """The 202403 download only finishes once 202404 has been reported."""
+
+    def __init__(self, posts):
+        super().__init__(posts)
+        self.april_reported = threading.Event()
+
+    def post(self, url, form, headers):
+        if form["datemonth"] == "202403":
+            assert self.april_reported.wait(10)
+        return super().post(url, form, headers)
+
+
+def test_report_keeps_input_order_and_progress_stays_on_the_calling_thread(tmp_path):
+    transport = LaggingTransport({"202403": [ok()], "202404": [ok(month="202404")]})
+    sink = Recorder(
+        on_advance=lambda d: transport.april_reported.set() if "202404" in d else None
+    )
+
+    report, _ = run(tmp_path, transport, end="2024-04", workers=2, progress=sink)
+
+    advanced = [e[1] for e in sink.events if e[0] == "advance"]
+    assert advanced == ["EURUSD 202404", "EURUSD 202403"]  # completion order
+    assert report.fetched == [("EURUSD", "202403"), ("EURUSD", "202404")]
+    assert sink.threads == {threading.get_ident()}
+    assert sink.events[0] == ("start", "fetching months", 2)
+    assert sink.events[-1] == ("done",)
+
+
+def test_rejected_month_warns_from_the_calling_thread(tmp_path):
+    sink = Recorder()
+    transport = StubTransport({"202403": [Response(200, b"junk", {})]})
+
+    run(tmp_path, transport, progress=sink)
+
+    assert [e for e in sink.events if e[0] == "warn"]
+    assert sink.threads == {threading.get_ident()}
+
+
+def test_workers_must_be_positive(tmp_path):
+    import pytest
+
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="workers"):
+            run(tmp_path, StubTransport({"202403": [ok()]}), workers=bad)
+
+
+class FakeClock:
+    """Injected ``now``/``sleep``: sleeping advances time; nothing really waits."""
+
+    def __init__(self, start=NOW):
+        self.t = start
+        self.slept: list[float] = []
+        self._lock = threading.Lock()
+
+    def now(self):
+        with self._lock:
+            return self.t
+
+    def sleep(self, seconds):
+        with self._lock:
+            self.slept.append(seconds)
+            self.t += timedelta(seconds=seconds)
+
+
+class TimedTransport(StubTransport):
+    """Records the fake-clock time of every request."""
+
+    def __init__(self, clock, posts, pages=None):
+        super().__init__(posts, pages)
+        self.clock = clock
+        self.times: list[tuple[str, datetime]] = []
+
+    def get(self, url, headers):
+        self.times.append(("GET", self.clock.now()))
+        return super().get(url, headers)
+
+    def post(self, url, form, headers):
+        self.times.append(("POST", self.clock.now()))
+        return super().post(url, form, headers)
+
+
+def run_clocked(tmp_path, transport, clock, *, workers=8, **kwargs):
+    return fetch_months(
+        RawCache(tmp_path),
+        transport,
+        kwargs.pop("instruments", ("EURUSD",)),
+        kwargs.pop("start", "2024-03"),
+        kwargs.pop("end", "2024-03"),
+        sleep=clock.sleep,
+        now=clock.now,
+        workers=workers,
+    )
+
+
+def throttled(retry_after=None):
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    return Response(429, b"", headers)
+
+
+def test_retry_after_seconds_pauses_every_worker(tmp_path):
+    clock = FakeClock()
+    transport = TimedTransport(
+        clock, {"202403": [throttled("30"), ok()], "202404": [ok(month="202404")]}
+    )
+
+    report = run_clocked(tmp_path, transport, clock, start="2024-03", end="2024-04")
+
+    assert report.ok and len(report.fetched) == 2
+    # Every request after the first 429 reply happens >= 30 s later.
+    throttled_at = min(t for kind, t in transport.times if kind == "POST")
+    later = [t for _, t in transport.times if t > throttled_at]
+    assert later and all(t >= throttled_at + timedelta(seconds=30) for t in later)
+
+
+def test_retry_after_http_date_is_honoured(tmp_path):
+    clock = FakeClock()
+    date = format_datetime(NOW + timedelta(seconds=45), usegmt=True)
+    transport = TimedTransport(clock, {"202403": [throttled(date), ok()]})
+
+    run_clocked(tmp_path, transport, clock)
+
+    assert 45 <= sum(clock.slept) < 60
+
+
+def test_missing_retry_after_backs_off_exponentially(tmp_path):
+    clock = FakeClock()
+    # Month pages are throttled, so no good reply restarts the backoff between.
+    pages = [throttled()] * 3 + [Response(200, PAGE.encode(), {})]
+    transport = TimedTransport(clock, {"202403": [ok()]}, pages=pages)
+
+    report = run_clocked(tmp_path, transport, clock)
+
+    assert report.fetched == [("EURUSD", "202403")]
+    assert clock.slept == [1.0, 2.0, 4.0]
+
+
+def test_cooldown_is_capped_at_five_minutes(tmp_path):
+    clock = FakeClock()
+    transport = TimedTransport(clock, {"202403": [throttled("86400"), ok()]})
+
+    report = run_clocked(tmp_path, transport, clock)
+
+    assert report.fetched == [("EURUSD", "202403")]
+    assert sum(clock.slept) == 300
+
+
+def test_throttles_do_not_use_up_attempts(tmp_path):
+    clock = FakeClock()
+    transport = TimedTransport(clock, {"202403": [*[throttled("1")] * 5, ok()]})
+
+    report = run_clocked(tmp_path, transport, clock)
+
+    assert report.fetched == [("EURUSD", "202403")]
+
+
+def test_other_failures_still_use_up_attempts(tmp_path):
+    clock = FakeClock()
+    boom = Response(500, b"", {})
+    transport = TimedTransport(clock, {"202403": [boom, boom, boom, ok()]})
+
+    report = run_clocked(tmp_path, transport, clock)
+
+    assert report.rejected == [(("EURUSD", "202403"), "HTTP 500")]
+
+
+def test_429_on_the_month_page_is_a_throttle_too(tmp_path):
+    clock = FakeClock()
+    pages = [throttled("5")] * 5 + [Response(200, PAGE.encode(), {})]
+    transport = TimedTransport(clock, {"202403": [ok()]}, pages=pages)
+
+    report = run_clocked(tmp_path, transport, clock)
+
+    assert report.fetched == [("EURUSD", "202403")]
+
+
+def test_endlessly_throttled_month_is_rejected_as_throttled(tmp_path):
+    clock = FakeClock()
+    transport = TimedTransport(clock, {"202403": [throttled("1")]})
+
+    report = run_clocked(tmp_path, transport, clock)
+
+    ((key, reason),) = report.rejected
+    assert key == ("EURUSD", "202403")
+    assert "throttled" in reason
+    assert 9 <= len(transport.posts_for("202403")) <= 11
+
+
+class InterruptingSink:
+    """Releases the in-flight month, then raises Ctrl-C when March is reported."""
+
+    def __init__(self, release):
+        self.release = release
+
+    def start(self, phase, total=None):
+        pass
+
+    def advance(self, detail="", outcome=None):
+        if "202403" in detail:
+            self.release.set()
+            raise KeyboardInterrupt
+
+    def warn(self, message):
+        pass
+
+    def status(self, text):
+        pass
+
+    def done(self):
+        pass
+
+
+class GatedTransport(StubTransport):
+    """April's download blocks until released, so it is in flight at the interrupt."""
+
+    def __init__(self, posts, gate):
+        super().__init__(posts)
+        self.gate = gate
+
+    def post(self, url, form, headers):
+        if form["datemonth"] == "202404":
+            assert self.gate.wait(timeout=10)
+        return super().post(url, form, headers)
+
+
+def test_interrupt_stops_dispatch_finishes_in_flight_and_rerun_fetches_the_rest(
+    tmp_path,
+):
+    gate = threading.Event()
+    posts = {m: [ok(month=m)] for m in ("202403", "202404", "202405", "202406")}
+    transport = GatedTransport(posts, gate)
+
+    report, _ = run(
+        tmp_path,
+        transport,
+        end="2024-06",
+        workers=2,
+        progress=InterruptingSink(gate),
+    )
+
+    assert report.interrupted
+    assert report.fetched == [("EURUSD", "202403"), ("EURUSD", "202404")]
+    assert transport.posts_for("202405") == []
+    assert transport.posts_for("202406") == []
+    assert (tmp_path / "raw" / "histdata" / "EURUSD" / "202404.zip").exists()
+
+    again = StubTransport(posts)
+    rerun, _ = run(tmp_path, again, end="2024-06", workers=2)
+
+    assert not rerun.interrupted
+    assert rerun.skipped == [("EURUSD", "202403"), ("EURUSD", "202404")]
+    assert rerun.fetched == [("EURUSD", "202405"), ("EURUSD", "202406")]
+
+
+def test_an_uninterrupted_run_is_not_marked_interrupted(tmp_path):
+    report, _ = run(tmp_path, StubTransport({"202403": [ok()]}))
+
+    assert not report.interrupted
+
+
+class AdaptiveClock(FakeClock):
+    """FakeClock that flags the first cooldown wait: the throttle is fully handled."""
+
+    def __init__(self):
+        super().__init__()
+        self.cooling = threading.Event()
+
+    def sleep(self, seconds):
+        super().sleep(seconds)
+        self.cooling.set()
+
+
+class ScriptedTransport:
+    """Requests are numbered in start order.
+
+    The first ``workers`` requests are the initial group: request 1 is throttled
+    and the rest stay in flight until the cooldown begins, then succeed. Later
+    requests (numbered from 1 as ``m``) are "new": ``throttle_at`` makes some
+    throttled, ``barriers`` makes some wait for company, and ``at_start`` records
+    how many new requests were in flight (itself included) when each started.
+    """
+
+    def __init__(self, clock, workers, throttle_at=(), barriers=None, fail_at=()):
+        self.clock = clock
+        self.workers = workers
+        self.throttle_at = set(throttle_at)
+        self.fail_at = set(fail_at)
+        self.broken: set[int] = set()  # barrier requests that found no company
+        self.barriers = barriers or {}
+        self.lock = threading.Lock()
+        self.count = 0
+        self.new_inflight = 0
+        self.at_start: dict[int, int] = {}
+
+    def get(self, url, headers):
+        match self._request():
+            case "throttle":
+                return throttled("1")
+            case "fail":
+                return Response(500, b"", {})
+        return Response(200, PAGE.encode(), {})
+
+    def post(self, url, form, headers):
+        match self._request():
+            case "throttle":
+                return throttled("1")
+            case "fail":
+                return Response(500, b"", {})
+        return ok(month=form["datemonth"])
+
+    def _request(self) -> str:
+        """Block as scripted; the reply wanted: "throttle", "fail" or "ok"."""
+        with self.lock:
+            self.count += 1
+            n = self.count
+            m = n - self.workers
+            if m > 0:
+                self.new_inflight += 1
+                self.at_start[m] = self.new_inflight
+        try:
+            if n == 1:
+                return "throttle"
+            if m <= 0:
+                assert self.clock.cooling.wait(timeout=10)
+                return "ok"
+            if m in self.barriers:
+                try:
+                    self.barriers[m].wait()
+                except threading.BrokenBarrierError:
+                    self.broken.add(m)
+            if m in self.throttle_at:
+                return "throttle"
+            return "fail" if m in self.fail_at else "ok"
+        finally:
+            if m > 0:
+                with self.lock:
+                    self.new_inflight -= 1
+
+    def peak(self, lo, hi):
+        return max(v for m, v in self.at_start.items() if lo <= m <= hi)
+
+
+def run_adaptive(tmp_path, transport, clock, workers):
+    return run_clocked(
+        tmp_path, transport, clock, workers=workers, start="2023-01", end="2024-04"
+    )
+
+
+def test_a_throttle_halves_the_requests_in_flight_with_a_floor_of_one(tmp_path):
+    clock = AdaptiveClock()
+    transport = ScriptedTransport(clock, workers=4)
+
+    report = run_adaptive(tmp_path, transport, clock, workers=4)
+
+    assert report.ok
+    # 4 -> 2. Three initial successes plus seven more are needed to regrow.
+    assert transport.peak(1, 7) <= 2
+
+
+def test_a_throttle_at_one_active_worker_keeps_one(tmp_path):
+    clock = AdaptiveClock()
+    transport = ScriptedTransport(clock, workers=2, throttle_at={3})
+
+    report = run_adaptive(tmp_path, transport, clock, workers=2)
+
+    assert report.ok
+    assert transport.peak(1, 9) == 1  # 2 -> 1, then another 429 leaves 1
+
+
+def test_active_workers_grow_by_one_per_ten_consecutive_successes(tmp_path):
+    clock = AdaptiveClock()
+    # 3 workers, throttled to 1. The 2 initial successes count towards the run,
+    # so the 8th new success is the 10th (limit 2) and the 18th is the 20th (3).
+    pair, trio = threading.Barrier(2, timeout=10), threading.Barrier(3, timeout=10)
+    barriers = {9: pair, 10: pair, 19: trio, 20: trio, 21: trio}
+    transport = ScriptedTransport(clock, workers=3, barriers=barriers)
+
+    report = run_adaptive(tmp_path, transport, clock, workers=3)
+
+    assert report.ok
+    assert transport.peak(1, 8) == 1
+    assert transport.peak(9, 10) == 2  # barrier: two ran together
+    assert transport.peak(11, 18) <= 2
+    assert transport.peak(19, 21) == 3  # barrier: three ran together
+    assert transport.peak(1, 60) == 3  # never above the configured maximum
+
+
+def test_a_throttle_resets_the_success_run(tmp_path):
+    clock = AdaptiveClock()
+    # 2 workers, throttled to 1. Request m=7 is throttled again, after which 10
+    # more successes (m=8..17) are needed. Without a reset the limit would grow
+    # earlier, once 10 successes in all had been seen.
+    pair = threading.Barrier(2, timeout=10)
+    transport = ScriptedTransport(
+        clock, workers=2, throttle_at={7}, barriers={18: pair, 19: pair}
+    )
+
+    report = run_adaptive(tmp_path, transport, clock, workers=2)
+
+    assert report.ok
+    assert transport.peak(8, 17) == 1
+    assert transport.peak(18, 19) == 2
+
+
+def test_a_failed_request_resets_the_success_run(tmp_path):
+    clock = AdaptiveClock()
+    # 2 workers, throttled to 1; the initial success starts the run at 1 and
+    # m=1..6 make 7. m=7 fails (HTTP 500), so only 10 more good replies (m=8..17)
+    # regrow the limit. If the failure did not reset the run, the 10th good reply
+    # would come at m=10 and m=11 and m=12 would overlap.
+    early = threading.Barrier(2, timeout=0.2)
+    late = threading.Barrier(2, timeout=10)
+    transport = ScriptedTransport(
+        clock,
+        workers=2,
+        fail_at={7},
+        barriers={11: early, 12: early, 18: late, 19: late},
+    )
+
+    report = run_adaptive(tmp_path, transport, clock, workers=2)
+
+    assert report.ok
+    assert 11 in transport.broken  # m=11 ran alone: the limit was still 1
+    assert not {18, 19} & transport.broken  # and by m=18 it had regrown to 2
+
+
+class BurstTransport:
+    """Every month's first page request waits until all are in flight, then 429s."""
+
+    def __init__(self, size):
+        self.barrier = threading.Barrier(size, timeout=10)
+        self.lock = threading.Lock()
+        self.seen: set[str] = set()
+
+    def get(self, url, headers):
+        with self.lock:
+            first = url not in self.seen
+            self.seen.add(url)
+        if first:
+            self.barrier.wait()
+            return throttled()
+        return Response(200, PAGE.encode(), {})
+
+    def post(self, url, form, headers):
+        return ok(month=form["datemonth"])
+
+
+def test_a_burst_of_simultaneous_throttles_counts_as_one(tmp_path):
+    clock = FakeClock()
+    transport = BurstTransport(4)
+
+    report = run_clocked(
+        tmp_path, transport, clock, workers=4, start="2024-01", end="2024-04"
+    )
+
+    assert report.ok and len(report.fetched) == 4
+    assert max(clock.slept) == 1.0  # one cooldown step, not four
+
+
+def test_the_backoff_survives_thousands_of_throttles(tmp_path):
+    clock = FakeClock()
+    transport = TimedTransport(clock, {}, pages=[throttled()])
+
+    report = run_clocked(
+        tmp_path, transport, clock, workers=1, start="2010-01", end="2019-06"
+    )
+
+    assert len(report.rejected) == 114  # 1140 throttles, no OverflowError
+    assert max(clock.slept) == 300
+
+
+def test_any_good_reply_resets_the_backoff_not_only_a_stored_month(tmp_path):
+    clock = FakeClock()
+    transport = TimedTransport(clock, {"202403": [throttled()] * 3 + [ok()]})
+
+    report = run_clocked(tmp_path, transport, clock)
+
+    assert report.fetched == [("EURUSD", "202403")]
+    assert clock.slept == [1.0, 1.0, 1.0]  # each good month page restarts at 1 s
+
+
+class FailingDownload(GatedTransport):
+    """April's download fails with a bug (not a network error) once released."""
+
+    def post(self, url, form, headers):
+        if form["datemonth"] == "202404":
+            assert self.gate.wait(timeout=10)
+            raise RuntimeError("boom")
+        return super().post(url, form, headers)
+
+
+class EventSink(InterruptingSink):
+    """Ctrl-C when March is reported; keeps every call it receives."""
+
+    def __init__(self, release, *, repeat=False, fail=None):
+        super().__init__(release)
+        self.repeat = repeat  # also Ctrl-C when any later month is reported
+        self.fail = fail
+        self.advanced: list[tuple] = []
+        self.finished = False
+
+    def advance(self, detail="", outcome=None):
+        self.advanced.append((detail, outcome))
+        if self.fail:
+            raise self.fail
+        if self.repeat and "202403" not in detail:
+            raise KeyboardInterrupt
+        super().advance(detail, outcome)
+
+    def done(self):
+        self.finished = True
+
+
+POSTS = {m: [ok(month=m)] for m in ("202403", "202404", "202405", "202406")}
+
+
+def test_interrupt_keeps_the_partial_report_when_an_in_flight_month_blows_up(tmp_path):
+    gate = threading.Event()
+    sink = EventSink(gate)
+
+    report, _ = run(
+        tmp_path,
+        FailingDownload(POSTS, gate),
+        end="2024-06",
+        workers=2,
+        progress=sink,
+    )
+
+    assert report.interrupted
+    assert report.fetched == [("EURUSD", "202403")]
+    assert sink.finished
+
+
+def test_a_second_ctrl_c_while_draining_still_returns_the_partial_report(tmp_path):
+    gate = threading.Event()
+    sink = EventSink(gate, repeat=True)
+
+    report, _ = run(
+        tmp_path,
+        GatedTransport(POSTS, gate),
+        end="2024-06",
+        workers=2,
+        progress=sink,
+    )
+
+    assert report.interrupted
+    assert report.fetched == [("EURUSD", "202403"), ("EURUSD", "202404")]
+    assert sink.finished
+
+
+def test_drained_months_are_reported_to_progress(tmp_path):
+    gate = threading.Event()
+    sink = EventSink(gate)
+
+    run(tmp_path, GatedTransport(POSTS, gate), end="2024-06", workers=2, progress=sink)
+
+    assert sink.advanced == [
+        ("EURUSD 202403", "fetched"),
+        ("EURUSD 202404", "fetched"),
+    ]
+
+
+def test_progress_is_finished_even_when_a_sink_call_raises(tmp_path):
+    import pytest
+
+    sink = EventSink(threading.Event(), fail=ValueError("sink bug"))
+
+    with pytest.raises(ValueError, match="sink bug"):
+        run(tmp_path, StubTransport({"202403": [ok()]}), progress=sink)
+
+    assert sink.finished
+
+
+class CooldownTransport(StubTransport):
+    """April finishes first; then March is throttled for 5 minutes."""
+
+    def __init__(self, posts):
+        super().__init__(posts)
+        self.april_done = threading.Event()
+
+    def post(self, url, form, headers):
+        if form["datemonth"] == "202404":
+            try:
+                return super().post(url, form, headers)
+            finally:
+                self.april_done.set()
+        assert self.april_done.wait(timeout=10)
+        return throttled("300")
+
+
+def test_interrupt_does_not_wait_out_a_cooldown(tmp_path):
+    transport = CooldownTransport({"202403": [ok()], "202404": [ok(month="202404")]})
+    sink = EventSink(threading.Event(), fail=KeyboardInterrupt())
+    started = time.monotonic()
+
+    report = fetch_months(
+        RawCache(tmp_path),
+        transport,
+        ("EURUSD",),
+        "2024-03",
+        "2024-04",
+        workers=2,
+        progress=sink,
+        now=lambda: NOW,
+    )  # real time.sleep: a 300 s cooldown would block here
+
+    assert time.monotonic() - started < 30
+    assert report.interrupted
+    assert report.fetched == [("EURUSD", "202404")]

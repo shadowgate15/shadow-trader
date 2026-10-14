@@ -24,7 +24,7 @@ from rich.console import Console
 from .backfill import BuildFailure, build_backfill
 from .bars import Bar
 from .cli_progress import NORMAL, QUIET, VERBOSE, RichProgress
-from .config import Config, ConfigError, load_config
+from .config import DEFAULT_WORKERS, Config, ConfigError, load_config
 from .dataset import DatasetError, RawCache
 from .live import LiveIngester
 from .livedataset import build_live
@@ -78,6 +78,13 @@ def add_ingest_parser(subparsers: argparse._SubParsersAction) -> None:  # type: 
         command.add_argument(
             "--bar-sizes", type=_int_csv, help="Override bar sizes in minutes."
         )
+        if name == "fetch":
+            command.add_argument(
+                "--workers",
+                type=int,
+                help="Concurrent fetch workers (positive; default from config, "
+                f"{DEFAULT_WORKERS}).",
+            )
         if name == "build-live":
             command.add_argument("--from", dest="range_from", help="Range start.")
             command.add_argument("--to", dest="range_to", help="Range end.")
@@ -148,6 +155,7 @@ def _run_fetch(config: Config, args: argparse.Namespace, progress: RichProgress)
         config.build.end,
         sleep=_sleep,
         progress=progress,
+        workers=config.build.workers,
     )
     progress.close()
     print(
@@ -161,6 +169,9 @@ def _run_fetch(config: Config, args: argparse.Namespace, progress: RichProgress)
         print(f"warning: {instrument} {period} absent at source")
     for (instrument, period), reason in report.rejected:
         print(f"error: {instrument} {period} rejected: {reason}", file=sys.stderr)
+    if report.interrupted:
+        print("interrupted: partial fetch; re-run to fetch the missing months")
+        return EXIT_INTERRUPTED
     return EXIT_OK if report.ok else EXIT_BUILD_FAILURE
 
 
@@ -262,6 +273,7 @@ def run_ingest(args: argparse.Namespace) -> int:
             bar_sizes=args.bar_sizes,
             start=args.start,
             end=args.end,
+            workers=getattr(args, "workers", None),
         )
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
