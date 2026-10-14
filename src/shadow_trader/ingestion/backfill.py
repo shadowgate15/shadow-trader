@@ -31,6 +31,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Any
 
 from . import dataset
 from .anomaly import FlaggingBarBuilder, summarize_flags
@@ -123,17 +124,30 @@ def read_raw_month(cache: RawCache, instrument: str, period: str) -> str:
     return text
 
 
-def _ignore_interrupt() -> None:
-    """Pool workers leave Ctrl-C to the parent, which shuts the pool down."""
+_EVENTS: Any = None  # in a pool worker: the queue of month events to the parent
+
+
+def _init_worker(events: Any) -> None:
+    """Pool workers leave Ctrl-C to the parent, which shuts the pool down; they
+    keep the queue their progress events travel on."""
+    global _EVENTS
+    _EVENTS = events
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
+def _drain(events: Any, on_event: Callable[[str, str, str | None], None]) -> None:
+    """Hand every queued worker event to the parent's progress callback."""
+    while not events.empty():
+        on_event(*events.get())
+
+
 @contextlib.contextmanager
-def worker_pool(jobs: int) -> Generator[ProcessPoolExecutor | None]:
+def worker_pool(jobs: int, events: Any = None) -> Generator[ProcessPoolExecutor | None]:
     """A process pool of ``jobs`` workers, or ``None`` for in-process (``jobs`` 1).
 
     Any exit through an exception (Ctrl-C included) terminates the workers, so
-    none outlives the build.
+    none outlives the build. ``events`` is a queue the workers can send progress
+    events on (see ``_chunk_task``).
     """
     if jobs <= 1:
         yield None
@@ -141,7 +155,8 @@ def worker_pool(jobs: int) -> Generator[ProcessPoolExecutor | None]:
     pool = ProcessPoolExecutor(
         jobs,
         mp_context=multiprocessing.get_context("spawn"),
-        initializer=_ignore_interrupt,
+        initializer=_init_worker,
+        initargs=(events,),
     )
     try:
         yield pool
@@ -158,12 +173,14 @@ def run_tasks[T, R](
     task: Callable[[T], R],
     items: Sequence[T],
     on_done: Callable[[int, R], None] = lambda index, result: None,
+    poll: Callable[[], None] | None = None,
 ) -> list[R]:
     """``task`` over ``items``, results in item order whatever the finish order.
 
     ``on_done`` sees each result as it arrives. On a failure, queued items after
     the failed one are cancelled and running ones finish; the failure raised is
-    the earliest by item order, which is what a serial run hits first.
+    the earliest by item order, which is what a serial run hits first. ``poll``
+    runs while the pool works and once more after it, to relay worker events.
     """
     if pool is None:
         results = []
@@ -176,7 +193,11 @@ def run_tasks[T, R](
     pending: set[Future[R]] = set(futures)
     failed: int | None = None
     while pending:
-        finished, pending = wait(pending, return_when=FIRST_COMPLETED)
+        finished, pending = wait(
+            pending, timeout=0.05 if poll else None, return_when=FIRST_COMPLETED
+        )
+        if poll:
+            poll()
         for future in sorted(finished, key=position.__getitem__):
             if future.cancelled():
                 continue
@@ -189,6 +210,8 @@ def run_tasks[T, R](
                         other.cancel()
             elif failed is None:
                 on_done(index, future.result())
+    if poll:
+        poll()
     if failed is not None:
         error = futures[failed].exception()
         assert error is not None
@@ -510,7 +533,17 @@ class ChunkTask:
     span: WeekSpan
 
 
+def _send_month(instrument: str) -> Callable[[str, str | None], None] | None:
+    """Month callback of a pool worker: queue the event for the parent."""
+    if _EVENTS is None:
+        return None
+    events = _EVENTS
+    return lambda period, note: events.put((instrument, period, note))
+
+
 def _chunk_task(task: ChunkTask) -> ChunkResult:
+    """Run one chunk; in a pool worker each month read is sent to the parent as
+    it finishes, so progress is live inside a long chunk."""
     return build_chunk(
         task.cache,
         task.instrument,
@@ -521,6 +554,7 @@ def _chunk_task(task: ChunkTask) -> ChunkResult:
         task.periods,
         task.acknowledged,
         task.span,
+        on_month=_send_month(task.instrument),
     )
 
 
@@ -552,6 +586,16 @@ def _chunk_months(
             on_month(period, note)
 
     return chunk_done
+
+
+def _relay(
+    events: Any, progress: ProgressSink, on_month: Callable[[str, str | None], None]
+) -> Callable[[], None] | None:
+    """Parent side of the worker queue: feed worker month events to ``on_month``
+    (which advances each month once, whichever chunk reports it first)."""
+    if events is None:
+        return None
+    return lambda: _drain(events, lambda _, period, note: on_month(period, note))
 
 
 def _empty_sessions(last: Bar, following: Bar, bar_size: int) -> list[Bar]:
@@ -613,10 +657,21 @@ def build_backfill(
     report and warnings are the same at any job count.
     """
     validate_bar_sizes((bar_size,))
+    events = (
+        multiprocessing.get_context("spawn").SimpleQueue()
+        if config.build.jobs > 1
+        else None
+    )
     try:
-        with worker_pool(config.build.jobs) as pool:
+        with worker_pool(config.build.jobs, events) as pool:
             return _build(
-                config, bar_size, now or datetime.now(UTC), progress, chunk_weeks, pool
+                config,
+                bar_size,
+                now or datetime.now(UTC),
+                progress,
+                chunk_weeks,
+                pool,
+                events,
             )
     except BuildFailure as failure:
         # an unwritable report must not mask the failure itself
@@ -643,6 +698,7 @@ def _build(
     progress: ProgressSink,
     chunk_weeks: int,
     pool: ProcessPoolExecutor | None,
+    events: Any = None,
 ) -> BackfillResult:
     cache = RawCache(config.paths.data_root)
     build = config.build
@@ -721,6 +777,7 @@ def _build(
             _chunk_task,
             tasks,
             _chunk_months(tasks, on_month, acknowledged),
+            poll=_relay(events, progress, on_month),
         )
         chunk = merge_chunks(chunks, bar_size)
         progress.done()

@@ -210,3 +210,64 @@ def test_pool_progress_advances_once_per_month_in_each_phase(history):
     months = ["EURUSD 202401", "EURUSD 202402"]
     assert sorted(phases["scanning clocks"]) == months
     assert sorted(phases["building months"]) == months
+
+
+class Tape(NullProgress):
+    """Records every progress event in arrival order."""
+
+    def __init__(self):
+        self.events: list[tuple] = []
+
+    def start(self, phase, total=None):
+        self.events.append(("start", phase, total))
+
+    def advance(self, detail="", outcome=None):
+        self.events.append(("advance", detail))
+
+    def warn(self, message):
+        self.events.append(("warn", message))
+
+    def done(self):
+        self.events.append(("done",))
+
+
+def test_a_workers_months_report_before_its_chunk_finishes(tmp_path):
+    config = install_history(tmp_path, bad_rows=("202402",))
+    tape = Tape()
+
+    with pytest.raises(BuildFailure):
+        build_backfill(with_jobs(config, 2), 5, progress=tape, chunk_weeks=1000)
+
+    building = tape.events[tape.events.index(("start", "building months", 2)) :]
+    assert ("advance", "EURUSD 202401") in building
+
+
+@pytest.mark.parametrize("jobs", [1, 3])
+def test_progress_counts_each_month_once_and_never_overshoots(history, jobs):
+    tape = Tape()
+
+    build_backfill(with_jobs(history, jobs), 5, progress=tape, chunk_weeks=1)
+
+    start = tape.events.index(("start", "building months", 2))
+    end = tape.events.index(("done",), start)
+    advances = [e for e in tape.events[start:end] if e[0] == "advance"]
+    assert sorted(advances) == [
+        ("advance", "EURUSD 202401"),
+        ("advance", "EURUSD 202402"),
+    ]
+
+
+def test_tolerated_clock_decisions_warn_in_a_parallel_build(tmp_path):
+    from .test_week_clock import build, replay_week
+
+    config, _ = build(tmp_path, replay_week(), "2024-04")
+    serial_tape, pooled_tape = Tape(), Tape()
+
+    build_backfill(with_jobs(config, 1), 5, progress=serial_tape, chunk_weeks=1)
+    build_backfill(with_jobs(config, 2), 5, progress=pooled_tape, chunk_weeks=1)
+
+    def warnings(tape):
+        return [e for e in tape.events if e[0] == "warn"]
+
+    assert any("replayed block" in e[1] for e in warnings(pooled_tape))
+    assert warnings(pooled_tape) == warnings(serial_tape)
