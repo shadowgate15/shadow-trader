@@ -35,6 +35,9 @@ Observed behaviour this code relies on:
   an HTTP date) when usable, else exponential backoff, always capped at 5
   minutes. A 429 does not consume one of a month's ``ATTEMPTS``; the same month
   is retried, and after ``MAX_THROTTLES`` throttles it is rejected as throttled.
+* Each 429 also halves the number of requests allowed in flight (minimum 1);
+  every ``GROW_AFTER`` consecutive successful requests raise it by one, never
+  above ``workers``, and a 429 restarts that run.
 
 This is the only code in the project that touches the network, and it does so
 only through the ``Transport`` seam so tests run on stubbed responses.
@@ -50,8 +53,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -68,6 +72,7 @@ BACKOFF_SECONDS = (1.0, 30.0)  # first wait between attempts, and the cap; doubl
 DEFAULT_WORKERS = 8
 THROTTLE_STATUS = 429  # the only throttle signal for now
 MAX_THROTTLES = 10  # per month, then it is rejected as throttled
+GROW_AFTER = 10  # consecutive successful requests per +1 active worker
 MAX_COOLDOWN_SECONDS = 300.0
 SETTLE_DAYS = 7
 USER_AGENT = (
@@ -212,31 +217,56 @@ def _retry_after(headers: Mapping[str, str], now: datetime) -> float | None:
 
 
 class _Limiter:
-    """Shared by all workers: a global cooldown after a throttle reply."""
+    """Shared by all workers: a global cooldown and an adaptive request limit.
+
+    ``slot()`` admits at most ``allowed`` requests at once. A throttle halves
+    ``allowed`` (floor 1); every ``GROW_AFTER`` consecutive successful requests
+    raise it by one, up to ``maximum``.
+    """
 
     def __init__(
-        self, sleep: Callable[[float], None], now: Callable[[], datetime]
+        self,
+        sleep: Callable[[float], None],
+        now: Callable[[], datetime],
+        maximum: int = 1,
     ) -> None:
         self._sleep = sleep
         self._now = now
-        self._lock = threading.Lock()
+        self._cond = threading.Condition()
         self._until: datetime | None = None
         self._streak = 0  # consecutive throttles, for the backoff fallback
+        self._maximum = maximum
+        self._allowed = maximum
+        self._active = 0  # requests currently holding a slot
+        self._successes = 0  # consecutive successful requests
 
-    def wait(self) -> None:
-        """Block until any cooldown has passed; call before every request."""
+    @contextmanager
+    def slot(self) -> Generator[None]:
+        """Hold a request slot, after any cooldown has passed."""
         while True:
-            with self._lock:
-                if self._until is None:
-                    return
-                remaining = (self._until - self._now()).total_seconds()
-            if remaining <= 0:
-                return
+            with self._cond:
+                remaining = (
+                    0.0
+                    if self._until is None
+                    else (self._until - self._now()).total_seconds()
+                )
+                if remaining <= 0:
+                    if self._active < self._allowed:
+                        self._active += 1
+                        break
+                    self._cond.wait()
+                    continue
             self._sleep(remaining)
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._active -= 1
+                self._cond.notify_all()
 
     def throttled(self, headers: Mapping[str, str]) -> None:
-        """A throttle reply: start or extend the cooldown for every worker."""
-        with self._lock:
+        """A throttle reply: start or extend the cooldown, and ease off."""
+        with self._cond:
             now = self._now()
             seconds = _retry_after(headers, now)
             if seconds is None:
@@ -245,9 +275,27 @@ class _Limiter:
             until = now + timedelta(seconds=min(seconds, MAX_COOLDOWN_SECONDS))
             if self._until is None or until > self._until:
                 self._until = until
+            self._allowed = max(1, self._allowed // 2)
+            self._successes = 0
+
+    def reply(self, response: Response) -> None:
+        """Account for a reply: a throttle eases off, a good run speeds up."""
+        if response.status == THROTTLE_STATUS:
+            self.throttled(response.headers)
+        elif response.status == 200:
+            self._request_ok()
+
+    def _request_ok(self) -> None:
+        with self._cond:
+            self._successes += 1
+            if self._successes >= GROW_AFTER:
+                self._successes = 0
+                if self._allowed < self._maximum:
+                    self._allowed += 1
+                    self._cond.notify_all()
 
     def succeeded(self) -> None:
-        with self._lock:
+        with self._cond:
             self._streak = 0
 
 
@@ -291,7 +339,7 @@ def fetch_months(
     tasks = [(i, p) for i in instruments for p in periods]
     progress.start("fetching months", len(tasks))
     outcomes: dict[Month, _Outcome] = {}
-    limiter = _Limiter(sleep, now)
+    limiter = _Limiter(sleep, now, workers)
     interrupted = False
 
     def record(outcome: _Outcome) -> None:
@@ -405,10 +453,10 @@ def _fetch_one(
         attempt += 1
         backoff = True  # unless this attempt is throttled, a failure backs off
         try:
-            limiter.wait()
-            page = transport.get(page_url, headers)
+            with limiter.slot():
+                page = transport.get(page_url, headers)
+                limiter.reply(page)
             if page.status == THROTTLE_STATUS:
-                limiter.throttled(page.headers)
                 throttles, attempt, backoff = throttles + 1, attempt - 1, False
                 continue
             token = _token(page.body.decode("utf-8", "replace"))
@@ -425,13 +473,13 @@ def _fetch_one(
                 "timeframe": "T",
                 "fxpair": instrument,
             }
-            limiter.wait()
-            reply = transport.post(POST_URL, form, {**headers, "Referer": page_url})
+            with limiter.slot():
+                reply = transport.post(POST_URL, form, {**headers, "Referer": page_url})
+                limiter.reply(reply)
         except (OSError, urllib.error.URLError) as exc:
             problem = f"network error: {exc}"
             continue
         if reply.status == THROTTLE_STATUS:
-            limiter.throttled(reply.headers)
             throttles, attempt, backoff = throttles + 1, attempt - 1, False
             continue
         if reply.status != 200:
