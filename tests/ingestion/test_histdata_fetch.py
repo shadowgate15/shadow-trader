@@ -3,7 +3,8 @@ import io
 import json
 import threading
 import zipfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 
 from shadow_trader.ingestion.dataset import RawCache
 from shadow_trader.ingestion.sources import Response, fetch_months
@@ -427,3 +428,146 @@ def test_workers_must_be_positive(tmp_path):
     for bad in (0, -1):
         with pytest.raises(ValueError, match="workers"):
             run(tmp_path, StubTransport({"202403": [ok()]}), workers=bad)
+
+
+class FakeClock:
+    """Injected ``now``/``sleep``: sleeping advances time; nothing really waits."""
+
+    def __init__(self, start=NOW):
+        self.t = start
+        self.slept: list[float] = []
+        self._lock = threading.Lock()
+
+    def now(self):
+        with self._lock:
+            return self.t
+
+    def sleep(self, seconds):
+        with self._lock:
+            self.slept.append(seconds)
+            self.t += timedelta(seconds=seconds)
+
+
+class TimedTransport(StubTransport):
+    """Records the fake-clock time of every request."""
+
+    def __init__(self, clock, posts, pages=None):
+        super().__init__(posts, pages)
+        self.clock = clock
+        self.times: list[tuple[str, datetime]] = []
+
+    def get(self, url, headers):
+        self.times.append(("GET", self.clock.now()))
+        return super().get(url, headers)
+
+    def post(self, url, form, headers):
+        self.times.append(("POST", self.clock.now()))
+        return super().post(url, form, headers)
+
+
+def run_clocked(tmp_path, transport, clock, *, workers=8, **kwargs):
+    return fetch_months(
+        RawCache(tmp_path),
+        transport,
+        kwargs.pop("instruments", ("EURUSD",)),
+        kwargs.pop("start", "2024-03"),
+        kwargs.pop("end", "2024-03"),
+        sleep=clock.sleep,
+        now=clock.now,
+        workers=workers,
+    )
+
+
+def throttled(retry_after=None):
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    return Response(429, b"", headers)
+
+
+def test_retry_after_seconds_pauses_every_worker(tmp_path):
+    clock = FakeClock()
+    transport = TimedTransport(
+        clock, {"202403": [throttled("30"), ok()], "202404": [ok(month="202404")]}
+    )
+
+    report = run_clocked(tmp_path, transport, clock, start="2024-03", end="2024-04")
+
+    assert report.ok and len(report.fetched) == 2
+    # Every request after the first 429 reply happens >= 30 s later.
+    throttled_at = min(t for kind, t in transport.times if kind == "POST")
+    later = [t for _, t in transport.times if t > throttled_at]
+    assert later and all(t >= throttled_at + timedelta(seconds=30) for t in later)
+
+
+def test_retry_after_http_date_is_honoured(tmp_path):
+    clock = FakeClock()
+    date = format_datetime(NOW + timedelta(seconds=45), usegmt=True)
+    transport = TimedTransport(clock, {"202403": [throttled(date), ok()]})
+
+    run_clocked(tmp_path, transport, clock)
+
+    assert 45 <= sum(clock.slept) < 60
+
+
+def test_missing_retry_after_backs_off_exponentially(tmp_path):
+    clock = FakeClock()
+    transport = TimedTransport(
+        clock, {"202403": [throttled(), throttled(), throttled(), ok()]}
+    )
+
+    report = run_clocked(tmp_path, transport, clock)
+
+    assert report.fetched == [("EURUSD", "202403")]
+    waits = clock.slept
+    assert len(waits) == 3
+    assert waits[0] < waits[1] < waits[2]
+
+
+def test_cooldown_is_capped_at_five_minutes(tmp_path):
+    clock = FakeClock()
+    transport = TimedTransport(clock, {"202403": [throttled("86400"), ok()]})
+
+    report = run_clocked(tmp_path, transport, clock)
+
+    assert report.fetched == [("EURUSD", "202403")]
+    assert sum(clock.slept) == 300
+
+
+def test_throttles_do_not_use_up_attempts(tmp_path):
+    clock = FakeClock()
+    transport = TimedTransport(clock, {"202403": [*[throttled("1")] * 5, ok()]})
+
+    report = run_clocked(tmp_path, transport, clock)
+
+    assert report.fetched == [("EURUSD", "202403")]
+
+
+def test_other_failures_still_use_up_attempts(tmp_path):
+    clock = FakeClock()
+    boom = Response(500, b"", {})
+    transport = TimedTransport(clock, {"202403": [boom, boom, boom, ok()]})
+
+    report = run_clocked(tmp_path, transport, clock)
+
+    assert report.rejected == [(("EURUSD", "202403"), "HTTP 500")]
+
+
+def test_429_on_the_month_page_is_a_throttle_too(tmp_path):
+    clock = FakeClock()
+    pages = [throttled("5")] * 5 + [Response(200, PAGE.encode(), {})]
+    transport = TimedTransport(clock, {"202403": [ok()]}, pages=pages)
+
+    report = run_clocked(tmp_path, transport, clock)
+
+    assert report.fetched == [("EURUSD", "202403")]
+
+
+def test_endlessly_throttled_month_is_rejected_as_throttled(tmp_path):
+    clock = FakeClock()
+    transport = TimedTransport(clock, {"202403": [throttled("1")]})
+
+    report = run_clocked(tmp_path, transport, clock)
+
+    ((key, reason),) = report.rejected
+    assert key == ("EURUSD", "202403")
+    assert "throttled" in reason
+    assert 9 <= len(transport.posts_for("202403")) <= 11
