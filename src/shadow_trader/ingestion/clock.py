@@ -210,8 +210,63 @@ class WeekClock:
         return {"rule_counts": self.rule_counts(), **self.provenance()}
 
 
+@dataclass(frozen=True)
+class MonthEvidence:
+    """The week-clock evidence of one raw month; plain data, so it can cross a
+    process boundary and merge into a ``WeekEvidence`` in any order."""
+
+    # naive day -> (first stamp, last stamp, first Sunday stamp from 12:00)
+    days: Mapping[str, tuple[str, str | None, str | None]]
+    replays: Mapping[str, tuple[Replay, ...]] = field(default_factory=dict)
+
+
+def month_evidence(text: str, label: str = "") -> MonthEvidence:
+    """Scan one raw month; raises ``UnexplainedJump`` for a stamp step back that
+    is not a replay. Replayed ticks are not evidence."""
+    days: dict[str, list[str | None]] = {}
+    current: str | None = None
+    record: list[str | None] | None = None
+    sunday = False
+    lines = text.splitlines()
+    high = ""
+    skip_until = 0
+    replays: list[Replay] = []
+    for index, line in enumerate(lines):
+        if index < skip_until:
+            continue
+        stamp = line[:15]
+        if stamp >= high:
+            high = stamp
+        elif replay := find_replay(lines, index, label, high):
+            replays.append(replay)
+            skip_until = index + replay.rows
+            continue
+        day = line[:8]
+        if day != current:
+            current = day
+            try:
+                sunday = datetime.strptime(day, "%Y%m%d").weekday() == 6
+            except ValueError:
+                record = None  # parse_ticks reports the bad row
+                continue
+            record = days.setdefault(day, [line[:15], None, None])
+        if record is None:
+            continue
+        record[1] = line[:15]
+        if sunday and record[2] is None and line[9:11] >= _SUNDAY_NOON:
+            record[2] = line[:15]
+    return MonthEvidence(
+        {day: (str(r[0]), r[1], r[2]) for day, r in days.items()},
+        {label: tuple(replays)} if replays else {},
+    )
+
+
 class WeekEvidence:
-    """Accumulates, month by month, the ticks that identify each week's clock."""
+    """Accumulates, month by month, the ticks that identify each week's clock.
+
+    Merging is order-independent: per day the earliest first stamp, the latest
+    last stamp and the earliest Sunday-open stamp win.
+    """
 
     def __init__(self) -> None:
         # naive day -> [first stamp, last stamp, first Sunday stamp from 12:00]
@@ -219,42 +274,16 @@ class WeekEvidence:
         self._replays: dict[str, tuple[Replay, ...]] = {}
 
     def add_text(self, text: str, label: str = "") -> None:
-        """Add one raw month; raises ``UnexplainedJump`` for a stamp step back that
-        is not a replay. Replayed ticks are not evidence."""
-        days = self._days
-        current: str | None = None
-        record: list[str | None] | None = None
-        sunday = False
-        lines = text.splitlines()
-        high = ""
-        skip_until = 0
-        replays: list[Replay] = []
-        for index, line in enumerate(lines):
-            if index < skip_until:
-                continue
-            stamp = line[:15]
-            if stamp >= high:
-                high = stamp
-            elif replay := find_replay(lines, index, label, high):
-                replays.append(replay)
-                skip_until = index + replay.rows
-                continue
-            day = line[:8]
-            if day != current:
-                current = day
-                try:
-                    sunday = datetime.strptime(day, "%Y%m%d").weekday() == 6
-                except ValueError:
-                    record = None  # parse_ticks reports the bad row
-                    continue
-                record = days.setdefault(day, [line[:15], None, None])
-            if record is None:
-                continue
-            record[1] = line[:15]
-            if sunday and record[2] is None and line[9:11] >= _SUNDAY_NOON:
-                record[2] = line[:15]
-        if replays:
-            self._replays[label] = tuple(replays)
+        """Add one raw month (see ``month_evidence``)."""
+        self.merge(month_evidence(text, label))
+
+    def merge(self, month: MonthEvidence) -> None:
+        for day, (first, last, sunday_open) in month.days.items():
+            record = self._days.setdefault(day, [first, last, sunday_open])
+            record[0] = min(str(record[0]), first)
+            record[1] = _pick(max, record[1], last)
+            record[2] = _pick(min, record[2], sunday_open)
+        self._replays.update(month.replays)
 
     def _weeks(self) -> dict[date, list[str | None]]:
         """Per week: [first Sunday tick, last tick]; either may be missing."""
@@ -330,6 +359,10 @@ class WeekEvidence:
             ),
             dict(sorted(failures.items())),
         )
+
+
+def _pick(choose, a: str | None, b: str | None) -> str | None:
+    return b if a is None else a if b is None else choose(a, b)
 
 
 def _deltas(
