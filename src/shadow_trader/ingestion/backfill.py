@@ -14,7 +14,7 @@ from __future__ import annotations
 import contextlib
 import io
 import zipfile
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -32,6 +32,7 @@ from .clock import (
 )
 from .config import (
     DEFAULT_START,
+    AnomalyRuleConfig,
     Config,
     ConfigError,
     last_complete_month,
@@ -225,6 +226,93 @@ def parse_ticks(
         yield Quote(clock.to_utc(naive), quote_bid, quote_ask)
 
 
+@dataclass(frozen=True)
+class ChunkResult:
+    """Plain, picklable output of one bar-pass chunk (no writes, no I/O handles)."""
+
+    bars: tuple[Bar, ...]
+    missing: dict[datetime, Bar]  # source-missing Gap bars of acknowledged months
+    tick_flag_counts: dict[str, int]
+    dropped_out_of_session: int
+    late_dropped: int
+    first_ticks: dict[datetime, datetime]  # weekly open -> first tick
+    warnings: tuple[BuildWarning, ...]
+
+
+def build_chunk(
+    cache: RawCache,
+    instrument: str,
+    bar_size: int,
+    price_scale: int,
+    anomaly_rule: AnomalyRuleConfig,
+    clock: WeekClock,
+    periods: Iterable[str],
+    acknowledged: frozenset[str] = frozenset(),
+    *,
+    on_month: Callable[[str, str | None], None] | None = None,
+) -> ChunkResult:
+    """Bar pass over ``periods`` (monthly raw files) for one Instrument.
+
+    Returns plain data only; per-Instrument post-processing (outage flagging,
+    flag summaries, alignment warnings) is the merge step's job.
+    """
+    builder = FlaggingBarBuilder(instrument, bar_size, price_scale, anomaly_rule)
+    bars: list[Bar] = []
+    first_ticks: dict[datetime, datetime] = {}
+    missing: dict[datetime, Bar] = {}
+    warnings: list[BuildWarning] = []
+    newest: datetime | None = None
+    late_dropped = 0
+    for period in periods:
+        month = to_month(period)
+        if month in acknowledged:
+            for gap in source_missing_bars(instrument, month, bar_size):
+                missing[gap.open_time] = gap
+            if on_month:
+                on_month(period, "acknowledged missing")
+            continue
+        text = read_raw_month(cache, instrument, period)
+        if month < DEFAULT_START:
+            warnings.append(
+                BuildWarning(
+                    "thin_data",
+                    f"{instrument} {period} is before the history floor "
+                    f"{DEFAULT_START}; ticks are sparse",
+                    f"{instrument}/{period}",
+                )
+            )
+        label = f"{instrument}/{period}"
+        for row, quote in enumerate(
+            parse_ticks(text, label, price_scale, clock), start=1
+        ):
+            first_ticks.setdefault(_week_open(quote.ts), quote.ts)
+            try:
+                bars.extend(builder.push(quote))
+            except ValueError as exc:
+                # a stale tick a second or so behind a closed slot (HistData's
+                # 2026 files); the pre-pass already failed any bigger step back
+                if newest is None or newest - quote.ts >= BACKWARD_TOLERANCE:
+                    where = f"{label} row {row}"
+                    raise BuildFailure(
+                        f"ticks out of order at {where}: {exc}", where
+                    ) from None
+                late_dropped += 1
+                continue
+            newest = quote.ts if newest is None else max(newest, quote.ts)
+        if on_month:
+            on_month(period, None)
+    bars.extend(builder.flush())
+    return ChunkResult(
+        tuple(bars),
+        missing,
+        dict(builder.tick_flag_counts),
+        builder.dropped_out_of_session,
+        late_dropped,
+        first_ticks,
+        tuple(warnings),
+    )
+
+
 def build_backfill(
     config: Config,
     bar_size: int,
@@ -284,15 +372,9 @@ def _build(
     clocks: dict[str, WeekClock] = {}
     for instrument in build.instruments:
         scale = config.instruments[instrument].price_scale
-        builder = FlaggingBarBuilder(instrument, bar_size, scale, config.anomaly_rule)
-        bars: list[Bar] = []
-        first_ticks: dict[datetime, datetime] = {}  # weekly open -> first tick
-        acknowledged = {
+        acknowledged = frozenset(
             a.month for a in build.acknowledged_missing if a.instrument == instrument
-        }
-        missing: dict[datetime, Bar] = {}
-        newest: datetime | None = None
-        late_dropped = 0
+        )
         clocks[instrument] = clock = infer_week_clock(
             cache,
             instrument,
@@ -305,79 +387,58 @@ def _build(
         )
         periods = months_between(build.start, end)
         progress.start("building months", len(periods))
-        for period in periods:
-            month = to_month(period)
-            if month in acknowledged:
-                for gap in source_missing_bars(instrument, month, bar_size):
-                    missing[gap.open_time] = gap
-                progress.advance(f"{instrument} {period}", "acknowledged missing")
-                continue
-            text = read_raw_month(cache, instrument, period)
-            if month < DEFAULT_START:
-                warn(
-                    BuildWarning(
-                        "thin_data",
-                        f"{instrument} {period} is before the history floor "
-                        f"{DEFAULT_START}; ticks are sparse",
-                        f"{instrument}/{period}",
-                    )
-                )
-            label = f"{instrument}/{period}"
-            for row, quote in enumerate(
-                parse_ticks(text, label, scale, clock), start=1
-            ):
-                first_ticks.setdefault(_week_open(quote.ts), quote.ts)
-                try:
-                    bars.extend(builder.push(quote))
-                except ValueError as exc:
-                    # a stale tick a second or so behind a closed slot (HistData's
-                    # 2026 files); the pre-pass already failed any bigger step back
-                    if newest is None or newest - quote.ts >= BACKWARD_TOLERANCE:
-                        where = f"{label} row {row}"
-                        raise BuildFailure(
-                            f"ticks out of order at {where}: {exc}", where
-                        ) from None
-                    late_dropped += 1
-                    continue
-                newest = quote.ts if newest is None else max(newest, quote.ts)
-            progress.advance(f"{instrument} {period}")
-        bars.extend(builder.flush())
+        # one chunk covering the whole history (see ``build_chunk``)
+        chunk = build_chunk(
+            cache,
+            instrument,
+            bar_size,
+            scale,
+            config.anomaly_rule,
+            clock,
+            periods,
+            acknowledged,
+            on_month=lambda period, note=None, i=instrument: progress.advance(
+                f"{i} {period}", note
+            ),
+        )
+        for warning in chunk.warnings:
+            warn(warning)
         progress.done()
-        bars = [bar for bar in bars if lo <= bar.open_time < hi]
-        for opened, first in first_ticks.items():
+        bars = [bar for bar in chunk.bars if lo <= bar.open_time < hi]
+        for opened, first in chunk.first_ticks.items():
             if (off := _alignment_warning(instrument, opened, first)) is not None:
                 warn(off[0])
                 alignments.setdefault(instrument, []).append(off[1])
-        merged = {bar.open_time: bar for bar in bars} | missing
+        merged = {bar.open_time: bar for bar in bars} | chunk.missing
         series[instrument] = flag_suspected_outages(
             sorted(merged.values(), key=lambda bar: bar.open_time),
             bar_size,
             config.gap_rule.outage_threshold_minutes,
         )
-        tick_flags[instrument] = dict(builder.tick_flag_counts)
+        tick_flags[instrument] = dict(chunk.tick_flag_counts)
         summary = summarize_flags(
             series[instrument],
-            builder.tick_flag_counts,
+            chunk.tick_flag_counts,
             config.anomaly_rule.alert_fraction,
         )
         for w in summary.warnings:
             warn(BuildWarning(w.code, w.message, instrument))
-        if late_dropped:
+        if chunk.late_dropped:
             warn(
                 BuildWarning(
                     "late_ticks_dropped",
-                    f"{late_dropped} {instrument} tick(s) arrived up to "
+                    f"{chunk.late_dropped} {instrument} tick(s) arrived up to "
                     f"{BACKWARD_TOLERANCE.seconds} s behind a closed slot and "
                     "were dropped",
                     instrument,
                 )
             )
-        if builder.dropped_out_of_session:
-            dropped[instrument] = builder.dropped_out_of_session
+        if chunk.dropped_out_of_session:
+            dropped[instrument] = chunk.dropped_out_of_session
             warn(
                 BuildWarning(
                     "out_of_session_ticks",
-                    f"{builder.dropped_out_of_session} {instrument} ticks fell "
+                    f"{chunk.dropped_out_of_session} {instrument} ticks fell "
                     "outside any Session and were dropped",
                     instrument,
                 )
