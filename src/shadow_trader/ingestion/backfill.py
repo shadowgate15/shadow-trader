@@ -26,10 +26,12 @@ from .anomaly import FlaggingBarBuilder, summarize_flags
 from .bars import Bar, Quote
 from .clock import (
     BACKWARD_TOLERANCE,
+    MonthEvidence,
     UnexplainedJump,
     WeekClock,
     WeekClockError,
     WeekEvidence,
+    month_evidence,
 )
 from .config import (
     DEFAULT_START,
@@ -106,6 +108,17 @@ def read_raw_month(cache: RawCache, instrument: str, period: str) -> str:
     return text
 
 
+def _month_evidence(cache: RawCache, instrument: str, period: str) -> MonthEvidence:
+    """One clock pre-pass task: unzip a raw month and return its week-clock evidence."""
+    label = f"{instrument}/{period}"
+    try:
+        return month_evidence(read_raw_month(cache, instrument, period), label)
+    except UnexplainedJump as jump:
+        raise BuildFailure(
+            f"ticks out of order at {jump}", f"{jump.label} row {jump.row}"
+        ) from None
+
+
 def infer_week_clock(
     cache: RawCache,
     instrument: str,
@@ -118,13 +131,7 @@ def infer_week_clock(
     months = list(periods)
     progress.start("scanning clocks", len(months))
     for period in months:
-        label = f"{instrument}/{period}"
-        try:
-            evidence.add_text(read_raw_month(cache, instrument, period), label)
-        except UnexplainedJump as jump:
-            raise BuildFailure(
-                f"ticks out of order at {jump}", f"{jump.label} row {jump.row}"
-            ) from None
+        evidence.merge(_month_evidence(cache, instrument, period))
         progress.advance(f"{instrument} {period}")
     try:
         clock = evidence.infer()
