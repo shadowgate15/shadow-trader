@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import time
 import zipfile
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -289,7 +290,9 @@ def _build(
     tick_flags: dict[str, dict[str, int]] = {}
     alignments: dict[str, list[Alignment]] = {}
     clocks: dict[str, WeekClock] = {}
+    timings = {"clock_pre_pass": 0.0, "bar_pass": 0.0, "write_dataset": 0.0}
     for instrument in build.instruments:
+        instrument_began = time.perf_counter()
         scale = config.instruments[instrument].price_scale
         builder = FlaggingBarBuilder(instrument, bar_size, scale, config.anomaly_rule)
         bars: list[Bar] = []
@@ -300,6 +303,7 @@ def _build(
         missing: dict[datetime, Bar] = {}
         newest: datetime | None = None
         late_dropped = 0
+        pre_pass_began = time.perf_counter()
         clocks[instrument] = clock = infer_week_clock(
             cache,
             instrument,
@@ -310,6 +314,8 @@ def _build(
             ],
             progress=progress,
         )
+        pre_pass = time.perf_counter() - pre_pass_began
+        timings["clock_pre_pass"] += pre_pass
         periods = months_between(build.start, end)
         progress.start("building months", len(periods))
         for period in periods:
@@ -350,6 +356,7 @@ def _build(
             progress.advance(f"{instrument} {period}")
         bars.extend(builder.flush())
         progress.done()
+        timings["bar_pass"] += time.perf_counter() - instrument_began - pre_pass
         bars = [bar for bar in bars if lo <= bar.open_time < hi]
         for opened, first in first_ticks.items():
             if (off := _alignment_warning(instrument, opened, first)) is not None:
@@ -390,6 +397,7 @@ def _build(
                 )
             )
     progress.start("writing dataset")
+    write_began = time.perf_counter()
     ref = dataset.write_dataset(
         config,
         bar_size,
@@ -400,6 +408,7 @@ def _build(
         tick_flag_counts=tick_flags,
         extra_manifest={"session_clock": _clock_manifest(clocks)},
     )
+    timings["write_dataset"] = time.perf_counter() - write_began
     report_path = write_build_report(
         ref.path,
         build_report(
@@ -413,6 +422,7 @@ def _build(
             warnings=warnings,
             raw_inputs=ref.manifest["raw_inputs"],
             config=config,
+            timings=timings,
         ),
     )
     progress.done()

@@ -324,3 +324,42 @@ def test_outage_runs_are_capped_at_200_with_the_exact_total():
         "end": "2024-01-07T22:05:00+00:00",
         "duration_minutes": 5,
     }
+
+
+def test_build_report_records_the_three_phase_timings(tmp_path):
+    _, result = build_fixture(tmp_path, "eurusd_winter", "EURUSD", "2024-01")
+
+    timings = read_report(result)["timings"]
+
+    assert set(timings) == {"clock_pre_pass", "bar_pass", "write_dataset"}
+    assert all(isinstance(t, float) and t >= 0 for t in timings.values())
+
+
+def test_timings_do_not_change_the_dataset_id_on_rebuild(tmp_path):
+    from shadow_trader.ingestion.backfill import build_backfill
+
+    config, first = build_fixture(tmp_path, "eurusd_winter", "EURUSD", "2024-01")
+
+    second = build_backfill(config, 5)
+
+    assert second.ref.dataset_id == first.ref.dataset_id
+    a, b = read_report(first), read_report(second)
+    a.pop("timings"), b.pop("timings")
+    assert a == b
+
+
+def test_console_summary_shows_the_phase_timings_before_the_path():
+    from pathlib import Path
+
+    from shadow_trader.ingestion.report import console_summary
+
+    report = {
+        "status": "ok",
+        "warnings": [],
+        "timings": {"clock_pre_pass": 1.25, "bar_pass": 30.0, "write_dataset": 0.5},
+    }
+
+    assert console_summary(report, Path("/x.json")) == [
+        "timings: clock pre-pass 1.2 s, bar pass 30.0 s, write dataset 0.5 s",
+        "report: /x.json",
+    ]

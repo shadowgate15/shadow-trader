@@ -143,6 +143,7 @@ def build_report(
     warnings: Sequence[WarningEntry] = (),
     raw_inputs: Mapping[str, str] | None = None,
     config: Config | None = None,
+    timings: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """The build report of one successful Dataset build (a plain JSON document)."""
     alert_fraction = config.anomaly_rule.alert_fraction if config else 0.01
@@ -179,7 +180,16 @@ def build_report(
         ],
         "raw_inputs": dict(raw_inputs or {}),
         "config": resolved_config(config) if config else None,
+        # wall-clock seconds per phase; never part of the Dataset content hash
+        "timings": dict(timings or {}),
     }
+
+
+PHASE_LABELS = {
+    "clock_pre_pass": "clock pre-pass",
+    "bar_pass": "bar pass",
+    "write_dataset": "write dataset",
+}
 
 
 def console_summary(report: Mapping[str, Any], path: Path) -> list[str]:
@@ -197,6 +207,14 @@ def console_summary(report: Mapping[str, Any], path: Path) -> list[str]:
         for warning in report["warnings"]:
             counts[warning["code"]] = counts.get(warning["code"], 0) + 1
         lines.extend(f"warning: {code} x{counts[code]}" for code in counts)
+        if timings := report.get("timings"):
+            lines.append(
+                "timings: "
+                + ", ".join(
+                    f"{PHASE_LABELS.get(phase, phase)} {seconds:.1f} s"
+                    for phase, seconds in timings.items()
+                )
+            )
     lines.append(f"report: {path}")
     return lines
 
