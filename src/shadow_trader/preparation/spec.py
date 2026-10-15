@@ -50,6 +50,8 @@ class FeatureColumn:
     # Absolute parity tolerance between batch and tail evaluation. 0.0 means
     # bitwise (finite memory); recursive EMA/RSI/ATR columns declare 1e-9.
     tolerance: float = 0.0
+    # Scaler method: ``robust_clip`` or ``identity`` (bounded / flag columns).
+    scaling: str = "robust_clip"
 
 
 @dataclass(frozen=True)
@@ -373,6 +375,7 @@ def _time_family() -> tuple[FeatureColumn, ...]:
             lookback=0,
             expression=expression,
             always_valid=True,
+            scaling="robust_clip" if param == "since_open" else "identity",
         )
         for param, (text, expression) in definitions.items()
     )
