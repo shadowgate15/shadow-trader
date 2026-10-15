@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 
 import polars as pl
 
@@ -77,6 +78,34 @@ def live_spec(
 FEATURE_SPEC = live_spec(SPECS[LIVE_SPEC_VERSION])
 
 
+def _validate_tail(tail_bars: Sequence[Bar], bar_size: int) -> None:
+    """Raise ``ValueError`` naming the first Bar that breaks the tail contract."""
+    step = timedelta(minutes=bar_size)
+    first = tail_bars[0]
+    previous = first
+    for index, bar in enumerate(tail_bars[1:], start=1):
+        where = f"Bar {index} ({bar.instrument} open_time {bar.open_time.isoformat()})"
+        if bar.instrument != first.instrument:
+            raise ValueError(
+                f"{where}: Instrument {bar.instrument} in a {first.instrument} tail"
+            )
+        if bar.open_time <= previous.open_time:
+            raise ValueError(
+                f"{where}: open_time not after the previous Bar's "
+                f"{previous.open_time.isoformat()} (duplicate or unsorted)"
+            )
+        if (
+            bar.session_id == previous.session_id
+            and bar.open_time - previous.open_time != step
+        ):
+            raise ValueError(
+                f"{where}: missing slot after {previous.open_time.isoformat()}; "
+                "a missing slot must be supplied as a Gap Bar "
+                f"(expected a {bar_size}-minute step)"
+            )
+        previous = bar
+
+
 def evaluate_tail(
     tail_bars: Sequence[Bar], spec: LiveFeatureSpec = FEATURE_SPEC
 ) -> pl.DataFrame:
@@ -86,6 +115,14 @@ def evaluate_tail(
     ``open_time`` order. The tail start is treated like a Dataset start, so a
     short tail gives nulls, never an error; an empty tail gives an unusable
     all-null row.
+
+    Windows count rows, so a malformed tail would give plausible wrong features.
+    The tail is therefore validated in one O(n) pass and ``ValueError`` names
+    the first offending Bar: a second Instrument, an ``open_time`` that is not
+    strictly after the previous Bar's (duplicates and unsorted input are
+    rejected, not reordered), or, within a Session, a step other than
+    ``bar_size`` minutes (a missing slot must arrive as a Gap Bar). Session
+    boundaries are exempt from the step check.
     """
     if not tail_bars:
         return pl.DataFrame(
@@ -95,6 +132,7 @@ def evaluate_tail(
                 "unusable_reason": ["dataset_start"],
             }
         )
+    _validate_tail(tail_bars, spec.spec.bar_size)
     frame = featured_frame(tail_bars, spec.spec, spec.policy)
     return frame.select(*spec.spec.names, "usable", "unusable_reason").tail(1)
 

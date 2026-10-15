@@ -3,6 +3,7 @@
 
 import math
 import random
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import polars as pl
@@ -22,7 +23,7 @@ from shadow_trader.preparation.live import (
     evaluate_tail,
 )
 
-from .synthetic import SESSION_1, session_bars
+from .synthetic import SESSION_1, SESSION_2, session_bars
 
 TAIL = FEATURE_SPEC.min_tail_bars
 
@@ -111,6 +112,73 @@ def test_the_revision_of_a_bar_is_ignored():
     bars = series(TAIL)
 
     assert evaluate_tail(bars).equals(evaluate_tail(list(bars)))
+
+
+# --- evaluate_tail preconditions ----------------------------------------------
+
+
+def test_a_missing_slot_without_a_gap_row_is_rejected():
+    bars = series(TAIL)
+    del bars[200]
+
+    with pytest.raises(ValueError, match="missing slot") as err:
+        evaluate_tail(bars)
+
+    assert bars[200].open_time.isoformat() in str(err.value)
+    assert "Gap" in str(err.value)
+
+
+def test_a_duplicated_bar_is_rejected():
+    bars = series(TAIL)
+    bars.append(bars[-1])
+
+    with pytest.raises(ValueError, match="not after") as err:
+        evaluate_tail(bars)
+
+    assert bars[-1].open_time.isoformat() in str(err.value)
+
+
+def test_an_unsorted_tail_is_rejected():
+    bars = series(TAIL)
+    bars.insert(0, bars.pop())  # newest Bar first
+
+    with pytest.raises(ValueError, match="not after") as err:
+        evaluate_tail(bars)
+
+    assert bars[1].open_time.isoformat() in str(err.value)
+
+
+def test_a_foreign_instrument_bar_is_rejected():
+    bars = series(TAIL)
+    bars[50] = replace(bars[50], instrument="GBPUSD")
+
+    with pytest.raises(ValueError, match="GBPUSD") as err:
+        evaluate_tail(bars)
+
+    assert bars[50].open_time.isoformat() in str(err.value)
+    assert "EURUSD" in str(err.value)
+
+
+def test_a_tail_with_a_gap_row_is_accepted_and_matches_batch():
+    bars = series(TAIL + 50, gaps=(TAIL - 20,))
+    batch = featured_frame(bars, FEATURE_SPEC.spec).tail(1)
+
+    row = evaluate_tail(bars)
+
+    assert row["usable"][0] == batch["usable"][0]
+    assert row["unusable_reason"][0] == batch["unusable_reason"][0]
+
+
+def test_a_tail_spanning_a_session_boundary_is_accepted_and_matches_batch():
+    first = session_bars("EURUSD", SESSION_1, 100)
+    second = session_bars("EURUSD", SESSION_2, 100)
+    bars = [*first, *second]
+    batch = featured_frame(bars, FEATURE_SPEC.spec).tail(1)
+
+    row = evaluate_tail(bars)
+
+    assert row["usable"][0] == batch["usable"][0]
+    assert row["feat_ret_1"][0] == batch["feat_ret_1"][0]
 
 
 # --- check_compat -----------------------------------------------------------
