@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from shadow_trader.ingestion.anomaly import BAR_FLAGS, GAP_FLAGS, TICK_FLAGS
 from shadow_trader.ingestion.config import ConfigError
 
 from .anomaly import DEFAULT_POLICY, AnomalyPolicy
@@ -188,6 +189,16 @@ def load_prepared_config(path: Path) -> PreparedConfig:
                 isinstance(f, str) for f in flags
             ):
                 raise ConfigError("policy.distrusted_flags must be a list of strings")
+            # An empty list would silently remove all distrust, so it is refused.
+            if not flags:
+                raise ConfigError("policy.distrusted_flags needs at least one flag")
+            known = (*TICK_FLAGS, *BAR_FLAGS, *GAP_FLAGS)
+            unknown = sorted(set(flags) - set(known))
+            if unknown:
+                raise ConfigError(
+                    f"unknown policy.distrusted_flags {', '.join(map(repr, unknown))}; "
+                    f"known: {', '.join(known)}"
+                )
             policy = AnomalyPolicy(tuple(flags))
 
     report = ReportConfig()

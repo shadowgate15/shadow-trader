@@ -89,13 +89,15 @@ def test_anomaly_flags_default_and_are_validated(tmp_path):
 
 def test_the_policy_table_is_named_policy_and_anomaly_is_refused(tmp_path):
     config = load_prepared_config(
-        write_prepared_toml(tmp_path, "abc", '[policy]\ndistrusted_flags = ["a"]\n')
+        write_prepared_toml(
+            tmp_path, "abc", '[policy]\ndistrusted_flags = ["zero_spread"]\n'
+        )
     )
-    assert config.anomaly.distrusted_flags == ("a",)
+    assert config.anomaly.distrusted_flags == ("zero_spread",)
     with pytest.raises(ConfigError, match=r"unknown key.*anomaly"):
         load_prepared_config(
             write_prepared_toml(
-                tmp_path, "abc", '[anomaly]\ndistrusted_flags = ["a"]\n'
+                tmp_path, "abc", '[anomaly]\ndistrusted_flags = ["zero_spread"]\n'
             )
         )
 
@@ -140,3 +142,27 @@ def test_bad_split_tables_are_config_errors(tmp_path, old, new, message):
     text = split_toml().replace(old, new)
     with pytest.raises(ConfigError, match=message):
         load_prepared_config(write_prepared_toml(tmp_path, "abc", split=text))
+
+
+def test_unknown_distrusted_flag_names_are_refused_with_the_known_set(tmp_path):
+    with pytest.raises(ConfigError, match=r"crossd_quote.*known:.*crossed_quote"):
+        load_prepared_config(
+            write_prepared_toml(
+                tmp_path, "abc", '[policy]\ndistrusted_flags = ["crossd_quote"]\n'
+            )
+        )
+    config = load_prepared_config(
+        write_prepared_toml(
+            tmp_path,
+            "abc",
+            '[policy]\ndistrusted_flags = ["spread_spike", "suspected_outage"]\n',
+        )
+    )
+    assert config.anomaly.distrusted_flags == ("spread_spike", "suspected_outage")
+
+
+def test_an_empty_distrusted_flags_list_is_refused(tmp_path):
+    with pytest.raises(ConfigError, match="at least one"):
+        load_prepared_config(
+            write_prepared_toml(tmp_path, "abc", "[policy]\ndistrusted_flags = []\n")
+        )
