@@ -13,9 +13,10 @@ and its artifact is written before the three Datasets (whose manifests name it).
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,15 @@ from .anomaly import DEFAULT_POLICY, AnomalyPolicy, apply_anomaly_policy
 from .boundary import BoundaryCheckFailure, BoundaryContext, Check, boundary_check
 from .config import PreparedConfig
 from .dataset import PreparedRef, build_id_of, plan_prepared, write_build_record
+from .report import (
+    REPORT_VERSION,
+    advisory_warnings,
+    max_clip_fraction,
+    report_path,
+    role_summary,
+    write_failed_report,
+    write_json,
+)
 from .scaler import (
     ScalerFitError,
     fit_scaler,
@@ -66,6 +76,7 @@ class BuildFailure(Exception):
     def __init__(self, message: str, code: str | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.report_path: Path | None = None  # the failed-build report, once written
 
 
 @dataclass(frozen=True)
@@ -76,6 +87,8 @@ class BuildRef:
     path: Path
     record: Mapping[str, Any]
     datasets: Mapping[str, PreparedRef]
+    report: Mapping[str, Any]  # the non-authoritative build report
+    report_path: Path
 
 
 def _bars_frame(rows: list[dict[str, object]]) -> pl.DataFrame:
@@ -110,20 +123,42 @@ def _span(frame: pl.DataFrame, bar_size: int) -> dict[str, str]:
 def build_prepared(
     config: PreparedConfig, progress: ProgressSink = NULL_PROGRESS
 ) -> BuildRef:
-    """Build the train, validation and test Datasets and return the build's ref."""
+    """Build the train, validation and test Datasets and return the build's ref.
+
+    Writes the build report beside the build record. A failure writes a small
+    failed-build report (outside the immutable store) and records its path on
+    the raised ``BuildFailure``.
+    """
+    counts: dict[str, Any] = {"instruments": 0, "rows": {}}
+    try:
+        return _build(config, progress, counts)
+    except BuildFailure as exc:
+        exc.report_path = write_failed_report(
+            config, code=exc.code, message=str(exc), counts=counts
+        )
+        raise
+
+
+def _build(
+    config: PreparedConfig, progress: ProgressSink, counts: dict[str, Any]
+) -> BuildRef:
+    began = time.perf_counter()
     spec = config.feature_spec
     parent_id = config.input.dataset_id
     try:
         parent = open_dataset(config.paths.data_root, parent_id)
     except (DatasetError, OSError) as exc:
-        raise BuildFailure(f"cannot open parent Dataset {parent_id}: {exc}") from exc
+        raise BuildFailure(
+            f"cannot open parent Dataset {parent_id}: {exc}", "parent_unavailable"
+        ) from exc
 
     bar_size = parent.manifest["bar_size"]
     if bar_size != spec.bar_size:
         raise BuildFailure(
             f"bar size mismatch: parent Dataset {parent_id} has {bar_size}-minute "
             f"Bars but feature spec v{spec.version} is bound to "
-            f"{spec.bar_size}-minute Bars"
+            f"{spec.bar_size}-minute Bars",
+            "bar_size_mismatch",
         )
     instruments = list(parent.manifest["instruments"])
 
@@ -133,8 +168,11 @@ def build_prepared(
         frames[instrument] = featured_frame(
             parent.read(instrument), spec, config.anomaly
         )
+        counts["instruments"] += 1
+        counts["rows"][instrument] = frames[instrument].height
         progress.advance(instrument)
     progress.done()
+    features_seconds = time.perf_counter() - began
 
     embargo = embargo_bars(spec, config.embargo)
     try:
@@ -205,6 +243,18 @@ def build_prepared(
     }
     build_id = build_id_of(shared, ids)
 
+    role_summaries = {
+        role: role_summary({pair: roles[pair][role].frame for pair in instruments})
+        for role in ROLES
+    }
+    clips = {
+        role: max_clip_fraction(
+            scaler, {pair: roles[pair][role].frame for pair in instruments}
+        )
+        for role in ROLES
+    }
+    warnings = advisory_warnings(role_summaries, clips, config.report)
+
     write_scaler(config.paths.prepared_root, scaler)
     progress.start("write", len(ROLES))
     datasets: dict[str, PreparedRef] = {}
@@ -230,4 +280,27 @@ def build_prepared(
         progress.advance(role)
     record = write_build_record(config.paths.prepared_root, shared, ids)
     progress.done()
-    return BuildRef(record.build_id, record.path, record.record, datasets)
+
+    total_seconds = time.perf_counter() - began
+    rows = sum(s["rows"] for s in role_summaries.values())
+    path = report_path(config.paths.prepared_root, record.build_id)
+    report: dict[str, Any] = {
+        "report_version": REPORT_VERSION,
+        "build_id": record.build_id,
+        "created_at": datetime.now(UTC).isoformat(),
+        "durations": {
+            "features_seconds": features_seconds,
+            "total_seconds": total_seconds,
+        },
+        "throughput": {"rows": rows, "rows_per_second": rows / total_seconds},
+        "threads": pl.thread_pool_size(),
+        "roles": role_summaries,
+        "scaler": scaler.scaler_id,
+        "manifests": {
+            role: str(ref.path / "manifest.json") for role, ref in datasets.items()
+        },
+        "build_record": str(record.path),
+        "warnings": warnings,
+    }
+    write_json(path, report)
+    return BuildRef(record.build_id, record.path, record.record, datasets, report, path)

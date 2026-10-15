@@ -23,9 +23,12 @@ def test_build_exits_0_and_prints_the_build_and_dataset_ids(tmp_path, capsys):
     first, *rest = capsys.readouterr().out.splitlines()
     assert first.startswith("built prepared build ")
     assert (tmp_path / "prepared/builds" / f"{first.split()[-1]}.json").is_file()
-    assert [line.split()[0] for line in rest] == ["train", "validation", "test"]
-    for line in rest:
-        dataset_id = line.split()[-1]
+    roles = [
+        line for line in rest if line.split()[0] in ("train", "validation", "test")
+    ]
+    assert [line.split()[0] for line in roles] == ["train", "validation", "test"]
+    for line in roles:
+        dataset_id = line.split()[1]
         manifest = tmp_path / "prepared/datasets" / dataset_id / "manifest.json"
         assert manifest.is_file()
 
@@ -108,7 +111,9 @@ def build_in_subprocess(config_path, threads):
         text=True,
         check=True,
     )
-    return out.stdout.split()  # the build id and the three role / Dataset id pairs
+    # the build id and the three role / Dataset id pairs; the report path differs
+    lines = [x for x in out.stdout.splitlines() if not x.startswith("report ")]
+    return "\n".join(lines).split()
 
 
 def test_dataset_hash_is_identical_at_one_and_many_threads(tmp_path):
@@ -126,3 +131,39 @@ def test_dataset_hash_is_identical_at_one_and_many_threads(tmp_path):
         ids.append(build_in_subprocess(path, threads))
 
     assert ids[0] == ids[1]
+
+
+def test_build_prints_one_summary_screen(tmp_path, capsys):
+    parent = write_ingestion(tmp_path)
+    path = write_prepared_toml(tmp_path, parent.dataset_id)
+
+    assert run(["prepare", "build", "--config", str(path)]) == 0
+
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    build_id = lines[0].split()[-1]
+    by_key = {line.split()[0]: line.split() for line in lines[1:]}
+    for role in ("train", "validation", "test"):
+        _, dataset_id, _, rows, _, usable = by_key[role]
+        assert (tmp_path / "prepared/datasets" / dataset_id).is_dir()
+        assert int(rows) > 0 and usable.endswith("%")
+    scaler_id = by_key["scaler"][1]
+    assert (tmp_path / "prepared/scalers" / f"{scaler_id}.json").is_file()
+    assert "boundary_check pass" in lines
+    assert any(line.startswith("warnings ") for line in lines)
+    report = by_key["report"][1]
+    assert report == str(tmp_path / "prepared/builds" / f"{build_id}.report.json")
+    assert "\x1b" not in captured.out  # result lines are plain text
+
+
+def test_build_failure_names_the_code_and_the_failed_report(tmp_path, capsys):
+    parent = write_ingestion(tmp_path)
+    path = write_prepared_toml(
+        tmp_path, parent.dataset_id, split=split_toml(episode_bars=5000)
+    )
+
+    assert run(["prepare", "build", "--config", str(path), "-q"]) == 1
+
+    err = capsys.readouterr().err
+    assert "embargo_exceeds_dataset" in err
+    assert str(tmp_path / "prepared.failed") in err
