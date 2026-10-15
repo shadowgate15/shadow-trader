@@ -152,7 +152,7 @@ def fit_scaler(
             )
             if p75 - p25 == 0:
                 raise ScalerFitError(
-                    "scaler_zero_iqr",
+                    "zero_iqr",
                     f"{pair} {column.name} has a zero IQR over its {n_fit} train "
                     "values and cannot be robust-scaled",
                 )

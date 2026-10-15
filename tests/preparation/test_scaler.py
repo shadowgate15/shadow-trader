@@ -156,8 +156,10 @@ def test_zero_iqr_fails_the_build_loudly_and_writes_nothing(tmp_path):
     with pytest.raises(BuildFailure) as raised:
         build_prepared(config)
 
-    assert raised.value.code == "scaler_zero_iqr"
+    assert raised.value.code == "zero_iqr"
     assert FEATURE in str(raised.value)
+    assert raised.value.report_path is not None
+    assert json.loads(raised.value.report_path.read_text())["code"] == "zero_iqr"
     assert not (tmp_path / "prepared").exists()
 
 
