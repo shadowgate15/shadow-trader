@@ -6,9 +6,9 @@ open parent, check bar size, compute features per Instrument, check alignment
 ``boundary_check``, then write the three Datasets and the build record. Every
 check runs before the first write, so a failed build leaves nothing behind.
 
-The scaler (fit on train, written before the Datasets) is not built yet: its slot
-sits between ``boundary_check`` and the writes, and ``boundary_check`` accepts
-extra checks, which is where the scaler's fit-range check plugs in.
+Between the split and ``boundary_check`` the train Dataset is hashed and the
+scaler fit on the train role only; its fit-range check joins ``boundary_check``
+and its artifact is written before the three Datasets (whose manifests name it).
 """
 
 from __future__ import annotations
@@ -35,6 +35,12 @@ from .anomaly import DEFAULT_POLICY, AnomalyPolicy, apply_anomaly_policy
 from .boundary import BoundaryCheckFailure, BoundaryContext, Check, boundary_check
 from .config import PreparedConfig
 from .dataset import PreparedRef, build_id_of, plan_prepared, write_build_record
+from .scaler import (
+    ScalerFitError,
+    fit_scaler,
+    scaler_fit_range_check,
+    write_scaler,
+)
 from .spec import FeatureSpec, compute_features
 from .split import (
     ROLES,
@@ -45,8 +51,8 @@ from .split import (
     split_frame,
 )
 
-# Checks run after the built-in boundary checks. STUB: the scaler ticket adds its
-# "scaler fit range inside train" check here.
+# Checks run after the built-in boundary checks (the scaler's fit-range check is
+# appended per build, since it closes over that build's fitted scaler).
 EXTRA_CHECKS: tuple[tuple[str, Check], ...] = ()
 
 
@@ -143,33 +149,49 @@ def build_prepared(
             end=bounds.snapped["test_end"],
         )
         roles = {pair: split_frame(f, bounds, embargo) for pair, f in frames.items()}
-        # Scaler slot (not built yet): fit on each Instrument's train split here
-        # and add its fit-range check to EXTRA_CHECKS.
-        checks = [
-            boundary_check(
-                BoundaryContext(
-                    bounds, roles[pair], frames[pair]["open_time"], embargo, spec
-                ),
-                extra=EXTRA_CHECKS,
+        plans = {
+            role: plan_prepared(
+                {pair: roles[pair][role].frame for pair in instruments},
+                parent_ingestion=parent_id,
+                spec=spec,
+                policy=config.anomaly,
+                identity=dataset_identity(config.split, embargo, role),
+            )
+            for role in ROLES
+        }
+        contexts = {
+            pair: BoundaryContext(
+                bounds, roles[pair], frames[pair]["open_time"], embargo, spec
             )
             for pair in instruments
-        ]
+        }
+
+        def run_checks(extra: Sequence[tuple[str, Check]]) -> list[dict[str, Any]]:
+            return [boundary_check(contexts[pair], extra=extra) for pair in instruments]
+
+        try:
+            scaler = fit_scaler(
+                pl.concat([roles[pair]["train"].frame for pair in instruments]),
+                spec,
+                policy_hash=config.anomaly.hash,
+                fit_dataset=plans["train"].dataset_id,
+            )
+        except ScalerFitError:
+            # A degenerate split (empty or unusable train) is reported by its own
+            # boundary check first; only then is the fit failure the cause.
+            run_checks(EXTRA_CHECKS)
+            raise
+        checks = run_checks(
+            (*EXTRA_CHECKS, ("scaler_fit_range", scaler_fit_range_check(scaler)))
+        )
         checked = checks[0]  # every Instrument passed, on the same grid
+    except ScalerFitError as exc:
+        raise BuildFailure(str(exc), exc.code) from exc
     except AlignmentFailure as exc:
         raise BuildFailure(str(exc), exc.code) from exc
     except (SplitFailure, BoundaryCheckFailure) as exc:
         raise BuildFailure(f"{exc.code}: {exc.detail}", exc.code) from exc
 
-    plans = {
-        role: plan_prepared(
-            {pair: roles[pair][role].frame for pair in instruments},
-            parent_ingestion=parent_id,
-            spec=spec,
-            policy=config.anomaly,
-            identity=dataset_identity(config.split, embargo, role),
-        )
-        for role in ROLES
-    }
     ids = {role: plan.dataset_id for role, plan in plans.items()}
     split_block = {"scheme": config.split.scheme, **bounds.block()}
     shared: dict[str, Any] = {
@@ -179,9 +201,11 @@ def build_prepared(
         "split": split_block,
         "embargo_bars": embargo,
         "boundary_check": checked,
+        "scaler": scaler.scaler_id,
     }
     build_id = build_id_of(shared, ids)
 
+    write_scaler(config.paths.prepared_root, scaler)
     progress.start("write", len(ROLES))
     datasets: dict[str, PreparedRef] = {}
     for role in ROLES:
@@ -200,6 +224,7 @@ def build_prepared(
                     for pair in instruments
                 },
                 "boundary_check": checked,
+                "scaler": {"id": scaler.scaler_id, "fit": role == "train"},
             },
         )
         progress.advance(role)
