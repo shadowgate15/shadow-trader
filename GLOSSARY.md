@@ -72,7 +72,7 @@ The period after a live Bar closes during which late or catch-up quotes may stil
 _Avoid_: Grace period, lookback
 
 **Feature spec**:
-The versioned definition of every `feat_*` column a prepared Dataset carries: what each is computed from and over how many Bars it looks back. Each feature value for a Bar depends only on that Bar and earlier ones. A change to any definition produces a new version, never an edit.
+The versioned definition of every `feat_*` column a prepared Dataset carries: what each is computed from and over how many Bars it looks back. Each feature value for a Bar depends only on that Bar and earlier ones. A change to any definition produces a new version, never an edit. The volatility family is the sample std of 1-Bar returns over horizons 3 and up (a std of one return is undefined, so there is no 1-Bar volatility column) plus ATR over close from spec v4.
 _Avoid_: Feature config, indicator list
 
 **Warm-up**:
@@ -80,7 +80,7 @@ The stretch at the start of a Session, or of a Dataset, during which a history-d
 _Avoid_: Burn-in, priming
 
 **Usable Bar**:
-A prepared Bar that is priced, carries no distrusted quality flag, and has every history-dependent feature present. Everything else is unusable, and a Bar records why. Raw rows are never changed to express this.
+A prepared Bar that is priced, carries no distrusted quality flag, and has every history-dependent feature present. Everything else is unusable, and a Bar records why; a feature left null by a missing input (such as `tick_count`) is reported as `window_contains_gap`. Raw rows are never changed to express this.
 _Avoid_: Valid Bar, clean Bar
 
 **Embargo**:
