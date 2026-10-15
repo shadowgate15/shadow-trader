@@ -3,7 +3,8 @@
 Tables: ``[paths]`` (ingestion ``data_root`` and a separate ``prepared_root``),
 ``[input]`` (the explicit parent ingestion ``dataset_id``, never "latest"),
 ``[spec]`` (the feature spec version), ``[split]`` (the chronological scheme and
-its explicit UTC bounds) and ``[embargo]`` (the required ``episode_bars``).
+its explicit UTC bounds), ``[embargo]`` (the required ``episode_bars``) and the
+optional ``[report]`` (advisory warning thresholds; reporting only, never hashed).
 Unknown keys are errors. CLI flags may
 override only the config path.
 """
@@ -12,7 +13,7 @@ from __future__ import annotations
 
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,16 @@ class EmbargoConfig:
 
 
 @dataclass(frozen=True)
+class ReportConfig:
+    """Advisory warning thresholds: reporting only, never hashed, never fatal."""
+
+    min_usable_fraction: float = 0.5  # low_usable_fraction below this, per role
+    max_distrusted_flag_fraction: float = 0.01  # high_distrusted_flag_fraction
+    max_scaler_clip_fraction: float = 0.05  # scaler_clip_fraction_high
+    min_rows: int = 2000  # short_dataset: fewer rows than this per Instrument
+
+
+@dataclass(frozen=True)
 class PreparedConfig:
     paths: PathsConfig
     input: InputConfig
@@ -69,6 +80,7 @@ class PreparedConfig:
     split: SplitConfig
     embargo: EmbargoConfig
     anomaly: AnomalyPolicy = DEFAULT_POLICY
+    report: ReportConfig = ReportConfig()
 
     @property
     def feature_spec(self) -> FeatureSpec:
@@ -113,7 +125,9 @@ def load_prepared_config(path: Path) -> PreparedConfig:
         raise ConfigError(f"invalid TOML in {path}: {exc}") from None
 
     _check_keys(
-        raw, {"paths", "input", "spec", "anomaly", "split", "embargo"}, "config"
+        raw,
+        {"paths", "input", "spec", "anomaly", "split", "embargo", "report"},
+        "config",
     )
     paths = _table(raw, "paths", {"data_root", "prepared_root"})
     _check_keys(paths, {"data_root", "prepared_root"}, "[paths]")
@@ -175,6 +189,20 @@ def load_prepared_config(path: Path) -> PreparedConfig:
                 raise ConfigError("anomaly.distrusted_flags must be a list of strings")
             policy = AnomalyPolicy(tuple(flags))
 
+    report = ReportConfig()
+    if "report" in raw:
+        table = _table(raw, "report", set())
+        _check_keys(table, {f.name for f in fields(ReportConfig)}, "[report]")
+        values: dict[str, Any] = {}
+        for key, value in table.items():
+            if key == "min_rows":
+                values[key] = _checked(value, int, f"report.{key}")
+            elif isinstance(value, int | float) and not isinstance(value, bool):
+                values[key] = float(value)
+            else:
+                raise ConfigError(f"report.{key} must be a number")
+        report = ReportConfig(**values)
+
     return PreparedConfig(
         PathsConfig(data_root, prepared_root),
         InputConfig(dataset_id),
@@ -182,4 +210,5 @@ def load_prepared_config(path: Path) -> PreparedConfig:
         split,
         EmbargoConfig(episode_bars),
         policy,
+        report,
     )

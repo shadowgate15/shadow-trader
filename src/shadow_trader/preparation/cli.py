@@ -18,6 +18,7 @@ from shadow_trader.ingestion.config import ConfigError
 
 from .build import BuildFailure, build_prepared
 from .config import load_prepared_config
+from .report import console_summary
 from .verify import verify_build
 
 EXIT_OK = 0
@@ -82,9 +83,18 @@ def run_prepare(args: argparse.Namespace) -> int:
         except BuildFailure as exc:
             progress.close()
             print(f"build failed: {exc}", file=sys.stderr)
+            if exc.report_path is not None:
+                print(f"failed-build report: {exc.report_path}", file=sys.stderr)
             return EXIT_BUILD_FAILURE
         progress.close()
-    print(f"built prepared build {ref.build_id}")
-    for role, dataset in ref.datasets.items():
-        print(f"{role} {dataset.dataset_id}")
+    for line in console_summary(
+        ref.build_id,
+        {role: dataset.dataset_id for role, dataset in ref.datasets.items()},
+        ref.record["scaler"],
+        ref.report["roles"],
+        ref.record["boundary_check"],
+        ref.report["warnings"],
+        ref.report_path,
+    ):
+        print(line)
     return EXIT_OK
