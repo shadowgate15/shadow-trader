@@ -92,9 +92,11 @@ def test_the_policy_table_is_named_policy_and_anomaly_is_refused(tmp_path):
         write_prepared_toml(tmp_path, "abc", '[policy]\ndistrusted_flags = ["a"]\n')
     )
     assert config.anomaly.distrusted_flags == ("a",)
-    with pytest.raises(ConfigError, match="unknown key.*anomaly"):
+    with pytest.raises(ConfigError, match=r"unknown key.*anomaly"):
         load_prepared_config(
-            write_prepared_toml(tmp_path, "abc", '[anomaly]\ndistrusted_flags = ["a"]\n')
+            write_prepared_toml(
+                tmp_path, "abc", '[anomaly]\ndistrusted_flags = ["a"]\n'
+            )
         )
 
 

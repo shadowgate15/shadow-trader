@@ -1,8 +1,8 @@
 import os
+from datetime import UTC, datetime
 
 import polars as pl
 import pyarrow.parquet as pq
-from datetime import UTC, datetime
 
 from shadow_trader.preparation import build_prepared, open_prepared
 

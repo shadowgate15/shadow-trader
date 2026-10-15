@@ -206,11 +206,17 @@ def test_spec_v4_adds_atr_over_close_to_the_volatility_family(tmp_path):
 def test_v4_hash_covers_scaling_and_lookback_while_old_pins_stay():
     v4 = SPECS[V4]
     first = v4.columns[0]
-    rescaled = replace(v4, columns=(replace(first, scaling="identity"), *v4.columns[1:]))
-    deeper = replace(v4, columns=(replace(first, lookback=first.lookback + 1), *v4.columns[1:]))
+    rescaled = replace(
+        v4, columns=(replace(first, scaling="identity"), *v4.columns[1:])
+    )
+    deeper = replace(
+        v4, columns=(replace(first, lookback=first.lookback + 1), *v4.columns[1:])
+    )
 
     assert rescaled.hash != v4.hash and deeper.hash != v4.hash
     # versions 1-3 keep their original hash payload, so their pins are unchanged
     old = SPECS[3]
-    again = replace(old, columns=(replace(old.columns[0], scaling="identity"), *old.columns[1:]))
+    again = replace(
+        old, columns=(replace(old.columns[0], scaling="identity"), *old.columns[1:])
+    )
     assert again.hash == old.hash

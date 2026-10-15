@@ -10,12 +10,13 @@ definition without bumping the version is caught by the golden tests.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import polars as pl
+
+from ._io import canonical_json
 
 BAR_SIZE_5 = 5
 RETURN_HORIZONS = (1, 3, 6, 12, 24, 48, 288)  # Bars: short, medium, long
@@ -95,8 +96,7 @@ class FeatureSpec:
             "bar_size": self.bar_size,
             "columns": columns,
         }
-        payload = json.dumps(description, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode()).hexdigest()
+        return hashlib.sha256(canonical_json(description)).hexdigest()
 
 
 def _log_return(horizon: int) -> Callable[[], pl.Expr]:

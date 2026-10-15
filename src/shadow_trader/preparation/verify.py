@@ -21,7 +21,7 @@ from shadow_trader.ingestion.dataset import open_dataset
 
 from .boundary import BUILT_IN, BoundaryContext
 from .config import PreparedConfig
-from .dataset import _dataset_hash, _partition_hash, build_id_of, open_prepared
+from .dataset import build_id_of, dataset_hash, open_prepared, partition_hash
 from .scaler import Scaler, fit_matches_train, load_scaler, scaler_fit_range_check
 from .spec import SPECS
 from .split import BOUND_NAMES, ROLES, RoleSlice, SplitBounds
@@ -81,7 +81,7 @@ def verify_build(config: PreparedConfig, build_id: str) -> list[VerifyCheck]:
             hashes: dict[str, str] = {}
             bad = []
             for part in manifest["partitions"]:
-                digest = _partition_hash(pq.read_table(dataset.path / part["path"]))
+                digest = partition_hash(pq.read_table(dataset.path / part["path"]))
                 if digest != part["hash"]:
                     bad.append(part["path"])
                 hashes[part["path"].rsplit("/", 1)[0].removeprefix("bars/")] = digest
@@ -90,7 +90,7 @@ def verify_build(config: PreparedConfig, build_id: str) -> list[VerifyCheck]:
             spec = SPECS[manifest["feature_spec"]["version"]]
             if spec.hash != manifest["feature_spec"]["hash"]:
                 return f"{role}: feature spec hash differs from the recorded one"
-            expected = _dataset_hash(
+            expected = dataset_hash(
                 manifest["parent_ingestion"],
                 spec.hash,
                 manifest["anomaly_policy"]["hash"],

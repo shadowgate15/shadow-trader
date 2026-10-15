@@ -14,12 +14,12 @@ and adds the two derived columns.
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 import polars as pl
 
+from ._io import canonical_json
 from .spec import FeatureSpec
 
 POLICY_VERSION = 1
@@ -49,12 +49,14 @@ class AnomalyPolicy:
 
     @property
     def hash(self) -> str:
-        payload = json.dumps(
-            {"version": self.version, "distrusted_flags": list(self.distrusted_flags)},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        return hashlib.sha256(payload.encode()).hexdigest()
+        return hashlib.sha256(
+            canonical_json(
+                {
+                    "version": self.version,
+                    "distrusted_flags": list(self.distrusted_flags),
+                }
+            )
+        ).hexdigest()
 
 
 DEFAULT_POLICY = AnomalyPolicy()

@@ -151,9 +151,7 @@ def prepared_with_polars(version):
 def test_check_compat_warns_on_a_polars_version_difference():
     scaler = scaler_for(FEATURE_SPEC.hash, FEATURE_SPEC.policy_hash)
 
-    warnings = check_compat(
-        scaler, FEATURE_SPEC, dataset=prepared_with_polars("0.0.1")
-    )
+    warnings = check_compat(scaler, FEATURE_SPEC, dataset=prepared_with_polars("0.0.1"))
 
     assert len(warnings) == 1
     assert "polars" in warnings[0]

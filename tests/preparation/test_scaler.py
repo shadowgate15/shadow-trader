@@ -32,7 +32,7 @@ from .synthetic import (
 FEATURE = "feat_ret_1"
 
 
-def spec_hash_of(scaler):  # noqa: N802 - the frame's spec hash, as its manifest records it
+def spec_hash_of(scaler):
     return scaler.artifact["spec_hash"]
 
 

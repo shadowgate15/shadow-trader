@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,6 +22,7 @@ from typing import Any, overload
 
 import polars as pl
 
+from ._io import atomic_write_json, canonical_json
 from .boundary import BoundaryContext, Check
 from .spec import FeatureSpec
 
@@ -46,10 +46,6 @@ class ScalerFitError(ScalerError):
         self.detail = detail
 
 
-def _canonical(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-
-
 @dataclass(frozen=True)
 class Scaler:
     """A loaded scaler artifact."""
@@ -58,7 +54,7 @@ class Scaler:
 
     @property
     def scaler_id(self) -> str:
-        return hashlib.sha256(_canonical(self.artifact)).hexdigest()
+        return hashlib.sha256(canonical_json(self.artifact)).hexdigest()
 
     def _columns(self) -> set[str]:
         return {
@@ -83,13 +79,9 @@ class Scaler:
         return chain.otherwise(None).alias(name)
 
     @overload
-    def apply(
-        self, frame: pl.DataFrame, *, spec_hash: str | None
-    ) -> pl.DataFrame: ...
+    def apply(self, frame: pl.DataFrame, *, spec_hash: str | None) -> pl.DataFrame: ...
     @overload
-    def apply(
-        self, frame: pl.LazyFrame, *, spec_hash: str | None
-    ) -> pl.LazyFrame: ...
+    def apply(self, frame: pl.LazyFrame, *, spec_hash: str | None) -> pl.LazyFrame: ...
     def apply(
         self, frame: pl.DataFrame | pl.LazyFrame, *, spec_hash: str | None
     ) -> pl.DataFrame | pl.LazyFrame:
@@ -265,18 +257,15 @@ def write_scaler(prepared_root: Path, scaler: Scaler) -> Path:
     path = scaler_path(prepared_root, scaler.scaler_id)
     if path.is_file():
         return path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(scaler.artifact, indent=2, sort_keys=True))
-    os.replace(tmp, path)
+    atomic_write_json(path, scaler.artifact)
     return path
 
 
-def load_scaler(data_root: Path, scaler_id: str) -> Scaler:
+def load_scaler(prepared_root: Path, scaler_id: str) -> Scaler:
     """Load a scaler from the prepared root; its content must hash to the id."""
-    path = scaler_path(data_root, scaler_id)
+    path = scaler_path(prepared_root, scaler_id)
     if not path.is_file():
-        raise ScalerError(f"scaler {scaler_id} not found under {data_root}")
+        raise ScalerError(f"scaler {scaler_id} not found under {prepared_root}")
     scaler = Scaler(json.loads(path.read_text()))
     if scaler.scaler_id != scaler_id:
         raise ScalerError(

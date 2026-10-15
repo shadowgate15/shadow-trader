@@ -10,8 +10,6 @@ build; their thresholds come from the unhashed ``[report]`` config table.
 
 from __future__ import annotations
 
-import json
-import os
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -20,6 +18,7 @@ from typing import Any
 
 import polars as pl
 
+from ._io import atomic_write_json
 from .config import PreparedConfig, ReportConfig
 from .scaler import ROBUST, Scaler
 
@@ -39,10 +38,7 @@ _STAMP = "%Y-%m-%dT%H:%M:%SZ"
 
 def write_json(path: Path, document: Mapping[str, Any]) -> None:
     """Write ``document`` by atomic rename (overwriting any earlier report)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(document, indent=2, sort_keys=True))
-    os.replace(tmp, path)
+    atomic_write_json(path, document)
 
 
 def report_path(prepared_root: Path, build_id: str) -> Path:
