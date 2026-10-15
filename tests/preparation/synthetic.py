@@ -103,3 +103,31 @@ def write_prepared_toml(root: Path, dataset_id: str, extra: str = "") -> Path:
 
 def prepared_config(root: Path, dataset_id: str, extra: str = "") -> PreparedConfig:
     return load_prepared_config(write_prepared_toml(root, dataset_id, extra))
+
+
+def write_bars(root: Path, bars: dict[str, list[Bar]], bar_size: int = 5) -> DatasetRef:
+    """Write caller-supplied Bars as a synthetic ingestion Dataset."""
+    path = root / "ingest.toml"
+    names = ", ".join(f'"{pair}"' for pair in bars)
+    path.write_text(
+        f'[paths]\ndata_root = "{root / "ingestion"}"\n'
+        f"[build]\ninstruments = [{names}]\n"
+    )
+    return write_dataset(load_config(path), bar_size, bars)
+
+
+def prepared_frame(root: Path, bars: list[Bar], version: int = 2):
+    """Build a prepared Dataset from one Instrument's Bars; return its frame."""
+    from shadow_trader.preparation import build_prepared, open_prepared
+
+    parent = write_bars(root, {"EURUSD": bars})
+    config = prepared_config(root, parent.dataset_id)
+    toml = (
+        (root / "prepare.toml")
+        .read_text()
+        .replace("version = 1", f"version = {version}")
+    )
+    (root / "prepare.toml").write_text(toml)
+    config = load_prepared_config(root / "prepare.toml")
+    ref = build_prepared(config)
+    return open_prepared(config.paths.prepared_root, ref.dataset_id).read("EURUSD")
