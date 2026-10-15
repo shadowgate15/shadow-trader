@@ -102,7 +102,7 @@ def test_manifest_records_policy_and_counts(tmp_path):
 
 def test_configured_flag_set_changes_rows_and_dataset_hash(tmp_path):
     default, _ = build(tmp_path)
-    ref, dataset = build(tmp_path, '[anomaly]\ndistrusted_flags = ["zero_spread"]\n')
+    ref, dataset = build(tmp_path, '[policy]\ndistrusted_flags = ["zero_spread"]\n')
     frame = dataset.read("EURUSD")
 
     assert ref.manifest["anomaly_policy"]["distrusted_flags"] == ["zero_spread"]

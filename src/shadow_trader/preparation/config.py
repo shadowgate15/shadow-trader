@@ -2,7 +2,8 @@
 
 Tables: ``[paths]`` (ingestion ``data_root`` and a separate ``prepared_root``),
 ``[input]`` (the explicit parent ingestion ``dataset_id``, never "latest"),
-``[spec]`` (the feature spec version), ``[split]`` (the chronological scheme and
+``[spec]`` (the feature spec version), the optional ``[policy]`` (the anomaly
+policy's ``distrusted_flags``), ``[split]`` (the chronological scheme and
 its explicit UTC bounds), ``[embargo]`` (the required ``episode_bars``) and the
 optional ``[report]`` (advisory warning thresholds; reporting only, never hashed).
 Unknown keys are errors. CLI flags may
@@ -126,7 +127,7 @@ def load_prepared_config(path: Path) -> PreparedConfig:
 
     _check_keys(
         raw,
-        {"paths", "input", "spec", "anomaly", "split", "embargo", "report"},
+        {"paths", "input", "spec", "policy", "split", "embargo", "report"},
         "config",
     )
     paths = _table(raw, "paths", {"data_root", "prepared_root"})
@@ -178,15 +179,15 @@ def load_prepared_config(path: Path) -> PreparedConfig:
         raise ConfigError("embargo.episode_bars must be >= 1")
 
     policy = DEFAULT_POLICY
-    if "anomaly" in raw:
-        anomaly = _table(raw, "anomaly", set())
-        _check_keys(anomaly, {"distrusted_flags"}, "[anomaly]")
-        if "distrusted_flags" in anomaly:
-            flags = anomaly["distrusted_flags"]
+    if "policy" in raw:
+        table = _table(raw, "policy", set())
+        _check_keys(table, {"distrusted_flags"}, "[policy]")
+        if "distrusted_flags" in table:
+            flags = table["distrusted_flags"]
             if not isinstance(flags, list) or not all(
                 isinstance(f, str) for f in flags
             ):
-                raise ConfigError("anomaly.distrusted_flags must be a list of strings")
+                raise ConfigError("policy.distrusted_flags must be a list of strings")
             policy = AnomalyPolicy(tuple(flags))
 
     report = ReportConfig()

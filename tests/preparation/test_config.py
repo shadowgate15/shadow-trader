@@ -79,11 +79,22 @@ def test_anomaly_flags_default_and_are_validated(tmp_path):
     )
     with pytest.raises(ConfigError, match="list of strings"):
         load_prepared_config(
-            write_prepared_toml(tmp_path, "abc", "[anomaly]\ndistrusted_flags = 3\n")
+            write_prepared_toml(tmp_path, "abc", "[policy]\ndistrusted_flags = 3\n")
         )
     with pytest.raises(ConfigError, match="unknown key"):
         load_prepared_config(
-            write_prepared_toml(tmp_path, "abc", "[anomaly]\nbogus = 1\n")
+            write_prepared_toml(tmp_path, "abc", "[policy]\nbogus = 1\n")
+        )
+
+
+def test_the_policy_table_is_named_policy_and_anomaly_is_refused(tmp_path):
+    config = load_prepared_config(
+        write_prepared_toml(tmp_path, "abc", '[policy]\ndistrusted_flags = ["a"]\n')
+    )
+    assert config.anomaly.distrusted_flags == ("a",)
+    with pytest.raises(ConfigError, match="unknown key.*anomaly"):
+        load_prepared_config(
+            write_prepared_toml(tmp_path, "abc", '[anomaly]\ndistrusted_flags = ["a"]\n')
         )
 
 
