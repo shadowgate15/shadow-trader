@@ -170,12 +170,18 @@ def split_frame(
     return slices
 
 
-def dataset_identity(split: SplitConfig, embargo: int, role: str) -> dict[str, Any]:
-    """What the Dataset hash covers beyond rows: scheme, bounds, E and role."""
-    nominal = {name: getattr(split, name) for name in BOUND_NAMES}
+def dataset_identity(
+    split: SplitConfig, bounds: SplitBounds, embargo: int, role: str
+) -> dict[str, Any]:
+    """What the Dataset hash covers beyond rows: scheme, bounds, E and role.
+
+    Both the nominal bounds as configured and the bounds snapped to Session
+    opens are covered.
+    """
     return {
         "scheme": split.scheme,
-        "bounds": _iso(nominal),
+        "bounds": _iso(bounds.nominal),
+        "snapped_bounds": _iso(bounds.snapped),
         "embargo_bars": embargo,
         "role": role,
     }

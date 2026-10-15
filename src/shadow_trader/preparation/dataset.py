@@ -166,6 +166,13 @@ def _builder_version() -> str | None:
         return None
 
 
+def _split_series(manifest: Mapping[str, Any]) -> tuple[object, object] | None:
+    identity = manifest.get("identity")
+    if identity is None:
+        return None
+    return identity.get("scheme"), identity.get("bounds", {}).get("train_start")
+
+
 def _previous_same_role(
     prepared_root: Path,
     dataset_id: str,
@@ -174,9 +181,13 @@ def _previous_same_role(
 ) -> Mapping[str, Any] | None:
     """The latest other complete Dataset of the same role and series, if any.
 
-    Same role, bar size, Instruments, spec hash and policy hash. Only a source of
-    lineage and of linkable partitions: a link still needs a matching row hash.
+    Same role, bar size, Instruments, spec hash and policy hash, and the same
+    split series (scheme and nominal ``train_start``; both absent for a Dataset
+    written without a split), so an unrelated split is never a lineage parent.
+    Only a source of lineage and of linkable partitions: a link still needs a
+    matching row hash.
     """
+    series = _split_series(manifest)
     found: list[tuple[str, Mapping[str, Any]]] = []
     for path in (prepared_root / "datasets").glob("*/manifest.json"):
         other = json.loads(path.read_text())
@@ -188,6 +199,7 @@ def _previous_same_role(
             and other["instruments"] == manifest["instruments"]
             and other["feature_spec"]["hash"] == manifest["feature_spec"]["hash"]
             and other["anomaly_policy"]["hash"] == manifest["anomaly_policy"]["hash"]
+            and _split_series(other) == series
         ):
             found.append((other["created_at"], other))
     return max(found, key=lambda item: item[0])[1] if found else None

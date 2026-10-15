@@ -193,7 +193,7 @@ def _build(
                 parent_ingestion=parent_id,
                 spec=spec,
                 policy=config.anomaly,
-                identity=dataset_identity(config.split, embargo, role),
+                identity=dataset_identity(config.split, bounds, embargo, role),
             )
             for role in ROLES
         }
