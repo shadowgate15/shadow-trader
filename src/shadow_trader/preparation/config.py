@@ -16,6 +16,7 @@ from typing import Any
 
 from shadow_trader.ingestion.config import ConfigError
 
+from .anomaly import DEFAULT_POLICY, AnomalyPolicy
 from .spec import SPECS, FeatureSpec
 
 __all__ = ["ConfigError", "PreparedConfig", "load_prepared_config"]
@@ -42,6 +43,7 @@ class PreparedConfig:
     paths: PathsConfig
     input: InputConfig
     spec: SpecConfig
+    anomaly: AnomalyPolicy = DEFAULT_POLICY
 
     @property
     def feature_spec(self) -> FeatureSpec:
@@ -79,7 +81,7 @@ def load_prepared_config(path: Path) -> PreparedConfig:
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"invalid TOML in {path}: {exc}") from None
 
-    _check_keys(raw, {"paths", "input", "spec"}, "config")
+    _check_keys(raw, {"paths", "input", "spec", "anomaly"}, "config")
     paths = _table(raw, "paths", {"data_root", "prepared_root"})
     _check_keys(paths, {"data_root", "prepared_root"}, "[paths]")
     data_root = Path(_checked(paths["data_root"], str, "paths.data_root"))
@@ -105,8 +107,21 @@ def load_prepared_config(path: Path) -> PreparedConfig:
         known = ", ".join(map(str, sorted(SPECS)))
         raise ConfigError(f"unknown spec.version {version}; known: {known}")
 
+    policy = DEFAULT_POLICY
+    if "anomaly" in raw:
+        anomaly = _table(raw, "anomaly", set())
+        _check_keys(anomaly, {"distrusted_flags"}, "[anomaly]")
+        if "distrusted_flags" in anomaly:
+            flags = anomaly["distrusted_flags"]
+            if not isinstance(flags, list) or not all(
+                isinstance(f, str) for f in flags
+            ):
+                raise ConfigError("anomaly.distrusted_flags must be a list of strings")
+            policy = AnomalyPolicy(tuple(flags))
+
     return PreparedConfig(
         PathsConfig(data_root, prepared_root),
         InputConfig(dataset_id),
         SpecConfig(version),
+        policy,
     )

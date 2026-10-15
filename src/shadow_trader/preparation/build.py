@@ -17,6 +17,7 @@ from shadow_trader.ingestion.dataset import (
 )
 from shadow_trader.ingestion.progress import NULL_PROGRESS, ProgressSink
 
+from .anomaly import apply_anomaly_policy
 from .config import PreparedConfig
 from .dataset import PreparedRef, write_prepared
 from .spec import compute_features
@@ -66,13 +67,18 @@ def build_prepared(
     for instrument in instruments:
         bars = parent.read(instrument)
         rows = [{**vars(bar), "quality_flags": list(bar.quality_flags)} for bar in bars]
-        frames[instrument] = compute_features(_bars_frame(rows), spec).collect()
+        featured = compute_features(_bars_frame(rows), spec).collect()
+        frames[instrument] = apply_anomaly_policy(featured, spec, config.anomaly)
         progress.advance(instrument)
     progress.done()
 
     progress.start("write", 1)
     ref = write_prepared(
-        config.paths.prepared_root, frames, parent_ingestion=parent_id, spec=spec
+        config.paths.prepared_root,
+        frames,
+        parent_ingestion=parent_id,
+        spec=spec,
+        policy=config.anomaly,
     )
     progress.advance(ref.dataset_id)
     progress.done()

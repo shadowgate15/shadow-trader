@@ -22,7 +22,13 @@ BARS_PER_SESSION = 16
 GAP_INDEX = 5  # the Gap slot in the first Session
 
 
-def priced(instrument: str, opened: datetime, session: datetime, i: int) -> Bar:
+def priced(
+    instrument: str,
+    opened: datetime,
+    session: datetime,
+    i: int,
+    flags: tuple[str, ...] = (),
+) -> Bar:
     close = BASE * 2.0**i
     return Bar(
         instrument=instrument,
@@ -37,22 +43,37 @@ def priced(instrument: str, opened: datetime, session: datetime, i: int) -> Bar:
         is_gap=False,
         session_id=session,
         is_rollover=False,
+        quality_flags=flags,
     )
 
 
-def session_bars(instrument: str, session: datetime) -> list[Bar]:
+def session_bars(
+    instrument: str,
+    session: datetime,
+    count: int = BARS_PER_SESSION,
+    gaps: tuple[int, ...] = (GAP_INDEX,),
+    flags: dict[int, tuple[str, ...]] | None = None,
+) -> list[Bar]:
+    """One Session of Bars; ``gaps`` and ``flags`` apply to the first Session only."""
+    first = session == SESSION_1
     bars: list[Bar] = []
-    for i in range(BARS_PER_SESSION):
+    for i in range(count):
         opened = session + timedelta(minutes=5 * i)
-        if session == SESSION_1 and i == GAP_INDEX:
+        if first and i in gaps:
             bars.append(gap_bar(instrument, opened, session))
         else:
-            bars.append(priced(instrument, opened, session, i))
+            bar_flags = (flags or {}).get(i, ()) if first else ()
+            bars.append(priced(instrument, opened, session, i, bar_flags))
     return bars
 
 
 def write_ingestion(
-    root: Path, instruments: tuple[str, ...] = ("EURUSD",), bar_size: int = 5
+    root: Path,
+    instruments: tuple[str, ...] = ("EURUSD",),
+    bar_size: int = 5,
+    count: int = BARS_PER_SESSION,
+    gaps: tuple[int, ...] = (GAP_INDEX,),
+    flags: dict[int, tuple[str, ...]] | None = None,
 ) -> DatasetRef:
     """Write a synthetic ingestion Dataset under ``root / "ingestion"``."""
     path = root / "ingest.toml"
@@ -62,7 +83,8 @@ def write_ingestion(
         f"[build]\ninstruments = [{names}]\n"
     )
     bars = {
-        pair: session_bars(pair, SESSION_1) + session_bars(pair, SESSION_2)
+        pair: session_bars(pair, SESSION_1, count, gaps, flags)
+        + session_bars(pair, SESSION_2, count, gaps, flags)
         for pair in instruments
     }
     return write_dataset(load_config(path), bar_size, bars)
