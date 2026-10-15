@@ -98,13 +98,22 @@ def _log_return(horizon: int) -> Callable[[], pl.Expr]:
 def _volatility_family() -> tuple[FeatureColumn, ...]:
     def make(horizon: int) -> Callable[[], pl.Expr]:
         def expression() -> pl.Expr:
-            # Every return in the window must exist (min_samples), so a single
-            # null makes the std null; the policy adds the Gap/flag rule.
-            value = (
-                _one_bar_return()
-                .rolling_std(horizon, min_samples=horizon)
-                .over("session_id")
+            # Every return in the window must exist, so a single null makes the
+            # std null; the policy adds the Gap/flag rule. The first return of a
+            # Session is null, so a window never crosses a Session start. The std
+            # is a per-window group aggregate rather than the sliding-sum
+            # rolling_std, whose rounding depends on where the series starts and
+            # would break bitwise tail/batch parity (ADR 0004).
+            same_session = pl.col("session_id") == pl.col("session_id").shift(1)
+            step = pl.when(same_session).then(
+                (pl.col("close") / pl.col("close").shift(1)).log()
             )
+            index = pl.int_range(pl.len(), dtype=pl.Int64)
+            # a window holds horizon + 1 Bars: the first only seeds its neighbour
+            period = f"{horizon + 1}i"
+            std = step.std(ddof=1).rolling(index_column=index, period=period)
+            seen = step.count().rolling(index_column=index, period=period)
+            value = pl.when(seen == horizon).then(std)
             return pl.when(value.is_finite()).then(value).otherwise(None)
 
         return expression
