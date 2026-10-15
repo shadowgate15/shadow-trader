@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from shadow_trader.preparation import (
+    SPECS,
     BuildFailure,
     Scaler,
     ScalerError,
@@ -241,3 +242,52 @@ def test_boundary_check_block_lists_the_scaler_check(tmp_path):
 
     checks = dataset(config, ref, "train").manifest["boundary_check"]["checks"]
     assert "scaler_fit_range" in checks
+
+
+def test_fit_range_check_compares_against_the_split_bounds_not_the_fit_frame(
+    tmp_path,
+):
+    # A fit range that starts before the train bound lies outside the split even
+    # though a frame-derived range would never reveal it.
+    from shadow_trader.preparation.boundary import BoundaryContext
+    from shadow_trader.preparation.split import RoleSlice, SplitBounds
+
+    _, config, ref = build(tmp_path)
+    train = dataset(config, ref, "train")
+    scaler = load_scaler(config.paths.prepared_root, train.manifest["scaler"]["id"])
+    frame = train.read("EURUSD")
+    first = frame["open_time"][0]
+    bound = {"train_start": first, "validation_start": SESSION_2, "test_start": None}
+    ctx = BoundaryContext(
+        SplitBounds(bound, bound),
+        {"train": RoleSlice("train", frame, frame.height, 0, None, None)},
+        frame["open_time"],
+        0,
+        SPECS[1],
+    )
+    assert scaler_module.scaler_fit_range_check(scaler)(ctx) is None
+
+    # The frame itself is unchanged; only the split bound moves past the fit start.
+    late = {**bound, "train_start": frame["open_time"][10]}
+    moved = BoundaryContext(
+        SplitBounds(late, late), ctx.roles, ctx.parent_open_times, 0, SPECS[1]
+    )
+    detail = scaler_module.scaler_fit_range_check(scaler)(moved)
+    assert detail is not None and "train bounds" in detail
+
+
+def test_fit_matches_train_compares_artifact_to_the_stored_train_rows(tmp_path):
+    _, config, ref = build(tmp_path)
+    train = dataset(config, ref, "train")
+    scaler = load_scaler(config.paths.prepared_root, train.manifest["scaler"]["id"])
+    frames = {"EURUSD": train.read("EURUSD")}
+
+    assert scaler_module.fit_matches_train(scaler, frames, train.dataset_id) is None
+
+    other = Scaler({**scaler.artifact, "fit_dataset": "someone-else"})
+    detail = scaler_module.fit_matches_train(other, frames, train.dataset_id)
+    assert detail is not None and "fit_dataset" in detail
+    start = scaler.artifact["fit_range"][0]
+    shifted = Scaler({**scaler.artifact, "fit_range": [start, "2030-01-01T00:00:00"]})
+    detail = scaler_module.fit_matches_train(shifted, frames, train.dataset_id)
+    assert detail is not None and "fit range" in detail

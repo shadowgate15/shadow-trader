@@ -188,7 +188,12 @@ def fit_scaler(
 
 
 def scaler_fit_range_check(scaler: Scaler) -> Check:
-    """The ``boundary_check`` check: the fit range lies inside the train range."""
+    """The ``boundary_check`` check: the fit range lies inside the train range.
+
+    Judged twice, independently of how the fit range was derived: against the
+    Instrument's actual train rows and against the split's train bounds
+    (``train_start`` up to, not including, ``validation_start``).
+    """
 
     def check(ctx: BoundaryContext) -> str | None:
         frame = ctx.roles["train"].frame
@@ -204,9 +209,49 @@ def scaler_fit_range_check(scaler: Scaler) -> Check:
                 f"scaler fit range {start.isoformat()}..{end.isoformat()} is not "
                 f"inside the train range {low.isoformat()}..{high.isoformat()}"
             )
+        bound_start, bound_end = ctx.bounds.start("train"), ctx.bounds.end("train")
+        if start < bound_start or (bound_end is not None and end >= bound_end):
+            return (
+                f"scaler fit range {start.isoformat()}..{end.isoformat()} is not "
+                f"inside the train bounds {bound_start.isoformat()}.."
+                f"{'open' if bound_end is None else bound_end.isoformat()}"
+            )
         return None
 
     return check
+
+
+def fit_matches_train(
+    scaler: Scaler, train: Mapping[str, pl.DataFrame], train_dataset_id: str
+) -> str | None:
+    """Compare a stored artifact with the stored train Dataset it claims to be fit on.
+
+    ``train`` maps each Instrument to its train rows. Returns a detail string on
+    mismatch: the artifact's ``fit_dataset`` must be the train Dataset's id and
+    its ``fit_range`` the first and last ``open_time`` over all Instruments.
+    """
+    if scaler.artifact["fit_dataset"] != train_dataset_id:
+        return (
+            f"scaler fit_dataset {scaler.artifact['fit_dataset']} is not the train "
+            f"Dataset {train_dataset_id}"
+        )
+    lows, highs = zip(
+        *(
+            frame.select(
+                pl.col("open_time").min().alias("low"),
+                pl.col("open_time").max().alias("high"),
+            ).row(0)
+            for frame in train.values()
+        ),
+        strict=True,
+    )
+    actual = [min(lows).isoformat(), max(highs).isoformat()]
+    if list(scaler.artifact["fit_range"]) != actual:
+        return (
+            f"scaler fit range {scaler.artifact['fit_range']} differs from the "
+            f"train Dataset's range {actual}"
+        )
+    return None
 
 
 def scaler_path(prepared_root: Path, scaler_id: str) -> Path:

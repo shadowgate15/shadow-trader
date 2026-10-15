@@ -86,6 +86,27 @@ def test_removed_scaler_artifact_fails_scaler_check(tmp_path, capsys):
     assert any("scaler" in line for line in failed_lines(capsys.readouterr().out))
 
 
+def test_manifest_scaler_ref_differing_from_the_build_record_fails(tmp_path, capsys):
+    config, build_id, ids, prepared = built(tmp_path, capsys)
+    path = prepared / "datasets" / ids["validation"] / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["scaler"]["id"] = "0" * 64
+    path.write_text(json.dumps(manifest))
+
+    assert verify(config, build_id) == 1
+
+    assert any("scaler.ref" in line for line in failed_lines(capsys.readouterr().out))
+
+
+def test_intact_build_reports_the_scaler_fit_checks(tmp_path, capsys):
+    config, build_id, _, _ = built(tmp_path, capsys)
+
+    assert verify(config, build_id) == 0
+
+    out = capsys.readouterr().out
+    assert "scaler.ref" in out and "scaler.fit_matches_train" in out
+
+
 def test_unknown_build_fails_and_bad_config_is_exit_2(tmp_path, capsys):
     config, _, _, _ = built(tmp_path, capsys)
 
