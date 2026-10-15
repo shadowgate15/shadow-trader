@@ -13,7 +13,7 @@ import hashlib
 import json
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import polars as pl
 
@@ -23,6 +23,18 @@ RETURN_HORIZONS = (1, 3, 6, 12, 24, 48, 288)  # Bars: short, medium, long
 VOLATILITY_HORIZONS = (3, 6, 12, 24, 48, 288)
 ATR_WINDOW = 14  # Bars of true range averaged to scale intrabar shape
 MEDIAN_WINDOW = 48  # Bars in the rolling median behind spread and activity
+EMA_SPANS = (12, 24)  # Bars; trend distance is close minus the EMA, in ATR units
+RSI_WINDOW = 14
+WILDER_WINDOW = 14  # ATR (and RSI) smoothing: alpha = 1 / 14
+LONG_MEMORY_TOLERANCE = 1e-9  # default absolute parity tolerance for EMA/RSI/ATR
+
+
+def _decay_bars(alpha: float) -> int:
+    """Bars after which an input's weight in a recursive average is below 1e-9."""
+    return math.ceil(math.log(1e-9) / math.log(1 - alpha))
+
+
+ATR_LOOKBACK = _decay_bars(1 / WILDER_WINDOW)  # 280
 
 
 @dataclass(frozen=True)
@@ -35,6 +47,9 @@ class FeatureColumn:
     lookback: int  # Bars of history the value needs
     expression: Callable[[], pl.Expr]
     always_valid: bool = False  # time/session columns: never nulled by the policy
+    # Absolute parity tolerance between batch and tail evaluation. 0.0 means
+    # bitwise (finite memory); recursive EMA/RSI/ATR columns declare 1e-9.
+    tolerance: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -48,11 +63,20 @@ class FeatureSpec:
         return tuple(c.name for c in self.columns)
 
     @property
+    def longest_lookback(self) -> int:
+        """Bars of history the deepest column needs; sizes the Embargo."""
+        return max((c.lookback for c in self.columns), default=0)
+
+    @property
     def hash(self) -> str:
         description = {
             "version": self.version,
             "bar_size": self.bar_size,
-            "columns": [[c.name, c.definition] for c in self.columns],
+            "columns": [
+                [c.name, c.definition]
+                + ([c.tolerance, c.lookback] if c.tolerance else [])
+                for c in self.columns
+            ],
         }
         payload = json.dumps(description, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode()).hexdigest()
@@ -125,7 +149,125 @@ def _atr() -> pl.Expr:
     )
 
 
-def _shape_family() -> tuple[FeatureColumn, ...]:
+def _wilder(value: pl.Expr, first: int) -> pl.Expr:
+    """Wilder-smoothed average (alpha = 1/14) seeded with a plain 14-value mean.
+
+    ``value`` first exists at Session position ``first``; the seed is the mean of
+    its first 14 values and sits at position ``first + 13``. A null input is
+    skipped (the average carries forward unchanged). Per Session.
+    """
+    return _seeded_average(value, first, WILDER_WINDOW, 1 / WILDER_WINDOW)
+
+
+def _seeded_average(value: pl.Expr, first: int, n: int, alpha: float) -> pl.Expr:
+    position = pl.int_range(pl.len()).over("session_id")
+    seed_at = first + n - 1
+    start = (
+        pl.when(position < seed_at)
+        .then(None)
+        .when(position == seed_at)
+        .then(value.rolling_mean(n, min_samples=n).over("session_id"))
+        .otherwise(value)
+    )
+    return start.ewm_mean(alpha=alpha, adjust=False, ignore_nulls=True).over(
+        "session_id"
+    )
+
+
+def _true_range() -> pl.Expr:
+    previous = pl.col("close").shift(1).over("session_id")
+    return (
+        pl.when(previous.is_null())
+        .then(None)
+        .otherwise(
+            pl.max_horizontal(
+                pl.col("high") - pl.col("low"),
+                (pl.col("high") - previous).abs(),
+                (pl.col("low") - previous).abs(),
+            )
+        )
+    )
+
+
+def _wilder_atr() -> pl.Expr:
+    """Wilder ATR: seeded at Session position 14 with the mean of true ranges 1..14."""
+    return _wilder(_true_range(), first=1)
+
+
+def _trend_family() -> tuple[FeatureColumn, ...]:
+    def ema_distance(span: int) -> Callable[[], pl.Expr]:
+        def expression() -> pl.Expr:
+            ema = _seeded_average(pl.col("close"), 0, span, 2 / (span + 1))
+            return _finite((pl.col("close") - ema) / _wilder_atr())
+
+        return expression
+
+    def rsi() -> pl.Expr:
+        change = pl.col("close") - pl.col("close").shift(1).over("session_id")
+        gain = _wilder(change.clip(lower_bound=0), first=1)
+        loss = _wilder((-change).clip(lower_bound=0), first=1)
+        value = (
+            pl.when((gain == 0) & (loss == 0))
+            .then(50.0)
+            .otherwise(100 * gain / (gain + loss))
+        )
+        return _finite(value)
+
+    columns = tuple(
+        FeatureColumn(
+            name=f"feat_trend_ema_{span}",
+            family="trend",
+            definition=(
+                f"(close - ema) / atr; ema span {span} seeded with the SMA of the "
+                f"first {span} closes in session_id, alpha = 2/({span}+1); atr is "
+                f"Wilder ATR (alpha = 1/{WILDER_WINDOW}) seeded with the mean of "
+                f"true ranges 1..{WILDER_WINDOW}; a null input is skipped; "
+                "lookback = Bars until an older input weighs under 1e-9"
+            ),
+            lookback=ATR_LOOKBACK,
+            expression=ema_distance(span),
+            tolerance=LONG_MEMORY_TOLERANCE,
+        )
+        for span in EMA_SPANS
+    )
+    rsi_column = FeatureColumn(
+        name=f"feat_trend_rsi_{RSI_WINDOW}",
+        family="trend",
+        definition=(
+            f"100 * avg_gain / (avg_gain + avg_loss) of 1-Bar close changes, "
+            f"Wilder smoothed (alpha = 1/{RSI_WINDOW}) and seeded with the mean "
+            f"of the first {RSI_WINDOW} changes in session_id; 50 when both "
+            "are zero; lookback = Bars until an older input weighs under 1e-9"
+        ),
+        lookback=ATR_LOOKBACK,
+        expression=rsi,
+        tolerance=LONG_MEMORY_TOLERANCE,
+    )
+    return (*columns, rsi_column)
+
+
+def _wilder_shape_family() -> tuple[FeatureColumn, ...]:
+    return tuple(
+        replace(
+            column,
+            definition=column.definition.replace(
+                f"atr = mean of the last {ATR_WINDOW} true ranges within session_id "
+                "(true range null without a previous close)",
+                f"atr = Wilder ATR (alpha = 1/{WILDER_WINDOW}) seeded with the mean "
+                f"of true ranges 1..{WILDER_WINDOW} within session_id; "
+                "lookback = Bars until an older input weighs under 1e-9",
+            ),
+            lookback=ATR_LOOKBACK,
+            tolerance=LONG_MEMORY_TOLERANCE,
+        )
+        for column in _shape_family(_wilder_atr)
+    )
+
+
+def _shape_family(
+    atr: Callable[[], pl.Expr] | None = None,
+) -> tuple[FeatureColumn, ...]:
+    atr = atr or _atr
     body_top = pl.max_horizontal("open", "close")
     body_bottom = pl.min_horizontal("open", "close")
     parts = {
@@ -136,7 +278,7 @@ def _shape_family() -> tuple[FeatureColumn, ...]:
     }
 
     def make(numerator: Callable[[], pl.Expr]) -> Callable[[], pl.Expr]:
-        return lambda: _finite(numerator() / _atr())
+        return lambda: _finite(numerator() / atr())
 
     return tuple(
         FeatureColumn(
@@ -262,6 +404,16 @@ SPECS: dict[int, FeatureSpec] = {
         + _volatility_family()
         + _shape_family()
         + _cost_and_activity_family()
+        + _time_family(),
+    ),
+    3: FeatureSpec(
+        3,
+        BAR_SIZE_5,
+        _returns_family()
+        + _volatility_family()
+        + _wilder_shape_family()
+        + _cost_and_activity_family()
+        + _trend_family()
         + _time_family(),
     ),
 }
