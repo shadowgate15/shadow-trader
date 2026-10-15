@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from shadow_trader.preparation import (
+    SPECS,
     BuildFailure,
     Scaler,
     ScalerError,
@@ -29,6 +30,10 @@ from .synthetic import (
 )
 
 FEATURE = "feat_ret_1"
+
+
+def spec_hash_of(scaler):
+    return scaler.artifact["spec_hash"]
 
 
 def build(tmp_path, version=1):
@@ -90,7 +95,7 @@ def test_apply_scales_robustly_clips_and_preserves_nulls(tmp_path):
     frame = dataset(config, ref, "validation").read("EURUSD")
     stats = scaler.artifact["instruments"]["EURUSD"]["columns"][FEATURE]
 
-    scaled = scaler.apply(frame)
+    scaled = scaler.apply(frame, spec_hash=spec_hash_of(scaler))
 
     assert isinstance(scaled, pl.DataFrame)
     assert scaled.columns == frame.columns
@@ -106,10 +111,10 @@ def test_apply_returns_a_lazyframe_for_a_lazyframe(tmp_path):
     config, ref, scaler = built_scaler(tmp_path)
     frame = dataset(config, ref, "validation").read("EURUSD")
 
-    lazy = scaler.apply(frame.lazy())
+    lazy = scaler.apply(frame.lazy(), spec_hash=spec_hash_of(scaler))
 
     assert isinstance(lazy, pl.LazyFrame)
-    assert lazy.collect().equals(scaler.apply(frame))
+    assert lazy.collect().equals(scaler.apply(frame, spec_hash=spec_hash_of(scaler)))
 
 
 def test_apply_refuses_a_spec_hash_mismatch(tmp_path):
@@ -120,7 +125,7 @@ def test_apply_refuses_a_spec_hash_mismatch(tmp_path):
         scaler.apply(frame, spec_hash="0" * 64)
     scaler.apply(frame, spec_hash=scaler.artifact["spec_hash"])  # matches: fine
     with pytest.raises(ScalerError, match="columns"):
-        scaler.apply(frame.drop(FEATURE))
+        scaler.apply(frame.drop(FEATURE), spec_hash=spec_hash_of(scaler))
 
 
 def test_time_sin_cos_and_rollover_are_identity_and_the_rest_robust(tmp_path):
@@ -139,7 +144,7 @@ def test_time_sin_cos_and_rollover_are_identity_and_the_rest_robust(tmp_path):
     assert columns["feat_time_hour_sin"] == {"method": "identity"}
 
     frame = dataset(config, ref, "validation").read("EURUSD")
-    scaled = scaler.apply(frame)
+    scaled = scaler.apply(frame, spec_hash=spec_hash_of(scaler))
     for name in identity:
         assert scaled[name].equals(frame[name])
 
@@ -241,3 +246,62 @@ def test_boundary_check_block_lists_the_scaler_check(tmp_path):
 
     checks = dataset(config, ref, "train").manifest["boundary_check"]["checks"]
     assert "scaler_fit_range" in checks
+
+
+def test_fit_range_check_compares_against_the_split_bounds_not_the_fit_frame(
+    tmp_path,
+):
+    # A fit range that starts before the train bound lies outside the split even
+    # though a frame-derived range would never reveal it.
+    from shadow_trader.preparation.boundary import BoundaryContext
+    from shadow_trader.preparation.split import RoleSlice, SplitBounds
+
+    _, config, ref = build(tmp_path)
+    train = dataset(config, ref, "train")
+    scaler = load_scaler(config.paths.prepared_root, train.manifest["scaler"]["id"])
+    frame = train.read("EURUSD")
+    first = frame["open_time"][0]
+    bound = {"train_start": first, "validation_start": SESSION_2, "test_start": None}
+    ctx = BoundaryContext(
+        SplitBounds(bound, bound),
+        {"train": RoleSlice("train", frame, frame.height, 0, None, None)},
+        frame["open_time"],
+        0,
+        SPECS[1],
+    )
+    assert scaler_module.scaler_fit_range_check(scaler)(ctx) is None
+
+    # The frame itself is unchanged; only the split bound moves past the fit start.
+    late = {**bound, "train_start": frame["open_time"][10]}
+    moved = BoundaryContext(
+        SplitBounds(late, late), ctx.roles, ctx.parent_open_times, 0, SPECS[1]
+    )
+    detail = scaler_module.scaler_fit_range_check(scaler)(moved)
+    assert detail is not None and "train bounds" in detail
+
+
+def test_fit_matches_train_compares_artifact_to_the_stored_train_rows(tmp_path):
+    _, config, ref = build(tmp_path)
+    train = dataset(config, ref, "train")
+    scaler = load_scaler(config.paths.prepared_root, train.manifest["scaler"]["id"])
+    frames = {"EURUSD": train.read("EURUSD")}
+
+    assert scaler_module.fit_matches_train(scaler, frames, train.dataset_id) is None
+
+    other = Scaler({**scaler.artifact, "fit_dataset": "someone-else"})
+    detail = scaler_module.fit_matches_train(other, frames, train.dataset_id)
+    assert detail is not None and "fit_dataset" in detail
+    start = scaler.artifact["fit_range"][0]
+    shifted = Scaler({**scaler.artifact, "fit_range": [start, "2030-01-01T00:00:00"]})
+    detail = scaler_module.fit_matches_train(shifted, frames, train.dataset_id)
+    assert detail is not None and "fit range" in detail
+
+
+def test_apply_requires_the_spec_hash_unless_explicitly_opted_out(tmp_path):
+    config, ref, scaler = built_scaler(tmp_path)
+    frame = dataset(config, ref, "validation").read("EURUSD")
+
+    with pytest.raises(TypeError, match="spec_hash"):
+        scaler.apply(frame)  # type: ignore[call-arg]
+    # None is the explicit opt-out; the feat_* column set is still checked.
+    assert scaler.apply(frame, spec_hash=None).columns == frame.columns

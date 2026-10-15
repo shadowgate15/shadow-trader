@@ -312,3 +312,23 @@ def test_extra_checks_plug_in_after_the_built_in_ones(tmp_path, monkeypatch):
     failure = attempt(tmp_path)
 
     assert failure.code == "boundary_check.scaler_fit_range"
+
+
+def test_dataset_identity_covers_the_snapped_bounds_as_well_as_the_nominal(tmp_path):
+    from shadow_trader.preparation.config import SplitConfig
+    from shadow_trader.preparation.split import SplitBounds, dataset_identity
+
+    config = SplitConfig("chronological", SESSION_1, SESSION_2, SESSION_3)
+    nominal = {
+        "train_start": SESSION_1,
+        "validation_start": SESSION_2,
+        "test_start": SESSION_3,
+        "test_end": None,
+    }
+    snapped = {**nominal, "test_start": SESSION_3 + timedelta(days=7)}
+
+    same = dataset_identity(config, SplitBounds(nominal, nominal), 290, "train")
+    moved = dataset_identity(config, SplitBounds(nominal, snapped), 290, "train")
+
+    assert same["bounds"] == moved["bounds"]
+    assert same["snapped_bounds"] != moved["snapped_bounds"]

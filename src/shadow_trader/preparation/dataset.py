@@ -29,6 +29,7 @@ import pyarrow.parquet as pq
 
 from shadow_trader.ingestion.dataset import BAR_SCHEMA
 
+from ._io import atomic_write_json, canonical_json
 from .anomaly import DEFAULT_POLICY, AnomalyPolicy, policy_summary
 from .spec import FeatureSpec
 
@@ -98,26 +99,14 @@ def _check_version(value: object, where: object) -> None:
         )
 
 
-def _canonical_json(value: Any) -> bytes:
-    return json.dumps(
-        value, sort_keys=True, separators=(",", ":"), default=_isoformat
-    ).encode()
-
-
-def _isoformat(value: object) -> str:
-    if isinstance(value, datetime):
-        return value.astimezone(UTC).isoformat()
-    raise TypeError(f"cannot canonicalise {value!r}")
-
-
-def _partition_hash(table: pa.Table) -> str:
+def partition_hash(table: pa.Table) -> str:
     digest = hashlib.sha256()
     for row in table.to_pylist():  # canonical order: sorted by open_time
-        digest.update(_canonical_json(list(row.values())) + b"\n")
+        digest.update(canonical_json(list(row.values())) + b"\n")
     return digest.hexdigest()
 
 
-def _dataset_hash(
+def dataset_hash(
     parent: str,
     spec_hash: str,
     policy_hash: str,
@@ -129,7 +118,7 @@ def _dataset_hash(
     # when given, so a Dataset written without a split keeps its plain hash.
     extra = {} if identity is None else {"identity": identity}
     return hashlib.sha256(
-        _canonical_json(
+        canonical_json(
             {
                 **extra,
                 "kind": KIND,
@@ -166,6 +155,13 @@ def _builder_version() -> str | None:
         return None
 
 
+def _split_series(manifest: Mapping[str, Any]) -> tuple[object, object] | None:
+    identity = manifest.get("identity")
+    if identity is None:
+        return None
+    return identity.get("scheme"), identity.get("bounds", {}).get("train_start")
+
+
 def _previous_same_role(
     prepared_root: Path,
     dataset_id: str,
@@ -174,9 +170,13 @@ def _previous_same_role(
 ) -> Mapping[str, Any] | None:
     """The latest other complete Dataset of the same role and series, if any.
 
-    Same role, bar size, Instruments, spec hash and policy hash. Only a source of
-    lineage and of linkable partitions: a link still needs a matching row hash.
+    Same role, bar size, Instruments, spec hash and policy hash, and the same
+    split series (scheme and nominal ``train_start``; both absent for a Dataset
+    written without a split), so an unrelated split is never a lineage parent.
+    Only a source of lineage and of linkable partitions: a link still needs a
+    matching row hash.
     """
+    series = _split_series(manifest)
     found: list[tuple[str, Mapping[str, Any]]] = []
     for path in (prepared_root / "datasets").glob("*/manifest.json"):
         other = json.loads(path.read_text())
@@ -188,6 +188,7 @@ def _previous_same_role(
             and other["instruments"] == manifest["instruments"]
             and other["feature_spec"]["hash"] == manifest["feature_spec"]["hash"]
             and other["anomaly_policy"]["hash"] == manifest["anomaly_policy"]["hash"]
+            and _split_series(other) == series
         ):
             found.append((other["created_at"], other))
     return max(found, key=lambda item: item[0])[1] if found else None
@@ -251,8 +252,12 @@ class PreparedPlan:
                     Path(prepared_root) / "datasets" / prepared_parent["dataset_id"]
                 )
                 try:
+                    # Rehash the bytes actually on disk: a manifest hash alone
+                    # would let a corrupted earlier partition propagate.
+                    if partition_hash(pq.read_table(source / rel)) != digest:
+                        raise OSError("stored partition does not match its hash")
                     os.link(source / rel, dest)
-                except OSError:  # e.g. no hardlink support: fall back to a write
+                except (OSError, pa.ArrowException):  # unlinkable or damaged
                     pq.write_table(table, dest)
             else:
                 pq.write_table(table, dest)
@@ -275,7 +280,7 @@ class PreparedPlan:
             "builder_git_revision": _git_revision(),
             "created_at": (created_at or datetime.now(UTC)).isoformat(),
         }
-        _write_manifest(target, manifest)
+        atomic_write_json(target / "manifest.json", manifest)
         return PreparedRef(self.dataset_id, target, manifest)
 
 
@@ -304,10 +309,10 @@ def plan_prepared(
                 {"schema_version": str(SCHEMA_VERSION), "bar_size": str(spec.bar_size)}
             )
             key = f"instrument={pair}/year={year}"
-            parts[key] = (pair, _partition_hash(table), table.num_rows, table)
+            parts[key] = (pair, partition_hash(table), table.num_rows, table)
 
     hashes = {key: part[1] for key, part in parts.items()}
-    content_hash = _dataset_hash(
+    content_hash = dataset_hash(
         parent_ingestion, spec.hash, policy.hash, spec.bar_size, hashes, identity
     )
     manifest: dict[str, Any] = {
@@ -351,19 +356,12 @@ def write_prepared(
     return plan.write(prepared_root, created_at=created_at)
 
 
-def _write_manifest(target: Path, manifest: Mapping[str, Any]) -> None:
-    """Write the manifest last, by atomic rename."""
-    tmp = target / "manifest.json.tmp"
-    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True))
-    os.replace(tmp, target / "manifest.json")
-
-
-def open_prepared(data_root: Path, dataset_id: str) -> PreparedDataset:
+def open_prepared(prepared_root: Path, dataset_id: str) -> PreparedDataset:
     """Open a prepared Dataset; refuse a missing manifest or unknown schema_version.
 
-    ``data_root`` is the prepared root (``paths.prepared_root``).
+    ``prepared_root`` is ``paths.prepared_root``, not the ingestion root.
     """
-    path = Path(data_root) / "datasets" / dataset_id
+    path = Path(prepared_root) / "datasets" / dataset_id
     manifest_path = path / "manifest.json"
     if not manifest_path.is_file():
         raise PreparedDatasetError(f"dataset {dataset_id} has no manifest (incomplete)")
@@ -392,7 +390,7 @@ def _build_hashed(
 def build_id_of(shared: Mapping[str, Any], dataset_ids: Mapping[str, str]) -> str:
     """Hash of the three Dataset ids and the shared refs."""
     return hashlib.sha256(
-        _canonical_json(_build_hashed(shared, dataset_ids))
+        canonical_json(_build_hashed(shared, dataset_ids))
     ).hexdigest()
 
 
@@ -418,8 +416,5 @@ def write_build_record(
         "polars_version": pl.__version__,
         "created_at": (created_at or datetime.now(UTC)).isoformat(),
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(record, indent=2, sort_keys=True))
-    os.replace(tmp, path)
+    atomic_write_json(path, record)
     return BuildRecord(build_id, path, record)

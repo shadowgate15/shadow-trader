@@ -62,7 +62,7 @@ def test_spec_v2_declares_lookback_for_each_new_column():
     assert spec.version == 2 and spec.hash != SPECS[1].hash
     assert SPECS[1].names == tuple(f"feat_ret_{h}" for h in (1, 3, 6, 12, 24, 48, 288))
     with pytest.raises(KeyError):
-        SPECS[4]
+        SPECS[5]
 
 
 def test_spec_hashes_are_pinned_so_a_column_change_needs_a_version_bump():
@@ -72,6 +72,9 @@ def test_spec_hashes_are_pinned_so_a_column_change_needs_a_version_bump():
     )
     assert SPECS[2].hash == (
         "16d17ab3cd78190297595e44cfc8b1354a81f7bd52fa49ebc697254b520b1bba"
+    )
+    assert SPECS[4].hash == (
+        "186e0c4d8a145369fea34875014b93b16813eecd4682f62fbe388ce34eb180ba"
     )
     assert len(SPECS[2].names) == 26 and len(set(SPECS[2].names)) == 26
 

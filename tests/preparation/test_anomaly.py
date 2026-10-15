@@ -102,10 +102,43 @@ def test_manifest_records_policy_and_counts(tmp_path):
 
 def test_configured_flag_set_changes_rows_and_dataset_hash(tmp_path):
     default, _ = build(tmp_path)
-    ref, dataset = build(tmp_path, '[anomaly]\ndistrusted_flags = ["zero_spread"]\n')
+    ref, dataset = build(tmp_path, '[policy]\ndistrusted_flags = ["zero_spread"]\n')
     frame = dataset.read("EURUSD")
 
     assert ref.manifest["anomaly_policy"]["distrusted_flags"] == ["zero_spread"]
     assert ref.dataset_id != default.dataset_id
     assert frame["unusable_reason"][INFORMATIONAL] == "distrusted_flag"
     assert frame["unusable_reason"][FLAGGED] != "distrusted_flag"
+
+
+def test_a_null_history_dependent_feature_makes_the_bar_unusable(tmp_path):
+    # Story 24: usable needs every history-dependent feat_* non-null. A missing
+    # tick_count nulls feat_act_tick (story 18) for the median window after it.
+    from dataclasses import replace
+    from datetime import timedelta
+
+    from shadow_trader.preparation import SPECS
+
+    from .synthetic import SESSION_1, prepared_frame, priced
+
+    bars = [
+        priced("EURUSD", SESSION_1 + timedelta(minutes=5 * i), SESSION_1, i % 3)
+        for i in range(700)
+    ]
+    bars = [
+        replace(b, close=1.0 + 0.001 * (i % 7), open=1.0, high=1.01, low=0.99)
+        for i, b in enumerate(bars)
+    ]
+    bars[500] = replace(bars[500], tick_count=None)
+    frame = prepared_frame(tmp_path, bars, version=3)
+
+    assert frame["feat_act_tick"][520] is None
+    history = [c.name for c in SPECS[3].columns if c.lookback > 0]
+    assert frame["usable"][520] is False
+    assert frame["unusable_reason"][520] == "window_contains_gap"
+    assert frame["usable"][650] is True
+    assert all(frame[n][650] is not None for n in history)
+    # the invariant: usable iff every history-dependent feature is non-null
+    for row in frame.iter_rows(named=True):
+        if row["usable"]:
+            assert all(row[n] is not None for n in history)

@@ -1,6 +1,9 @@
 import os
 from datetime import UTC, datetime
 
+import polars as pl
+import pyarrow.parquet as pq
+
 from shadow_trader.preparation import build_prepared, open_prepared
 
 from .synthetic import (
@@ -127,3 +130,40 @@ def test_hash_is_the_same_whether_linked_or_recomputed(tmp_path):
             fresh_config.paths.prepared_root, recomputed.datasets[role].dataset_id
         )
         assert left.read("EURUSD").equals(right.read("EURUSD"))
+
+
+def test_a_corrupted_earlier_partition_is_never_hardlinked(tmp_path):
+    first_parent = write_ingestion(tmp_path, BASE_SESSIONS)
+    _, first = build(tmp_path, first_parent)
+    old = first.datasets["train"].path / CLOSED_2022
+    table = pq.read_table(old)
+    damaged = pl.DataFrame(table).with_columns(pl.col("close") + 1.0)
+    os.unlink(old)  # the stored file is shared by link; replace, do not edit
+    pq.write_table(damaged.to_arrow().cast(table.schema), old)
+
+    grown = write_ingestion(tmp_path, (*BASE_SESSIONS, SESSION_3))
+    _, second = build(tmp_path, grown)
+
+    new = second.datasets["train"].path / CLOSED_2022
+    assert os.stat(new).st_ino != os.stat(old).st_ino
+    assert pl.DataFrame(pq.read_table(new)).equals(pl.DataFrame(table))
+
+
+def test_an_unrelated_split_is_not_chosen_as_prepared_parent(tmp_path):
+    base = write_ingestion(tmp_path, BASE_SESSIONS)
+    _, first = build(tmp_path, base)
+    # Same Instruments, spec and policy, but a different split series, built later.
+    other_split = split_toml(
+        train_start=SESSION_2023, validation_start=SESSION_1, test_start=SESSION_2
+    )
+    other_config = prepared_config(tmp_path, base.dataset_id, split=other_split)
+    other = build_prepared(other_config)
+    assert other.datasets["train"].dataset_id != first.datasets["train"].dataset_id
+
+    grown = write_ingestion(tmp_path, (*BASE_SESSIONS, SESSION_3))
+    _, second = build(tmp_path, grown)
+
+    for role in ROLES:
+        assert second.datasets[role].manifest["prepared_parent"] == (
+            first.datasets[role].dataset_id
+        )

@@ -10,12 +10,13 @@ definition without bumping the version is caught by the golden tests.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import polars as pl
+
+from ._io import canonical_json
 
 BAR_SIZE_5 = 5
 RETURN_HORIZONS = (1, 3, 6, 12, 24, 48, 288)  # Bars: short, medium, long
@@ -26,6 +27,7 @@ MEDIAN_WINDOW = 48  # Bars in the rolling median behind spread and activity
 EMA_SPANS = (12, 24)  # Bars; trend distance is close minus the EMA, in ATR units
 RSI_WINDOW = 14
 WILDER_WINDOW = 14  # ATR (and RSI) smoothing: alpha = 1 / 14
+FULL_HASH_FROM_VERSION = 4  # first spec whose hash covers lookback and scaling
 LONG_MEMORY_TOLERANCE = 1e-9  # default absolute parity tolerance for EMA/RSI/ATR
 
 
@@ -71,17 +73,30 @@ class FeatureSpec:
 
     @property
     def hash(self) -> str:
-        description = {
-            "version": self.version,
-            "bar_size": self.bar_size,
-            "columns": [
+        """SHA-256 of the canonical description of the spec.
+
+        From version 4 every column contributes its name, definition, lookback,
+        parity tolerance and scaling method. Versions 1-3 keep their original
+        payload (definition, plus lookback and tolerance only for recursive
+        columns) so their hashes, and every Dataset built from them, stay valid.
+        """
+        if self.version >= FULL_HASH_FROM_VERSION:
+            columns = [
+                [c.name, c.definition, c.lookback, c.tolerance, c.scaling]
+                for c in self.columns
+            ]
+        else:
+            columns = [
                 [c.name, c.definition]
                 + ([c.tolerance, c.lookback] if c.tolerance else [])
                 for c in self.columns
-            ],
+            ]
+        description = {
+            "version": self.version,
+            "bar_size": self.bar_size,
+            "columns": columns,
         }
-        payload = json.dumps(description, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode()).hexdigest()
+        return hashlib.sha256(canonical_json(description)).hexdigest()
 
 
 def _log_return(horizon: int) -> Callable[[], pl.Expr]:
@@ -203,6 +218,21 @@ def _true_range() -> pl.Expr:
 def _wilder_atr() -> pl.Expr:
     """Wilder ATR: seeded at Session position 14 with the mean of true ranges 1..14."""
     return _wilder(_true_range(), first=1)
+
+
+def _atr_volatility() -> FeatureColumn:
+    return FeatureColumn(
+        name="feat_vol_atr",
+        family="volatility",
+        definition=(
+            f"atr / close; atr is Wilder ATR (alpha = 1/{WILDER_WINDOW}) seeded "
+            f"with the mean of true ranges 1..{WILDER_WINDOW} within session_id; "
+            "lookback = Bars until an older input weighs under 1e-9"
+        ),
+        lookback=ATR_LOOKBACK,
+        expression=lambda: _finite(_wilder_atr() / pl.col("close")),
+        tolerance=LONG_MEMORY_TOLERANCE,
+    )
 
 
 def _trend_family() -> tuple[FeatureColumn, ...]:
@@ -423,6 +453,19 @@ SPECS: dict[int, FeatureSpec] = {
         BAR_SIZE_5,
         _returns_family()
         + _volatility_family()
+        + _wilder_shape_family()
+        + _cost_and_activity_family()
+        + _trend_family()
+        + _time_family(),
+    ),
+    # v3 plus ATR / close in the volatility family; the hash now covers every
+    # column's lookback, tolerance and scaling method.
+    4: FeatureSpec(
+        4,
+        BAR_SIZE_5,
+        _returns_family()
+        + _volatility_family()
+        + (_atr_volatility(),)
         + _wilder_shape_family()
         + _cost_and_activity_family()
         + _trend_family()

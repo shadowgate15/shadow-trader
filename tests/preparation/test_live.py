@@ -35,9 +35,9 @@ def series(count, gaps=()):
 
 
 def test_feature_spec_exposes_identity_and_warm_up():
-    spec = SPECS[3]
+    spec = SPECS[max(SPECS)]
 
-    assert FEATURE_SPEC.version == 3
+    assert FEATURE_SPEC.version == max(SPECS)
     assert FEATURE_SPEC.hash == spec.hash
     assert FEATURE_SPEC.policy_hash == DEFAULT_POLICY.hash
     assert set(FEATURE_SPEC.warm_up) == set(spec.names)
@@ -140,15 +140,25 @@ def test_check_compat_refuses_a_policy_hash_mismatch():
         check_compat(scaler, FEATURE_SPEC)
 
 
+def prepared_with_polars(version):
+    from pathlib import Path
+
+    from shadow_trader.preparation import PreparedDataset
+
+    return PreparedDataset("d", Path("."), {"polars_version": version})
+
+
 def test_check_compat_warns_on_a_polars_version_difference():
     scaler = scaler_for(FEATURE_SPEC.hash, FEATURE_SPEC.policy_hash)
 
-    warnings = check_compat(scaler, FEATURE_SPEC, manifest_polars_version="0.0.1")
+    warnings = check_compat(scaler, FEATURE_SPEC, dataset=prepared_with_polars("0.0.1"))
 
     assert len(warnings) == 1
     assert "polars" in warnings[0]
     assert "0.0.1" in warnings[0]
-    same = check_compat(scaler, FEATURE_SPEC, manifest_polars_version=pl.__version__)
+    same = check_compat(
+        scaler, FEATURE_SPEC, dataset=prepared_with_polars(pl.__version__)
+    )
     assert same == []
 
 

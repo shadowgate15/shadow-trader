@@ -26,7 +26,7 @@ EXIT_BUILD_FAILURE = 1
 EXIT_CONFIG_ERROR = 2
 
 
-def add_prepare_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def add_prepare_parser(subparsers: argparse._SubParsersAction) -> None:
     prepare = subparsers.add_parser("prepare", help="Dataset preparation.")
     commands = prepare.add_subparsers(dest="command", required=True, metavar="COMMAND")
     build = commands.add_parser(

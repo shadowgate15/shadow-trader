@@ -21,8 +21,8 @@ from shadow_trader.ingestion.dataset import open_dataset
 
 from .boundary import BUILT_IN, BoundaryContext
 from .config import PreparedConfig
-from .dataset import _dataset_hash, _partition_hash, build_id_of, open_prepared
-from .scaler import Scaler, load_scaler, scaler_fit_range_check
+from .dataset import build_id_of, dataset_hash, open_prepared, partition_hash
+from .scaler import Scaler, fit_matches_train, load_scaler, scaler_fit_range_check
 from .spec import SPECS
 from .split import BOUND_NAMES, ROLES, RoleSlice, SplitBounds
 
@@ -81,7 +81,7 @@ def verify_build(config: PreparedConfig, build_id: str) -> list[VerifyCheck]:
             hashes: dict[str, str] = {}
             bad = []
             for part in manifest["partitions"]:
-                digest = _partition_hash(pq.read_table(dataset.path / part["path"]))
+                digest = partition_hash(pq.read_table(dataset.path / part["path"]))
                 if digest != part["hash"]:
                     bad.append(part["path"])
                 hashes[part["path"].rsplit("/", 1)[0].removeprefix("bars/")] = digest
@@ -90,7 +90,7 @@ def verify_build(config: PreparedConfig, build_id: str) -> list[VerifyCheck]:
             spec = SPECS[manifest["feature_spec"]["version"]]
             if spec.hash != manifest["feature_spec"]["hash"]:
                 return f"{role}: feature spec hash differs from the recorded one"
-            expected = _dataset_hash(
+            expected = dataset_hash(
                 manifest["parent_ingestion"],
                 spec.hash,
                 manifest["anomaly_policy"]["hash"],
@@ -111,6 +111,31 @@ def verify_build(config: PreparedConfig, build_id: str) -> list[VerifyCheck]:
         return None
 
     results.append(_guard("scaler.resolves", resolve_scaler))
+
+    def scaler_refs() -> str | None:
+        # Every manifest names the scaler the build record names; only train's
+        # names it as the fit.
+        for role in ROLES:
+            ref = datasets[role].manifest["scaler"]
+            if ref["id"] != record["scaler"]:
+                return f"{role}: manifest scaler {ref['id']} is not {record['scaler']}"
+            if ref["fit"] != (role == "train"):
+                return f"{role}: manifest scaler fit flag is {ref['fit']}"
+        return None
+
+    results.append(_guard("scaler.ref", scaler_refs))
+
+    def fit_matches() -> str | None:
+        train = datasets["train"]
+        frames = {pair: train.read(pair) for pair in train.manifest["instruments"]}
+        return fit_matches_train(scaler_holder[0], frames, train.dataset_id)
+
+    if scaler_holder:
+        results.append(_guard("scaler.fit_matches_train", fit_matches))
+    else:
+        results.append(
+            VerifyCheck("scaler.fit_matches_train", "scaler did not resolve")
+        )
 
     def make_context() -> dict[str, BoundaryContext]:
         train = datasets["train"].manifest

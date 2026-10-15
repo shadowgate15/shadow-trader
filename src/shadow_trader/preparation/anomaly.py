@@ -4,6 +4,9 @@ A ``feat_*`` value is null whenever its own lookback window (the Bar and the
 ``lookback`` Bars before it, within one Session) holds a Gap Bar or a Bar
 carrying a distrusted quality flag. Windows never cross a Session start or the
 Dataset start. Each Bar gets ``usable`` and a single ``unusable_reason``.
+A Bar is usable only when every history-dependent ``feat_*`` (lookback > 0) is
+non-null; a null that survives the window rules (a missing ``tick_count``)
+is reported as ``window_contains_gap``, the last-resort reason.
 Raw rows are never altered or dropped; the policy only nulls ``feat_*`` values
 and adds the two derived columns.
 """
@@ -11,12 +14,12 @@ and adds the two derived columns.
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 import polars as pl
 
+from ._io import canonical_json
 from .spec import FeatureSpec
 
 POLICY_VERSION = 1
@@ -46,12 +49,14 @@ class AnomalyPolicy:
 
     @property
     def hash(self) -> str:
-        payload = json.dumps(
-            {"version": self.version, "distrusted_flags": list(self.distrusted_flags)},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        return hashlib.sha256(payload.encode()).hexdigest()
+        return hashlib.sha256(
+            canonical_json(
+                {
+                    "version": self.version,
+                    "distrusted_flags": list(self.distrusted_flags),
+                }
+            )
+        ).hexdigest()
 
 
 DEFAULT_POLICY = AnomalyPolicy()
@@ -81,6 +86,7 @@ def apply_anomaly_policy(
     # (lookback 0 means the Bar itself); only lookback > 0 sets the warm-up.
     windowed = [c for c in spec.columns if not c.always_valid]
     horizon = max((c.lookback for c in windowed), default=0)
+    history = [c.name for c in windowed if c.lookback > 0]
     distrusted = pl.Series(list(policy.distrusted_flags), dtype=pl.String)
 
     gap = pl.col("is_gap")
@@ -115,6 +121,12 @@ def apply_anomaly_policy(
             .then(pl.lit("dataset_start"))
             .otherwise(pl.lit("session_warm_up"))
         )
+        # Story 24: usable needs every history-dependent feat_* non-null. A null
+        # left over after the policy came from a missing input (e.g. tick_count
+        # null nulls feat_act_tick); the closest fixed reason is a window that
+        # holds a bad Bar, so it is reported as window_contains_gap.
+        .when(pl.any_horizontal(pl.lit(False), *(pl.col(n).is_null() for n in history)))
+        .then(pl.lit("window_contains_gap"))
         .otherwise(None)
     )
     return (
