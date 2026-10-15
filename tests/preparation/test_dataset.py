@@ -8,13 +8,16 @@ from shadow_trader.ingestion.dataset import open_dataset
 from shadow_trader.preparation import SPECS, build_prepared, open_prepared
 from shadow_trader.preparation.dataset import PreparedDatasetError
 
-from .synthetic import prepared_config, write_ingestion
+from .synthetic import BARS_PER_SESSION, EMBARGO, prepared_config, write_ingestion
+
+KEPT = BARS_PER_SESSION - EMBARGO
 
 
 def build(tmp_path, **kwargs):
+    """Build all three Datasets; return the parent, config and the train ref."""
     parent = write_ingestion(tmp_path)
     config = prepared_config(tmp_path, parent.dataset_id)
-    return parent, config, build_prepared(config, **kwargs)
+    return parent, config, build_prepared(config, **kwargs).datasets["train"]
 
 
 def test_layout_is_partitioned_by_instrument_and_year_in_a_separate_root(tmp_path):
@@ -28,7 +31,7 @@ def test_layout_is_partitioned_by_instrument_and_year_in_a_separate_root(tmp_pat
     assert [p.name for p in ingestion_datasets.iterdir()] == [parent.dataset_id]
     assert (
         open_dataset(config.paths.data_root, parent.dataset_id).manifest["row_count"]
-        == 32
+        == 3 * BARS_PER_SESSION
     )
 
 
@@ -47,7 +50,7 @@ def test_manifest_records_lineage_spec_and_unhashed_provenance(tmp_path):
         "hash": spec.hash,
         "columns": list(spec.names),
     }
-    assert manifest["row_count"] == 32
+    assert manifest["row_count"] == KEPT
     assert manifest["dataset_id"] == manifest["content_hash"] == ref.dataset_id
     for provenance in ("polars_version", "created_at", "builder_git_revision"):
         assert provenance in manifest
@@ -57,7 +60,7 @@ def test_rebuilding_gives_the_same_id_whatever_the_provenance(tmp_path):
     from shadow_trader.preparation.dataset import write_prepared
 
     _, config, first = build(tmp_path)
-    second = build_prepared(config)
+    second = build_prepared(config).datasets["train"]
     assert first.dataset_id == second.dataset_id
 
     frame = open_prepared(config.paths.prepared_root, first.dataset_id).read("EURUSD")
@@ -68,6 +71,7 @@ def test_rebuilding_gives_the_same_id_whatever_the_provenance(tmp_path):
         parent_ingestion=first.manifest["parent_ingestion"],
         spec=SPECS[1],
         created_at=datetime(2030, 1, 1, tzinfo=UTC),
+        identity=first.manifest["identity"],
     )
     assert again.dataset_id == first.dataset_id
     assert again.manifest["created_at"] != first.manifest["created_at"]

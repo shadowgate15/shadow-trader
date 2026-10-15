@@ -1,8 +1,10 @@
 """Preparation configuration: a TOML file validated into frozen dataclasses.
 
 Tables: ``[paths]`` (ingestion ``data_root`` and a separate ``prepared_root``),
-``[input]`` (the explicit parent ingestion ``dataset_id``, never "latest") and
-``[spec]`` (the feature spec version). Unknown keys are errors. CLI flags may
+``[input]`` (the explicit parent ingestion ``dataset_id``, never "latest"),
+``[spec]`` (the feature spec version), ``[split]`` (the chronological scheme and
+its explicit UTC bounds) and ``[embargo]`` (the required ``episode_bars``).
+Unknown keys are errors. CLI flags may
 override only the config path.
 """
 
@@ -11,6 +13,7 @@ from __future__ import annotations
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -39,10 +42,32 @@ class SpecConfig:
 
 
 @dataclass(frozen=True)
+class SplitConfig:
+    """Chronological split: half-open ranges from each start to the next one.
+
+    Bounds are nominal; the build snaps each forward to the next Session open.
+    ``test_end`` is optional (the test range then runs to the end of the parent).
+    """
+
+    scheme: str
+    train_start: datetime
+    validation_start: datetime
+    test_start: datetime
+    test_end: datetime | None = None
+
+
+@dataclass(frozen=True)
+class EmbargoConfig:
+    episode_bars: int  # required, >= 1, no default
+
+
+@dataclass(frozen=True)
 class PreparedConfig:
     paths: PathsConfig
     input: InputConfig
     spec: SpecConfig
+    split: SplitConfig
+    embargo: EmbargoConfig
     anomaly: AnomalyPolicy = DEFAULT_POLICY
 
     @property
@@ -72,6 +97,12 @@ def _checked[T](value: Any, kind: type[T], name: str) -> T:
     return value
 
 
+def _utc(value: Any, name: str) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ConfigError(f"{name} must be a TOML datetime with a UTC offset (Z)")
+    return value.astimezone(UTC)
+
+
 def load_prepared_config(path: Path) -> PreparedConfig:
     """Load and validate a config file; raise ConfigError on any problem."""
     try:
@@ -81,7 +112,9 @@ def load_prepared_config(path: Path) -> PreparedConfig:
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"invalid TOML in {path}: {exc}") from None
 
-    _check_keys(raw, {"paths", "input", "spec", "anomaly"}, "config")
+    _check_keys(
+        raw, {"paths", "input", "spec", "anomaly", "split", "embargo"}, "config"
+    )
     paths = _table(raw, "paths", {"data_root", "prepared_root"})
     _check_keys(paths, {"data_root", "prepared_root"}, "[paths]")
     data_root = Path(_checked(paths["data_root"], str, "paths.data_root"))
@@ -107,6 +140,29 @@ def load_prepared_config(path: Path) -> PreparedConfig:
         known = ", ".join(map(str, sorted(SPECS)))
         raise ConfigError(f"unknown spec.version {version}; known: {known}")
 
+    split_keys = {"scheme", "train_start", "validation_start", "test_start", "test_end"}
+    split_table = _table(
+        raw, "split", {"scheme", "train_start", "validation_start", "test_start"}
+    )
+    _check_keys(split_table, split_keys, "[split]")
+    scheme = _checked(split_table["scheme"], str, "split.scheme")
+    if scheme != "chronological":
+        raise ConfigError(f"unknown split.scheme {scheme!r}; known: chronological")
+    test_end = split_table.get("test_end")
+    split = SplitConfig(
+        scheme,
+        _utc(split_table["train_start"], "split.train_start"),
+        _utc(split_table["validation_start"], "split.validation_start"),
+        _utc(split_table["test_start"], "split.test_start"),
+        None if test_end is None else _utc(test_end, "split.test_end"),
+    )
+
+    embargo_table = _table(raw, "embargo", {"episode_bars"})
+    _check_keys(embargo_table, {"episode_bars"}, "[embargo]")
+    episode_bars = _checked(embargo_table["episode_bars"], int, "embargo.episode_bars")
+    if episode_bars < 1:
+        raise ConfigError("embargo.episode_bars must be >= 1")
+
     policy = DEFAULT_POLICY
     if "anomaly" in raw:
         anomaly = _table(raw, "anomaly", set())
@@ -123,5 +179,7 @@ def load_prepared_config(path: Path) -> PreparedConfig:
         PathsConfig(data_root, prepared_root),
         InputConfig(dataset_id),
         SpecConfig(version),
+        split,
+        EmbargoConfig(episode_bars),
         policy,
     )

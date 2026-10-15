@@ -56,5 +56,7 @@ def run_prepare(args: argparse.Namespace) -> int:
             print(f"build failed: {exc}", file=sys.stderr)
             return EXIT_BUILD_FAILURE
         progress.close()
-    print(f"built prepared dataset {ref.dataset_id}")
+    print(f"built prepared build {ref.build_id}")
+    for role, dataset in ref.datasets.items():
+        print(f"{role} {dataset.dataset_id}")
     return EXIT_OK

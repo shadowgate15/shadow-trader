@@ -123,10 +123,15 @@ def _dataset_hash(
     policy_hash: str,
     bar_size: int,
     partitions: Mapping[str, str],
+    identity: Mapping[str, Any] | None = None,
 ) -> str:
+    # ``identity`` (split scheme and bounds, Embargo E, role) joins the hash only
+    # when given, so a Dataset written without a split keeps its plain hash.
+    extra = {} if identity is None else {"identity": identity}
     return hashlib.sha256(
         _canonical_json(
             {
+                **extra,
                 "kind": KIND,
                 "schema_version": SCHEMA_VERSION,
                 "parent_ingestion": parent,
@@ -161,19 +166,71 @@ def _builder_version() -> str | None:
         return None
 
 
-def write_prepared(
-    prepared_root: Path,
+@dataclass(frozen=True)
+class PreparedPlan:
+    """A prepared Dataset whose content hash is known but which is not written yet.
+
+    Planning first lets a build learn all three Dataset ids (and so its own id)
+    before any manifest, which names the siblings and the build, is written.
+    """
+
+    dataset_id: str
+    _frames: Mapping[str, pl.DataFrame]
+    _parts: Mapping[str, tuple[str, str, int, pa.Table]]
+    _manifest: Mapping[str, Any]
+
+    def write(
+        self,
+        prepared_root: Path,
+        manifest_extra: Mapping[str, Any] | None = None,
+        created_at: datetime | None = None,
+    ) -> PreparedRef:
+        """Write the immutable Dataset; ``manifest_extra`` is recorded, never hashed."""
+        target = Path(prepared_root) / "datasets" / self.dataset_id
+        if (target / "manifest.json").exists():  # identical inputs: already built
+            manifest = json.loads((target / "manifest.json").read_text())
+            return PreparedRef(self.dataset_id, target, manifest)
+        if target.exists():  # incomplete earlier attempt: never read, safe to discard
+            shutil.rmtree(target)
+
+        entries: list[dict[str, Any]] = []
+        for key, (pair, digest, rows, table) in sorted(self._parts.items()):
+            rel = f"bars/{key}/part-0.parquet"
+            dest = target / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(table, dest)
+            entries.append(
+                {"instrument": pair, "path": rel, "rows": rows, "hash": digest}
+            )
+
+        manifest = {
+            **self._manifest,
+            **(manifest_extra or {}),
+            "partitions": entries,
+            "row_count": sum(e["rows"] for e in entries),
+            # Provenance: recorded, never hashed.
+            "polars_version": pl.__version__,
+            "builder_version": _builder_version(),
+            "builder_git_revision": _git_revision(),
+            "created_at": (created_at or datetime.now(UTC)).isoformat(),
+        }
+        _write_manifest(target, manifest)
+        return PreparedRef(self.dataset_id, target, manifest)
+
+
+def plan_prepared(
     frames: Mapping[str, pl.DataFrame],
     *,
     parent_ingestion: str,
     spec: FeatureSpec,
     policy: AnomalyPolicy = DEFAULT_POLICY,
-    created_at: datetime | None = None,
-) -> PreparedRef:
-    """Write an immutable prepared Dataset of ``frames`` (per Instrument).
+    identity: Mapping[str, Any] | None = None,
+) -> PreparedPlan:
+    """Hash ``frames`` (per Instrument) into a prepared Dataset id, writing nothing.
 
     Each frame holds the Bar columns, the spec's ``feat_*`` columns and the
-    ``usable`` / ``unusable_reason`` columns.
+    ``usable`` / ``unusable_reason`` columns. ``identity`` (split scheme and
+    bounds, Embargo E, role) is hashed and recorded in the manifest.
     """
     schema = prepared_schema(spec)
     parts: dict[str, tuple[str, str, int, pa.Table]] = {}
@@ -190,25 +247,9 @@ def write_prepared(
 
     hashes = {key: part[1] for key, part in parts.items()}
     content_hash = _dataset_hash(
-        parent_ingestion, spec.hash, policy.hash, spec.bar_size, hashes
+        parent_ingestion, spec.hash, policy.hash, spec.bar_size, hashes, identity
     )
-
-    target = Path(prepared_root) / "datasets" / content_hash
-    if (target / "manifest.json").exists():  # identical inputs: already built
-        manifest = json.loads((target / "manifest.json").read_text())
-        return PreparedRef(content_hash, target, manifest)
-    if target.exists():  # incomplete earlier attempt: never read, safe to discard
-        shutil.rmtree(target)
-
-    entries: list[dict[str, Any]] = []
-    for key, (pair, digest, rows, table) in sorted(parts.items()):
-        rel = f"bars/{key}/part-0.parquet"
-        dest = target / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(table, dest)
-        entries.append({"instrument": pair, "path": rel, "rows": rows, "hash": digest})
-
-    manifest = {
+    manifest: dict[str, Any] = {
         "kind": KIND,
         "dataset_id": content_hash,
         "content_hash": content_hash,
@@ -222,16 +263,31 @@ def write_prepared(
             "columns": list(spec.names),
         },
         "anomaly_policy": policy_summary(policy, frames.values()),
-        "partitions": entries,
-        "row_count": sum(e["rows"] for e in entries),
-        # Provenance: recorded, never hashed.
-        "polars_version": pl.__version__,
-        "builder_version": _builder_version(),
-        "builder_git_revision": _git_revision(),
-        "created_at": (created_at or datetime.now(UTC)).isoformat(),
     }
-    _write_manifest(target, manifest)
-    return PreparedRef(content_hash, target, manifest)
+    if identity is not None:
+        manifest["identity"] = dict(identity)
+    return PreparedPlan(content_hash, frames, parts, manifest)
+
+
+def write_prepared(
+    prepared_root: Path,
+    frames: Mapping[str, pl.DataFrame],
+    *,
+    parent_ingestion: str,
+    spec: FeatureSpec,
+    policy: AnomalyPolicy = DEFAULT_POLICY,
+    created_at: datetime | None = None,
+    identity: Mapping[str, Any] | None = None,
+) -> PreparedRef:
+    """Write an immutable prepared Dataset of ``frames`` (per Instrument)."""
+    plan = plan_prepared(
+        frames,
+        parent_ingestion=parent_ingestion,
+        spec=spec,
+        policy=policy,
+        identity=identity,
+    )
+    return plan.write(prepared_root, created_at=created_at)
 
 
 def _write_manifest(target: Path, manifest: Mapping[str, Any]) -> None:
@@ -255,3 +311,54 @@ def open_prepared(data_root: Path, dataset_id: str) -> PreparedDataset:
     if manifest.get("kind") != KIND:
         raise PreparedDatasetError(f"dataset {dataset_id} is not a prepared Dataset")
     return PreparedDataset(dataset_id, path, manifest)
+
+
+@dataclass(frozen=True)
+class BuildRecord:
+    """The hash-addressed build record: three Dataset ids and the shared refs."""
+
+    build_id: str
+    path: Path
+    record: Mapping[str, Any]
+
+
+def _build_hashed(
+    shared: Mapping[str, Any], dataset_ids: Mapping[str, str]
+) -> dict[str, Any]:
+    return {"kind": "build", "datasets": dict(dataset_ids), **shared}
+
+
+def build_id_of(shared: Mapping[str, Any], dataset_ids: Mapping[str, str]) -> str:
+    """Hash of the three Dataset ids and the shared refs."""
+    return hashlib.sha256(
+        _canonical_json(_build_hashed(shared, dataset_ids))
+    ).hexdigest()
+
+
+def write_build_record(
+    prepared_root: Path,
+    shared: Mapping[str, Any],
+    dataset_ids: Mapping[str, str],
+    created_at: datetime | None = None,
+) -> BuildRecord:
+    """Write ``<prepared_root>/builds/<build_id>.json`` by atomic rename.
+
+    ``build_id`` hashes the Dataset ids and ``shared`` refs; the polars version
+    and ``created_at`` are recorded but never hashed.
+    """
+    hashed = _build_hashed(shared, dataset_ids)
+    build_id = build_id_of(shared, dataset_ids)
+    path = Path(prepared_root) / "builds" / f"{build_id}.json"
+    if path.is_file():  # identical inputs: already built
+        return BuildRecord(build_id, path, json.loads(path.read_text()))
+    record = {
+        **hashed,
+        "build_id": build_id,
+        "polars_version": pl.__version__,
+        "created_at": (created_at or datetime.now(UTC)).isoformat(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(record, indent=2, sort_keys=True))
+    os.replace(tmp, path)
+    return BuildRecord(build_id, path, record)
