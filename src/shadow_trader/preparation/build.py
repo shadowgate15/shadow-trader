@@ -12,7 +12,7 @@ extra checks, which is where the scaler's fit-range check plugs in.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +20,7 @@ from typing import Any
 import polars as pl
 import pyarrow as pa
 
+from shadow_trader.ingestion.bars import Bar
 from shadow_trader.ingestion.dataset import (
     BAR_SCHEMA,
     DatasetError,
@@ -27,11 +28,11 @@ from shadow_trader.ingestion.dataset import (
 )
 from shadow_trader.ingestion.progress import NULL_PROGRESS, ProgressSink
 
-from .anomaly import apply_anomaly_policy
+from .anomaly import DEFAULT_POLICY, AnomalyPolicy, apply_anomaly_policy
 from .boundary import BoundaryCheckFailure, BoundaryContext, Check, boundary_check
 from .config import PreparedConfig
 from .dataset import PreparedRef, build_id_of, plan_prepared, write_build_record
-from .spec import compute_features
+from .spec import FeatureSpec, compute_features
 from .split import (
     ROLES,
     SplitFailure,
@@ -76,6 +77,15 @@ def _bars_frame(rows: list[dict[str, object]]) -> pl.DataFrame:
     return frame
 
 
+def featured_frame(
+    bars: Sequence[Bar], spec: FeatureSpec, policy: AnomalyPolicy = DEFAULT_POLICY
+) -> pl.DataFrame:
+    """One Instrument's Bars with ``feat_*``, ``usable`` and ``unusable_reason``."""
+    rows = [{**vars(bar), "quality_flags": list(bar.quality_flags)} for bar in bars]
+    featured = compute_features(_bars_frame(rows), spec).collect()
+    return apply_anomaly_policy(featured, spec, policy)
+
+
 def build_prepared(
     config: PreparedConfig, progress: ProgressSink = NULL_PROGRESS
 ) -> BuildRef:
@@ -104,10 +114,9 @@ def build_prepared(
     progress.start("features", len(instruments))
     frames: dict[str, pl.DataFrame] = {}
     for instrument in instruments:
-        bars = parent.read(instrument)
-        rows = [{**vars(bar), "quality_flags": list(bar.quality_flags)} for bar in bars]
-        featured = compute_features(_bars_frame(rows), spec).collect()
-        frames[instrument] = apply_anomaly_policy(featured, spec, config.anomaly)
+        frames[instrument] = featured_frame(
+            parent.read(instrument), spec, config.anomaly
+        )
         progress.advance(instrument)
     progress.done()
 

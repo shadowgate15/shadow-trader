@@ -142,3 +142,34 @@ def prepared_config(
     root: Path, dataset_id: str, extra: str = "", split: str | None = None
 ) -> PreparedConfig:
     return load_prepared_config(write_prepared_toml(root, dataset_id, extra, split))
+
+
+def write_bars(root: Path, bars: dict[str, list[Bar]], bar_size: int = 5) -> DatasetRef:
+    """Write caller-supplied Bars as a synthetic ingestion Dataset."""
+    path = root / "ingest.toml"
+    names = ", ".join(f'"{pair}"' for pair in bars)
+    path.write_text(
+        f'[paths]\ndata_root = "{root / "ingestion"}"\n'
+        f"[build]\ninstruments = [{names}]\n"
+    )
+    return write_dataset(load_config(path), bar_size, bars)
+
+
+def prepared_frame(root: Path, bars: list[Bar], version: int = 2):
+    """Features and anomaly policy over one Instrument's Bars, read back from disk.
+
+    Skips the split (these Bars are far shorter than a split's Embargo): the
+    frame is written as a plain prepared Dataset and read through the public API.
+    """
+    from shadow_trader.preparation import SPECS, open_prepared
+    from shadow_trader.preparation.build import featured_frame
+    from shadow_trader.preparation.dataset import write_prepared
+
+    spec = SPECS[version]
+    ref = write_prepared(
+        root / "prepared",
+        {"EURUSD": featured_frame(bars, spec)},
+        parent_ingestion="synthetic",
+        spec=spec,
+    )
+    return open_prepared(root / "prepared", ref.dataset_id).read("EURUSD")
