@@ -77,8 +77,10 @@ def apply_anomaly_policy(
             pl.lit(None, pl.Boolean).alias("usable"),
             pl.lit(None, pl.String).alias("unusable_reason"),
         )
-    history = [c for c in spec.columns if c.lookback > 0]
-    horizon = max((c.lookback for c in history), default=0)
+    # Every column but the always-valid time family is nulled by its own window
+    # (lookback 0 means the Bar itself); only lookback > 0 sets the warm-up.
+    windowed = [c for c in spec.columns if not c.always_valid]
+    horizon = max((c.lookback for c in windowed), default=0)
     distrusted = pl.Series(list(policy.distrusted_flags), dtype=pl.String)
 
     gap = pl.col("is_gap")
@@ -96,7 +98,7 @@ def apply_anomaly_policy(
         .then(pl.col(c.name))
         .otherwise(None)
         .alias(c.name)
-        for c in history
+        for c in windowed
     ]
     reason = (
         pl.when(gap | pl.col("close").is_null())
