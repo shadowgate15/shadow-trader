@@ -1,4 +1,5 @@
 import dataclasses
+import os
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,7 @@ def test_minimal_config_gets_spec_defaults(tmp_path):
     assert config.build.start == "2009-01"
     assert config.build.end is None
     assert config.build.workers == 8
+    assert config.build.jobs == os.process_cpu_count()
     assert config.build.acknowledged_missing == ()
     assert config.gap_rule.outage_threshold_minutes == 30
     assert config.anomaly_rule.alert_fraction == 0.01
@@ -83,6 +85,8 @@ def test_acknowledged_missing_entries_are_parsed(tmp_path):
         (MINIMAL + 'start = "2020-05"\nend = "2020-01"\n', "start"),
         (MINIMAL + "\n[rules.gap]\noutage_threshold_minutes = 0\n", "outage"),
         (MINIMAL + "\n[live]\nadapter = 'oanda'\n", "adapter"),
+        (MINIMAL + "jobs = 0\n", "jobs"),
+        (MINIMAL + "jobs = -3\n", "jobs"),
         (MINIMAL + "workers = 0\n", "workers"),
         (MINIMAL + "workers = -2\n", "workers"),
         ("this is not toml [", "TOML"),
@@ -117,3 +121,9 @@ def test_content_affecting_and_reporting_only_values_are_distinguishable(tmp_pat
         gap_rule=dataclasses.replace(config.gap_rule, outage_threshold_minutes=5),
     )
     assert stricter.content_affecting() != content
+
+
+def test_jobs_is_read_from_the_build_table_independently_of_workers(tmp_path):
+    config = load_config(write(tmp_path, MINIMAL + "jobs = 3\nworkers = 2\n"))
+
+    assert (config.build.jobs, config.build.workers) == (3, 2)

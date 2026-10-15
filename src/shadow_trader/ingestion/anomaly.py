@@ -216,6 +216,17 @@ class FlaggingBarBuilder:
     def flush(self) -> list[Bar]:
         return [self._flag(bar) for bar in self._builder.flush()]
 
+    def end_warm_up(self) -> None:
+        """Finish a replay that only primed the detectors; keep their state.
+
+        Closes the replayed Session (so the Bar detector sees its Bars), then
+        forgets everything the replay produced: Bars, flag counts and drops.
+        """
+        self.flush()
+        self._slot_flags.clear()
+        self.tick_flag_counts.clear()
+        self._builder.dropped_out_of_session = 0
+
     def _slot_of(self, ts: datetime) -> datetime:
         utc = ts.astimezone(UTC)
         return utc - (utc - datetime(1970, 1, 1, tzinfo=UTC)) % self._size
