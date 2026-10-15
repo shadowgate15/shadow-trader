@@ -61,3 +61,20 @@ def test_prepared_root_must_be_separate_from_the_ingestion_root(tmp_path):
         path.write_text(text.replace(str(tmp_path / "prepared"), target))
         with pytest.raises(ConfigError, match="separate"):
             load_prepared_config(path)
+
+
+def test_anomaly_flags_default_and_are_validated(tmp_path):
+    default = load_prepared_config(write_prepared_toml(tmp_path, "abc"))
+    assert default.anomaly.distrusted_flags == (
+        "crossed_quote",
+        "price_spike",
+        "stale_quote",
+    )
+    with pytest.raises(ConfigError, match="list of strings"):
+        load_prepared_config(
+            write_prepared_toml(tmp_path, "abc", "[anomaly]\ndistrusted_flags = 3\n")
+        )
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_prepared_config(
+            write_prepared_toml(tmp_path, "abc", "[anomaly]\nbogus = 1\n")
+        )

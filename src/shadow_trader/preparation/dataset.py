@@ -29,6 +29,7 @@ import pyarrow.parquet as pq
 
 from shadow_trader.ingestion.dataset import BAR_SCHEMA
 
+from .anomaly import DEFAULT_POLICY, AnomalyPolicy, policy_summary
 from .spec import FeatureSpec
 
 SCHEMA_VERSION = 1
@@ -42,7 +43,12 @@ class PreparedDatasetError(Exception):
 def prepared_schema(spec: FeatureSpec) -> pa.Schema:
     """Ingestion Bar columns followed by the spec's unscaled ``feat_*`` columns."""
     return pa.schema(
-        [*BAR_SCHEMA, *(pa.field(name, pa.float64()) for name in spec.names)]
+        [
+            *BAR_SCHEMA,
+            *(pa.field(name, pa.float64()) for name in spec.names),
+            pa.field("usable", pa.bool_()),
+            pa.field("unusable_reason", pa.string()),
+        ]
     )
 
 
@@ -112,7 +118,11 @@ def _partition_hash(table: pa.Table) -> str:
 
 
 def _dataset_hash(
-    parent: str, spec_hash: str, bar_size: int, partitions: Mapping[str, str]
+    parent: str,
+    spec_hash: str,
+    policy_hash: str,
+    bar_size: int,
+    partitions: Mapping[str, str],
 ) -> str:
     return hashlib.sha256(
         _canonical_json(
@@ -121,6 +131,7 @@ def _dataset_hash(
                 "schema_version": SCHEMA_VERSION,
                 "parent_ingestion": parent,
                 "spec_hash": spec_hash,
+                "anomaly_policy_hash": policy_hash,
                 "bar_size": bar_size,
                 # Merkle leaves combined in sorted partition-key order.
                 "partitions": sorted(partitions.items()),
@@ -156,11 +167,13 @@ def write_prepared(
     *,
     parent_ingestion: str,
     spec: FeatureSpec,
+    policy: AnomalyPolicy = DEFAULT_POLICY,
     created_at: datetime | None = None,
 ) -> PreparedRef:
     """Write an immutable prepared Dataset of ``frames`` (per Instrument).
 
-    Each frame holds the Bar columns plus the spec's ``feat_*`` columns.
+    Each frame holds the Bar columns, the spec's ``feat_*`` columns and the
+    ``usable`` / ``unusable_reason`` columns.
     """
     schema = prepared_schema(spec)
     parts: dict[str, tuple[str, str, int, pa.Table]] = {}
@@ -176,7 +189,9 @@ def write_prepared(
             parts[key] = (pair, _partition_hash(table), table.num_rows, table)
 
     hashes = {key: part[1] for key, part in parts.items()}
-    content_hash = _dataset_hash(parent_ingestion, spec.hash, spec.bar_size, hashes)
+    content_hash = _dataset_hash(
+        parent_ingestion, spec.hash, policy.hash, spec.bar_size, hashes
+    )
 
     target = Path(prepared_root) / "datasets" / content_hash
     if (target / "manifest.json").exists():  # identical inputs: already built
@@ -206,6 +221,7 @@ def write_prepared(
             "hash": spec.hash,
             "columns": list(spec.names),
         },
+        "anomaly_policy": policy_summary(policy, frames.values()),
         "partitions": entries,
         "row_count": sum(e["rows"] for e in entries),
         # Provenance: recorded, never hashed.
