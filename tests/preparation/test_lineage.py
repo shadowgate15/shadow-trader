@@ -10,8 +10,8 @@ from .synthetic import (
     prepared_config,
     session_bars,
     split_toml,
+    wiggled,
     write_bars,
-    write_ingestion,
 )
 
 SESSION_2022 = datetime(2022, 6, 5, 22, 0, tzinfo=UTC)
@@ -25,6 +25,20 @@ CLOSED_2022 = "bars/instrument=EURUSD/year=2022/part-0.parquet"
 OPEN_2023 = "bars/instrument=EURUSD/year=2023/part-0.parquet"
 
 
+def write_ingestion(root, sessions, first_count=700):
+    """Every Session wiggled (so scaler IQRs are non-zero); the first may be shorter."""
+    bars = []
+    for n, session in enumerate(sessions):
+        count = first_count if n == 0 else 700
+        bars += [
+            wiggled(bar, i) if i >= 100 and not bar.is_gap else bar
+            for i, bar in enumerate(
+                session_bars("EURUSD", session, count, gaps=(), wiggle=False)
+            )
+        ]
+    return write_bars(root, {"EURUSD": bars})
+
+
 def build(tmp_path, parent):
     config = prepared_config(tmp_path, parent.dataset_id, split=SPLIT)
     return config, build_prepared(config)
@@ -36,7 +50,7 @@ def partition_hash(ref, role, rel):
 
 
 def test_first_build_has_no_prepared_parent_and_records_parent_ingestion(tmp_path):
-    parent = write_ingestion(tmp_path, sessions=BASE_SESSIONS)
+    parent = write_ingestion(tmp_path, BASE_SESSIONS)
     _, ref = build(tmp_path, parent)
 
     for dataset in ref.datasets.values():
@@ -47,9 +61,9 @@ def test_first_build_has_no_prepared_parent_and_records_parent_ingestion(tmp_pat
 def test_rebuild_after_growth_records_lineage_and_hardlinks_closed_partitions(
     tmp_path,
 ):
-    first_parent = write_ingestion(tmp_path, sessions=BASE_SESSIONS)
+    first_parent = write_ingestion(tmp_path, BASE_SESSIONS)
     _, first = build(tmp_path, first_parent)
-    grown = write_ingestion(tmp_path, sessions=(*BASE_SESSIONS, SESSION_3))
+    grown = write_ingestion(tmp_path, (*BASE_SESSIONS, SESSION_3))
     _, second = build(tmp_path, grown)
 
     for role in ROLES:
@@ -73,17 +87,9 @@ def test_rebuild_after_growth_records_lineage_and_hardlinks_closed_partitions(
 
 
 def test_changed_closed_partition_is_fresh_never_linked(tmp_path):
-    first_parent = write_ingestion(tmp_path, sessions=BASE_SESSIONS)
+    first_parent = write_ingestion(tmp_path, BASE_SESSIONS)
     _, first = build(tmp_path, first_parent)
-    changed = write_bars(
-        tmp_path,
-        {
-            "EURUSD": [
-                *session_bars("EURUSD", SESSION_2022, count=699),
-                *(bar for s in BASE_SESSIONS[1:] for bar in session_bars("EURUSD", s)),
-            ]
-        },
-    )
+    changed = write_ingestion(tmp_path, BASE_SESSIONS, first_count=699)
     _, second = build(tmp_path, changed)
 
     old = first.datasets["train"].path / CLOSED_2022
@@ -99,14 +105,14 @@ def test_changed_closed_partition_is_fresh_never_linked(tmp_path):
 
 
 def test_hash_is_the_same_whether_linked_or_recomputed(tmp_path):
-    first_parent = write_ingestion(tmp_path, sessions=BASE_SESSIONS)
+    first_parent = write_ingestion(tmp_path, BASE_SESSIONS)
     build(tmp_path, first_parent)
-    grown = write_ingestion(tmp_path, sessions=(*BASE_SESSIONS, SESSION_3))
+    grown = write_ingestion(tmp_path, (*BASE_SESSIONS, SESSION_3))
     config, linked = build(tmp_path, grown)
 
     fresh_root = tmp_path / "fresh"
     fresh_root.mkdir()
-    fresh_parent = write_ingestion(fresh_root, sessions=(*BASE_SESSIONS, SESSION_3))
+    fresh_parent = write_ingestion(fresh_root, (*BASE_SESSIONS, SESSION_3))
     fresh_config = prepared_config(fresh_root, fresh_parent.dataset_id, split=SPLIT)
     recomputed = build_prepared(fresh_config)
 
