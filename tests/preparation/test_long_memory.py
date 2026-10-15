@@ -180,3 +180,37 @@ def test_ta_lib_agrees_on_ema_rsi_and_atr_conventions_past_warm_up(tmp_path):
     got_range = frame["feat_shape_range"].to_numpy()
     assert got_range[300:] == pytest.approx(((high - low) / atr)[300:], abs=1e-6)
     assert not math.isnan(got_range[300])
+
+
+V4 = 4
+
+
+def test_spec_v4_adds_atr_over_close_to_the_volatility_family(tmp_path):
+    # Closes 100, 101, ... with high/low one either side: the Wilder ATR is 2
+    # from Bar 14 (mean of true ranges 1..14), and close at Bar 14 is 114.
+    spec = SPECS[V4]
+    by_name = {c.name: c for c in spec.columns}
+    assert by_name["feat_vol_atr"].family == "volatility"
+    assert by_name["feat_vol_atr"].lookback == 280
+    assert by_name["feat_vol_atr"].tolerance == 1e-9
+    assert set(SPECS[V3].names) < set(spec.names)
+    assert len(spec.names) == 30 and "feat_vol_1" not in spec.names
+
+    frame = prepared_frame(tmp_path, shaped(40, ramp), version=V4)
+
+    assert frame["feat_vol_atr"][13] is None
+    assert frame["feat_vol_atr"][14] == pytest.approx(2 / 114, abs=1e-12)
+    assert frame["feat_vol_atr"][39] == pytest.approx(2 / 139, abs=1e-12)
+
+
+def test_v4_hash_covers_scaling_and_lookback_while_old_pins_stay():
+    v4 = SPECS[V4]
+    first = v4.columns[0]
+    rescaled = replace(v4, columns=(replace(first, scaling="identity"), *v4.columns[1:]))
+    deeper = replace(v4, columns=(replace(first, lookback=first.lookback + 1), *v4.columns[1:]))
+
+    assert rescaled.hash != v4.hash and deeper.hash != v4.hash
+    # versions 1-3 keep their original hash payload, so their pins are unchanged
+    old = SPECS[3]
+    again = replace(old, columns=(replace(old.columns[0], scaling="identity"), *old.columns[1:]))
+    assert again.hash == old.hash

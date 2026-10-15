@@ -35,9 +35,9 @@ def series(count, gaps=()):
 
 
 def test_feature_spec_exposes_identity_and_warm_up():
-    spec = SPECS[3]
+    spec = SPECS[max(SPECS)]
 
-    assert FEATURE_SPEC.version == 3
+    assert FEATURE_SPEC.version == max(SPECS)
     assert FEATURE_SPEC.hash == spec.hash
     assert FEATURE_SPEC.policy_hash == DEFAULT_POLICY.hash
     assert set(FEATURE_SPEC.warm_up) == set(spec.names)

@@ -24,7 +24,7 @@ from .dataset import PreparedDataset
 from .scaler import Scaler, ScalerError
 from .spec import SPECS, FeatureSpec
 
-LIVE_SPEC_VERSION = 3
+LIVE_SPEC_VERSION = max(SPECS)  # the newest registered spec
 # A recursive column's declared lookback is where an older input weighs under
 # 1e-9; the warm-up goes on top so truncation error stays well under that.
 WARM_UP_WEIGHT = 1e-12
