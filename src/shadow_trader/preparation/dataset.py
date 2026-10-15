@@ -251,8 +251,12 @@ class PreparedPlan:
                     Path(prepared_root) / "datasets" / prepared_parent["dataset_id"]
                 )
                 try:
+                    # Rehash the bytes actually on disk: a manifest hash alone
+                    # would let a corrupted earlier partition propagate.
+                    if _partition_hash(pq.read_table(source / rel)) != digest:
+                        raise OSError("stored partition does not match its hash")
                     os.link(source / rel, dest)
-                except OSError:  # e.g. no hardlink support: fall back to a write
+                except (OSError, pa.ArrowException):  # unlinkable or damaged
                     pq.write_table(table, dest)
             else:
                 pq.write_table(table, dest)
