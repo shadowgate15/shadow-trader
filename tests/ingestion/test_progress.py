@@ -49,6 +49,7 @@ def fetch(tmp_path, transport, sink, start="2024-03", end="2024-04"):
         sleep=lambda s: None,
         now=lambda: NOW,
         progress=sink,
+        workers=1,
     )
 
 

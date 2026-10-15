@@ -1,4 +1,5 @@
 import io
+import os
 import zipfile
 from pathlib import Path
 
@@ -6,8 +7,9 @@ import pytest
 
 from shadow_trader import main
 from shadow_trader.ingestion import cli
+from shadow_trader.ingestion.backfill import BuildFailure
 from shadow_trader.ingestion.config import load_config
-from shadow_trader.ingestion.sources import Response
+from shadow_trader.ingestion.sources import FetchReport, Response
 
 SUBCOMMANDS = ("fetch", "build", "live", "build-live", "diff")
 
@@ -242,3 +244,83 @@ def test_fetch_reports_unsettled_months_as_warnings_without_downloading(
     assert code == 0
     assert "not settled" in capsys.readouterr().out
     assert transport.posts == 0
+
+
+def test_fetch_passes_workers_from_the_option_or_the_config(
+    tmp_path, monkeypatch, capsys
+):
+    seen = []
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["workers"])
+        return FetchReport()
+
+    monkeypatch.setattr(cli, "fetch_months", spy)
+    path = fetch_config(tmp_path)
+
+    assert run(["ingest", "fetch", "--config", str(path)]) == 0
+    assert run(["ingest", "fetch", "--config", str(path), "--workers", "3"]) == 0
+    path.write_text(
+        path.read_text().replace('end = "2024-03"', 'end = "2024-03"\nworkers = 5')
+    )
+    assert run(["ingest", "fetch", "--config", str(path)]) == 0
+
+    assert seen == [8, 3, 5]
+
+
+@pytest.mark.parametrize("bad", ["0", "-1"])
+def test_fetch_rejects_a_non_positive_workers_option(
+    tmp_path, monkeypatch, capsys, bad
+):
+    transport = FakeTransport(Response(200, b"", {}))
+    monkeypatch.setattr(cli, "make_transport", lambda: transport)
+
+    code = run(
+        ["ingest", "fetch", "--config", str(fetch_config(tmp_path)), "--workers", bad]
+    )
+
+    assert code == 2
+    assert "workers" in capsys.readouterr().err
+    assert transport.posts == 0
+
+
+def test_fetch_exits_non_zero_after_an_interrupt(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli, "fetch_months", lambda *a, **k: FetchReport(interrupted=True)
+    )
+    path = fetch_config(tmp_path)
+
+    code = run(["ingest", "fetch", "--config", str(path)])
+
+    assert code == cli.EXIT_INTERRUPTED
+    assert "interrupted" in capsys.readouterr().out
+
+
+def test_build_passes_jobs_from_the_option_or_the_config(tmp_path, monkeypatch, capsys):
+    seen = []
+
+    def spy(config, bar_size, **kwargs):
+        seen.append(config.build.jobs)
+        raise BuildFailure("stop")
+
+    monkeypatch.setattr(cli, "build_backfill", spy)
+    path = fetch_config(tmp_path)
+
+    run(["ingest", "build", "--config", str(path)])
+    run(["ingest", "build", "--config", str(path), "--jobs", "1"])
+    path.write_text(
+        path.read_text().replace('end = "2024-03"', 'end = "2024-03"\njobs = 4')
+    )
+    run(["ingest", "build", "--config", str(path)])
+
+    assert seen == [os.process_cpu_count(), 1, 4]
+
+
+@pytest.mark.parametrize("bad", ["0", "-1"])
+def test_build_rejects_a_non_positive_jobs_option(tmp_path, capsys, bad):
+    code = run(
+        ["ingest", "build", "--config", str(fetch_config(tmp_path)), "--jobs", bad]
+    )
+
+    assert code == 2
+    assert "jobs" in capsys.readouterr().err
