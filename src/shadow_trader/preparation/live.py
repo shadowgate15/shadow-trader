@@ -20,6 +20,7 @@ from shadow_trader.ingestion.bars import Bar
 
 from .anomaly import DEFAULT_POLICY, AnomalyPolicy
 from .build import featured_frame
+from .dataset import PreparedDataset
 from .scaler import Scaler, ScalerError
 from .spec import SPECS, FeatureSpec
 
@@ -102,13 +103,16 @@ def check_compat(
     scaler: Scaler,
     spec: LiveFeatureSpec = FEATURE_SPEC,
     *,
-    manifest_polars_version: str | None = None,
+    dataset: PreparedDataset | None = None,
 ) -> list[str]:
     """Refuse a scaler fit under another spec or policy; return soft warnings.
 
     A spec or anomaly-policy hash mismatch raises ``ScalerError``. A polars
-    version differing from ``manifest_polars_version`` (the Dataset manifest's)
-    is only a warning: numerical behaviour may drift, so parity should be re-run.
+    version differing from the one recorded in ``dataset``'s manifest (the
+    Dataset the scaler was fit on, or any Dataset of its build) is only a
+    warning: numerical behaviour may drift, so parity should be re-run. The
+    scaler artifact does not record polars (its hash is train-data-determined),
+    so pass ``dataset`` for the warning to fire.
     """
     artifact = scaler.artifact
     if artifact["spec_hash"] != spec.hash:
@@ -122,10 +126,11 @@ def check_compat(
             f"{artifact['anomaly_policy_hash']}, live policy is {spec.policy_hash}"
         )
     warnings: list[str] = []
-    if manifest_polars_version not in (None, pl.__version__):
+    built_with = None if dataset is None else dataset.manifest.get("polars_version")
+    if built_with not in (None, pl.__version__):
         warnings.append(
             f"polars version {pl.__version__} differs from the manifest's "
-            f"{manifest_polars_version}; re-run the tail parity check"
+            f"{built_with}; re-run the tail parity check"
         )
     return warnings
 
