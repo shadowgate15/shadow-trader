@@ -71,13 +71,11 @@ def test_bar_size_mismatch_with_the_spec_exits_1(tmp_path, capsys):
     assert not (tmp_path / "prepared").exists()
 
 
-def test_several_instruments_are_a_build_failure(tmp_path, capsys):
+def test_several_instruments_build_on_the_shared_grid(tmp_path):
     parent = write_ingestion(tmp_path, instruments=("EURUSD", "GBPUSD"))
     path = write_prepared_toml(tmp_path, parent.dataset_id)
 
-    assert run(["prepare", "build", "--config", str(path), "-q"]) == 1
-
-    assert "exactly one" in capsys.readouterr().err
+    assert run(["prepare", "build", "--config", str(path), "-q"]) == 0
 
 
 def test_bad_config_exits_2(tmp_path, capsys):

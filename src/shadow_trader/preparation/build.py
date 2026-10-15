@@ -1,7 +1,8 @@
 """The preparation build: read one parent ingestion Dataset, add features, split, write.
 
 Reads the parent only through ingestion's public ``open_dataset``. Build order:
-open parent, check bar size and Instrument, compute features, split + Embargo,
+open parent, check bar size, compute features per Instrument, check alignment
+(coverage, bar size, Session geometry), split + Embargo,
 ``boundary_check``, then write the three Datasets and the build record. Every
 check runs before the first write, so a failed build leaves nothing behind.
 
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,7 @@ from shadow_trader.ingestion.dataset import (
 )
 from shadow_trader.ingestion.progress import NULL_PROGRESS, ProgressSink
 
+from .align import AlignmentFailure, check_alignment
 from .anomaly import DEFAULT_POLICY, AnomalyPolicy, apply_anomaly_policy
 from .boundary import BoundaryCheckFailure, BoundaryContext, Check, boundary_check
 from .config import PreparedConfig
@@ -92,6 +95,18 @@ def featured_frame(
     return apply_anomaly_policy(featured, spec, policy)
 
 
+def _span(frame: pl.DataFrame, bar_size: int) -> dict[str, str]:
+    """The actual ``[start, end)`` of one Instrument's Bars in a Dataset."""
+    first, last = frame.select(
+        pl.col("open_time").min().alias("first"),
+        pl.col("open_time").max().alias("last"),
+    ).row(0)
+    return {
+        "start": first.isoformat(),
+        "end": (last + timedelta(minutes=bar_size)).isoformat(),
+    }
+
+
 def build_prepared(
     config: PreparedConfig, progress: ProgressSink = NULL_PROGRESS
 ) -> BuildRef:
@@ -111,11 +126,6 @@ def build_prepared(
             f"{spec.bar_size}-minute Bars"
         )
     instruments = list(parent.manifest["instruments"])
-    if len(instruments) != 1:
-        raise BuildFailure(
-            f"parent Dataset {parent_id} has {len(instruments)} Instruments; "
-            "this build prepares exactly one"
-        )
 
     progress.start("features", len(instruments))
     frames: dict[str, pl.DataFrame] = {}
@@ -126,17 +136,22 @@ def build_prepared(
         progress.advance(instrument)
     progress.done()
 
-    (instrument,) = instruments
-    featured = frames[instrument]
     embargo = embargo_bars(spec, config.embargo)
     try:
-        bounds = snap_bounds(
-            config.split, sorted(featured["session_id"].unique().to_list())
+        opens = sorted(
+            set().union(*(set(f["session_id"].to_list()) for f in frames.values()))
         )
-        roles = split_frame(featured, bounds, embargo)
+        bounds = snap_bounds(config.split, opens)
+        check_alignment(
+            frames,
+            bar_size=spec.bar_size,
+            start=bounds.start("train"),
+            end=bounds.snapped["test_end"],
+        )
+        roles = {pair: split_frame(f, bounds, embargo) for pair, f in frames.items()}
         plans = {
             role: plan_prepared(
-                {instrument: roles[role].frame},
+                {pair: roles[pair][role].frame for pair in instruments},
                 parent_ingestion=parent_id,
                 spec=spec,
                 policy=config.anomaly,
@@ -144,10 +159,19 @@ def build_prepared(
             )
             for role in ROLES
         }
-        context = BoundaryContext(bounds, roles, featured["open_time"], embargo, spec)
+        contexts = {
+            pair: BoundaryContext(
+                bounds, roles[pair], frames[pair]["open_time"], embargo, spec
+            )
+            for pair in instruments
+        }
+
+        def run_checks(extra: Sequence[tuple[str, Check]]) -> list[dict[str, Any]]:
+            return [boundary_check(contexts[pair], extra=extra) for pair in instruments]
+
         try:
             scaler = fit_scaler(
-                roles["train"].frame,
+                pl.concat([roles[pair]["train"].frame for pair in instruments]),
                 spec,
                 policy_hash=config.anomaly.hash,
                 fit_dataset=plans["train"].dataset_id,
@@ -155,13 +179,15 @@ def build_prepared(
         except ScalerFitError:
             # A degenerate split (empty or unusable train) is reported by its own
             # boundary check first; only then is the fit failure the cause.
-            boundary_check(context, extra=EXTRA_CHECKS)
+            run_checks(EXTRA_CHECKS)
             raise
-        checked = boundary_check(
-            context,
-            extra=(*EXTRA_CHECKS, ("scaler_fit_range", scaler_fit_range_check(scaler))),
+        checks = run_checks(
+            (*EXTRA_CHECKS, ("scaler_fit_range", scaler_fit_range_check(scaler)))
         )
+        checked = checks[0]  # every Instrument passed, on the same grid
     except ScalerFitError as exc:
+        raise BuildFailure(str(exc), exc.code) from exc
+    except AlignmentFailure as exc:
         raise BuildFailure(str(exc), exc.code) from exc
     except (SplitFailure, BoundaryCheckFailure) as exc:
         raise BuildFailure(f"{exc.code}: {exc.detail}", exc.code) from exc
@@ -190,9 +216,13 @@ def build_prepared(
                 "build_id": build_id,
                 "siblings": {r: i for r, i in ids.items() if r != role},
                 "split": split_block,
-                "embargo": roles[role].embargo_block(
+                "embargo": roles[instruments[0]][role].embargo_block(
                     embargo, spec, config.embargo.episode_bars
                 ),
+                "instrument_spans": {
+                    pair: _span(roles[pair][role].frame, spec.bar_size)
+                    for pair in instruments
+                },
                 "boundary_check": checked,
                 "scaler": {"id": scaler.scaler_id, "fit": role == "train"},
             },
