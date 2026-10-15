@@ -1,6 +1,7 @@
 """``shadow-trader prepare`` command group.
 
-Exit codes: 0 success, 1 build failure, 2 config error. Progress goes to stderr
+Exit codes: 0 success, 1 build failure, 2 config error, 130 interrupted
+(Ctrl-C). Progress goes to stderr
 through ``rich``; stdout carries only the result line. The only flag that
 selects anything is ``--config``: every build setting lives in the config file.
 """
@@ -24,6 +25,7 @@ from .verify import BUILD_ID_PATTERN, verify_build
 EXIT_OK = 0
 EXIT_BUILD_FAILURE = 1
 EXIT_CONFIG_ERROR = 2
+EXIT_INTERRUPTED = 130
 
 
 def _build_id(text: str) -> str:
@@ -94,6 +96,12 @@ def run_prepare(args: argparse.Namespace) -> int:
             if exc.report_path is not None:
                 print(f"failed-build report: {exc.report_path}", file=sys.stderr)
             return EXIT_BUILD_FAILURE
+        except KeyboardInterrupt:
+            # Datasets already written stay as harmless orphans (see the README).
+            progress.close()
+            where = f" during {progress.phase}" if progress.phase else ""
+            print(f"interrupted{where}", file=sys.stderr)
+            return EXIT_INTERRUPTED
         progress.close()
     for line in console_summary(
         ref.build_id,

@@ -3,6 +3,8 @@ import subprocess
 import sys
 
 from shadow_trader import main
+from shadow_trader.preparation import build as build_module
+from shadow_trader.preparation import dataset as dataset_module
 
 from .synthetic import split_toml, write_ingestion, write_prepared_toml
 
@@ -167,3 +169,55 @@ def test_build_failure_names_the_code_and_the_failed_report(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "embargo_exceeds_dataset" in err
     assert str(tmp_path / "prepared.failed") in err
+
+
+def interrupted(*_args, **_kwargs):
+    raise KeyboardInterrupt
+
+
+def test_ctrl_c_while_computing_features_exits_130_without_a_traceback(
+    tmp_path, capsys, monkeypatch
+):
+    parent = write_ingestion(tmp_path)
+    path = write_prepared_toml(tmp_path, parent.dataset_id)
+    monkeypatch.setattr(build_module, "featured_frame", interrupted)
+
+    assert run(["prepare", "build", "--config", str(path), "-q"]) == 130
+
+    err = capsys.readouterr().err
+    assert err.strip().splitlines() == ["interrupted during features"]
+    assert not (tmp_path / "prepared/builds").exists()
+
+
+def test_ctrl_c_while_writing_exits_130_and_the_next_build_reuses_the_orphans(
+    tmp_path, capsys, monkeypatch
+):
+    parent = write_ingestion(tmp_path)
+    path = write_prepared_toml(tmp_path, parent.dataset_id)
+    write = dataset_module.PreparedPlan.write
+    calls = []
+
+    def third_write_is_interrupted(self, *args, **kwargs):
+        calls.append(self.dataset_id)
+        if len(calls) == 3:
+            raise KeyboardInterrupt
+        return write(self, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dataset_module.PreparedPlan, "write", third_write_is_interrupted)
+        assert run(["prepare", "build", "--config", str(path), "-q"]) == 130
+
+    err = capsys.readouterr().err
+    assert err.strip().splitlines() == ["interrupted during write"]
+    prepared = tmp_path / "prepared"
+    assert not (prepared / "builds").exists()  # no record: not a build
+    written = {p.name for p in (prepared / "datasets").iterdir()}
+    assert written >= set(calls[:2])  # orphans are left behind
+
+    # The same build later reuses those Datasets and completes.
+    assert run(["prepare", "build", "--config", str(path), "-q"]) == 0
+    assert set(calls) <= {p.name for p in (prepared / "datasets").iterdir()}
+    records = [
+        p for p in (prepared / "builds").glob("*.json") if ".report." not in p.name
+    ]
+    assert len(records) == 1

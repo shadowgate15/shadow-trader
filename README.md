@@ -125,6 +125,8 @@ SHADOW_TRADER_RAW_ROOT=/data/shadow-trader uv run pytest -m slow
 
 `shadow-trader prepare build --config prepare.toml` turns one named ingestion Dataset into train, validation and test prepared Datasets plus a train-only scaler; `shadow-trader prepare verify BUILD_ID --config prepare.toml` audits a stored build. Python API: `build_prepared`, `open_prepared`, `load_scaler` / `Scaler.apply`, `compute_features`, and for live use `FEATURE_SPEC`, `evaluate_tail`, `check_compat`, `check_tail_parity` (all in `shadow_trader.preparation`). Design: GLOSSARY.md and `docs/adr/0004-*`.
 
+Exit codes for `prepare`: 0 success, 1 build failure (or a `verify` check failing), 2 config error or a malformed `BUILD_ID`, 130 interrupted with Ctrl-C (one `interrupted during <phase>` line on stderr, no traceback). A build is complete only once its build record exists. An interrupt during the `write` phase can leave the train-only scaler and some Datasets in the store with no build record. These orphans are harmless: nothing references them, an identical rebuild reuses them under the same ids, and an incomplete Dataset directory is discarded and rewritten. They are not cleaned up on interrupt.
+
 Tests: `uv run pytest tests/preparation`. The opt-in real-data smoke (`tests/preparation/test_real_data_smoke.py`) runs with `SHADOW_TRADER_RAW_ROOT=/data/shadow-trader uv run pytest -m slow tests/preparation`; it needs a built 5-minute EURUSD ingestion Dataset spanning over a year under that root and is skipped otherwise.
 
 Polars upgrades: the full preparation suite (goldens, parity, causality, leakage) must pass; any changed golden means a new feature spec version. See the upgrade rule in ADR 0004.
