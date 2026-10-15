@@ -13,3 +13,7 @@ Dataset preparation computes `feat_*` with polars expressions and nothing else. 
 - Unbounded-memory columns need a warm-up long enough that tail truncation error sits below the stated tolerance; the spec states warm-up per column.
 - Live cost is one tail evaluation per Bar rather than O(1); acceptable at 5-minute Bars.
 - Polars 2.0.0 has no determinism guarantee in its docs; parity and golden tests gate upgrades.
+
+## Polars upgrade rule
+
+A polars upgrade (any change of the locked version in `uv.lock`) is accepted only if the full preparation suite passes unchanged: golden fixtures, tail parity, causality and leakage tests. If a golden value has to change, the numerical behaviour changed: bump the feature spec version (adding a new entry, never editing an old one) and regenerate the goldens in the same change. Polars version differences between a scaler or Dataset manifest and the running engine are surfaced as `check_compat` warnings, never silently accepted as identical behaviour.

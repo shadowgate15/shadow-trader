@@ -120,3 +120,11 @@ SHADOW_TRADER_RAW_ROOT=/data/shadow-trader uv run pytest -m slow
 ```
 
 `SHADOW_TRADER_RAW_ROOT` is the `data_root` holding the raw cache. `SHADOW_TRADER_REPLAY_RANGE` (`YYYY-MM` or `YYYY-MM:YYYY-MM`, default `2024-01`) picks the range for the replay-versus-batch parity test, and `SHADOW_TRADER_BUILD_RANGE` (same form, default every cached month) the range for the build and `dataset_id` reproducibility test. The raw-clock calendar cross-check reads every cached month and checks each week decided on tick evidence against the HistData calendar rule (New York local before 2018-12-16, Europe/Zurich minus 6 h after). The build drops an hour that HistData lists twice (a byte-identical block, seen on the EU clock-change Sunday in 2019-2023 and 2025) and records it under `replays` in the manifest's `session_clock`; any other backward step in the stamps fails the build. A tick up to a minute behind a slot that has already closed (seen in the 2026 files) is dropped and counted under the `late_ticks_dropped` warning.
+
+## Dataset preparation
+
+`shadow-trader prepare build --config prepare.toml` turns one named ingestion Dataset into train, validation and test prepared Datasets plus a train-only scaler; `shadow-trader prepare verify BUILD_ID --config prepare.toml` audits a stored build. Python API: `build_prepared`, `open_prepared`, `load_scaler` / `Scaler.apply`, `compute_features`, and for live use `FEATURE_SPEC`, `evaluate_tail`, `check_compat`, `check_tail_parity` (all in `shadow_trader.preparation`). Design: GLOSSARY.md and `docs/adr/0004-*`.
+
+Tests: `uv run pytest tests/preparation`. The opt-in real-data smoke (`tests/preparation/test_real_data_smoke.py`) runs with `SHADOW_TRADER_RAW_ROOT=/data/shadow-trader uv run pytest -m slow tests/preparation`; it needs a built 5-minute EURUSD ingestion Dataset spanning over a year under that root and is skipped otherwise.
+
+Polars upgrades: the full preparation suite (goldens, parity, causality, leakage) must pass; any changed golden means a new feature spec version. See the upgrade rule in ADR 0004.
