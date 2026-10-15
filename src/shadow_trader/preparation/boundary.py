@@ -112,9 +112,18 @@ def _gap_between_splits(ctx: BoundaryContext) -> str | None:
 
 
 def _no_window_before_dataset_start(ctx: BoundaryContext) -> str | None:
-    """Each feature is null for its first ``lookback`` Bars of the Dataset."""
+    """Each finite-memory feature is null for its first ``lookback`` Bars.
+
+    Recursive columns (``tolerance > 0``: EMA, RSI, Wilder ATR) are skipped: their
+    ``lookback`` is the memory length that sizes the Embargo and the live Tail
+    (ADR 0004), not their first valid Bar. They are seeded inside the Session and
+    legitimately non-null early. Their windows cannot cross a Session start because
+    they are computed per ``session_id``, and a Dataset starts at a Session open.
+    """
     for role, part in ctx.roles.items():
         for column in ctx.spec.columns:
+            if column.tolerance:
+                continue
             head = part.frame[column.name].head(column.lookback)
             if head.null_count() != head.len():
                 return (
