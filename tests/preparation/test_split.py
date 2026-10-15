@@ -175,6 +175,7 @@ def test_manifests_name_their_siblings_and_carry_the_boundary_check(tmp_path):
         "usable_bars",
         "gap_between_splits",
         "window_before_dataset_start",
+        "scaler_fit_range",
     ]
 
 

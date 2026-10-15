@@ -11,6 +11,7 @@ the default Embargo is ``E = 288 + EPISODE_BARS`` Bars.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -56,14 +57,42 @@ def priced(
     )
 
 
+WIGGLE_FROM = 100  # Bars of the first Session before the price wiggle starts
+
+
+def wiggled(bar: Bar, i: int) -> Bar:
+    """Break the exact doubling (and constant spread) so scaler IQRs are non-zero.
+
+    Applied to the first (train) Session from ``WIGGLE_FROM`` on, so every
+    validation / test value and the early train rows keep their exact values.
+    """
+    factor = 1.0 + 0.01 * ((i * 7) % 5)
+    assert bar.open is not None and bar.high is not None
+    assert bar.low is not None and bar.close is not None
+    return replace(
+        bar,
+        open=bar.open * factor * (1 + 0.002 * (i % 4)),
+        high=bar.high * factor * 1.01,
+        low=bar.low * factor * 0.98,
+        close=bar.close * factor,
+        spread_close=0.0001 * (1 + (i % 3)),
+        spread_mean=0.0001 * (1 + (i % 4)),
+    )
+
+
 def session_bars(
     instrument: str,
     session: datetime,
     count: int = BARS_PER_SESSION,
     gaps: tuple[int, ...] = (GAP_INDEX,),
     flags: dict[int, tuple[str, ...]] | None = None,
+    wiggle: bool = True,
 ) -> list[Bar]:
-    """One Session of Bars; ``gaps`` and ``flags`` apply to the first Session only."""
+    """One Session of Bars; ``gaps`` and ``flags`` apply to the first Session only.
+
+    ``wiggle`` perturbs the first Session (see ``wiggled``); pass ``False`` for
+    the exact doubling, whose constant returns have a zero IQR.
+    """
     first = session == SESSION_1
     bars: list[Bar] = []
     for i in range(count):
@@ -72,7 +101,10 @@ def session_bars(
             bars.append(gap_bar(instrument, opened, session))
         else:
             bar_flags = (flags or {}).get(i, ()) if first else ()
-            bars.append(priced(instrument, opened, session, i, bar_flags))
+            bar = priced(instrument, opened, session, i, bar_flags)
+            if wiggle and first and i >= WIGGLE_FROM:
+                bar = wiggled(bar, i)
+            bars.append(bar)
     return bars
 
 
@@ -84,6 +116,7 @@ def write_ingestion(
     gaps: tuple[int, ...] = (GAP_INDEX,),
     flags: dict[int, tuple[str, ...]] | None = None,
     sessions: tuple[datetime, ...] = SESSIONS,
+    wiggle: bool = True,
 ) -> DatasetRef:
     """Write a synthetic ingestion Dataset under ``root / "ingestion"``."""
     path = root / "ingest.toml"
@@ -94,7 +127,9 @@ def write_ingestion(
     )
     bars = {
         pair: [
-            bar for s in sessions for bar in session_bars(pair, s, count, gaps, flags)
+            bar
+            for s in sessions
+            for bar in session_bars(pair, s, count, gaps, flags, wiggle)
         ]
         for pair in instruments
     }
