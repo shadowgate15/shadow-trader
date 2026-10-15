@@ -18,6 +18,7 @@ from shadow_trader.ingestion.config import ConfigError
 
 from .build import BuildFailure, build_prepared
 from .config import load_prepared_config
+from .verify import verify_build
 
 EXIT_OK = 0
 EXIT_BUILD_FAILURE = 1
@@ -38,9 +39,36 @@ def add_prepare_parser(subparsers: argparse._SubParsersAction) -> None:  # type:
     group = build.add_mutually_exclusive_group()
     group.add_argument("-q", "--quiet", action="store_true", help="No progress.")
     group.add_argument("-v", "--verbose", action="store_true", help="More detail.")
+    verify = commands.add_parser(
+        "verify",
+        help="Audit a stored build without writing anything.",
+        description="Rehash Datasets, rerun boundary_check, resolve the scaler.",
+    )
+    verify.add_argument("build_id", help="The build to audit.")
+    verify.add_argument(
+        "--config", type=Path, required=True, help="Path to the TOML config."
+    )
+
+
+def run_verify(args: argparse.Namespace) -> int:
+    try:
+        config = load_prepared_config(args.config)
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+    checks = verify_build(config, args.build_id)
+    for check in checks:
+        print(
+            f"PASS {check.name}"
+            if check.passed
+            else f"FAIL {check.name}: {check.detail}"
+        )
+    return EXIT_OK if all(c.passed for c in checks) else EXIT_BUILD_FAILURE
 
 
 def run_prepare(args: argparse.Namespace) -> int:
+    if args.command == "verify":
+        return run_verify(args)
     try:
         config = load_prepared_config(args.config)
     except ConfigError as exc:
