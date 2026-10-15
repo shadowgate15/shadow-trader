@@ -107,8 +107,28 @@ def test_intact_build_reports_the_scaler_fit_checks(tmp_path, capsys):
     assert "scaler.ref" in out and "scaler.fit_matches_train" in out
 
 
-def test_unknown_build_fails_and_bad_config_is_exit_2(tmp_path, capsys):
-    config, _, _, _ = built(tmp_path, capsys)
+def test_unknown_build_gets_a_plain_message_and_bad_config_is_exit_2(tmp_path, capsys):
+    config, _, _, prepared = built(tmp_path, capsys)
+    absent = "ab" * 32
 
-    assert verify(config, "deadbeef") == 1
-    assert run(["prepare", "verify", "x", "--config", str(tmp_path / "no.toml")]) == 2
+    assert verify(config, absent) == 1
+    out = capsys.readouterr().out
+    assert f"no build record {absent} under {prepared}" in out
+    assert "Error" not in out
+    assert (
+        run(["prepare", "verify", absent, "--config", str(tmp_path / "no.toml")]) == 2
+    )
+
+
+def test_malformed_build_ids_are_a_bad_argument_and_never_touch_the_store(
+    tmp_path, capsys
+):
+    config, build_id, _, _ = built(tmp_path, capsys)
+
+    for bad in ("deadbeef", "../../x", "../../../x", build_id.upper(), build_id + "0"):
+        assert verify(config, bad) == 2
+    # Rejected before the config is read, so even a missing config is exit 2 quietly.
+    assert verify(tmp_path / "no.toml", "../x") == 2
+    err = capsys.readouterr().err
+    assert "64" in err and "hex" in err
+    assert "FileNotFoundError" not in err

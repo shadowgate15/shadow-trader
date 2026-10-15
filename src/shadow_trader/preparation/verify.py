@@ -9,6 +9,7 @@ written, repaired or modified, and no report file is produced.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,6 +26,8 @@ from .dataset import build_id_of, dataset_hash, open_prepared, partition_hash
 from .scaler import Scaler, fit_matches_train, load_scaler, scaler_fit_range_check
 from .spec import SPECS
 from .split import BOUND_NAMES, ROLES, RoleSlice, SplitBounds
+
+BUILD_ID_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,9 @@ def _parse(bounds: dict[str, str | None]) -> dict[str, datetime | None]:
 
 
 def verify_build(config: PreparedConfig, build_id: str) -> list[VerifyCheck]:
+    if not BUILD_ID_PATTERN.fullmatch(build_id):
+        # The id is joined into a path, so a malformed one never reaches the disk.
+        raise ValueError(f"build id must be 64 lowercase hex characters: {build_id!r}")
     root = config.paths.prepared_root
     results: list[VerifyCheck] = []
 
@@ -67,6 +73,8 @@ def verify_build(config: PreparedConfig, build_id: str) -> list[VerifyCheck]:
         if build_id_of(shared, record["datasets"]) != build_id:
             raise ValueError("record content does not hash to its build id")
         results.append(VerifyCheck("build_record"))
+    except FileNotFoundError:
+        return [VerifyCheck("build_record", f"no build record {build_id} under {root}")]
     except Exception as exc:
         return [VerifyCheck("build_record", f"{type(exc).__name__}: {exc}")]
 

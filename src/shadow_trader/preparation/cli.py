@@ -19,11 +19,19 @@ from shadow_trader.ingestion.config import ConfigError
 from .build import BuildFailure, build_prepared
 from .config import load_prepared_config
 from .report import console_summary
-from .verify import verify_build
+from .verify import BUILD_ID_PATTERN, verify_build
 
 EXIT_OK = 0
 EXIT_BUILD_FAILURE = 1
 EXIT_CONFIG_ERROR = 2
+
+
+def _build_id(text: str) -> str:
+    if not BUILD_ID_PATTERN.fullmatch(text):
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a build id (64 lowercase hex characters)"
+        )
+    return text
 
 
 def add_prepare_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -45,7 +53,7 @@ def add_prepare_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Audit a stored build without writing anything.",
         description="Rehash Datasets, rerun boundary_check, resolve the scaler.",
     )
-    verify.add_argument("build_id", help="The build to audit.")
+    verify.add_argument("build_id", type=_build_id, help="The build to audit.")
     verify.add_argument(
         "--config", type=Path, required=True, help="Path to the TOML config."
     )
