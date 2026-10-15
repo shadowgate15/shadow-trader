@@ -4,7 +4,7 @@ import sys
 
 from shadow_trader import main
 
-from .synthetic import write_ingestion, write_prepared_toml
+from .synthetic import split_toml, write_ingestion, write_prepared_toml
 
 
 def run(argv):
@@ -14,16 +14,43 @@ def run(argv):
         return exc.code if isinstance(exc.code, int) else 1
 
 
-def test_build_exits_0_and_prints_the_dataset_id(tmp_path, capsys):
+def test_build_exits_0_and_prints_the_build_and_dataset_ids(tmp_path, capsys):
     parent = write_ingestion(tmp_path)
     path = write_prepared_toml(tmp_path, parent.dataset_id)
 
     assert run(["prepare", "build", "--config", str(path), "-q"]) == 0
 
-    out = capsys.readouterr().out
-    assert out.startswith("built prepared dataset ")
-    dataset_id = out.split()[-1]
-    assert (tmp_path / "prepared/datasets" / dataset_id / "manifest.json").is_file()
+    first, *rest = capsys.readouterr().out.splitlines()
+    assert first.startswith("built prepared build ")
+    assert (tmp_path / "prepared/builds" / f"{first.split()[-1]}.json").is_file()
+    assert [line.split()[0] for line in rest] == ["train", "validation", "test"]
+    for line in rest:
+        dataset_id = line.split()[-1]
+        manifest = tmp_path / "prepared/datasets" / dataset_id / "manifest.json"
+        assert manifest.is_file()
+
+
+def test_failed_boundary_check_exits_1_naming_it_and_writes_nothing(tmp_path, capsys):
+    parent = write_ingestion(tmp_path)
+    path = write_prepared_toml(
+        tmp_path, parent.dataset_id, split=split_toml(episode_bars=5000)
+    )
+
+    assert run(["prepare", "build", "--config", str(path), "-q"]) == 1
+
+    assert "embargo_exceeds_dataset" in capsys.readouterr().err
+    assert not (tmp_path / "prepared").exists()
+
+
+def test_missing_episode_bars_is_a_config_error(tmp_path, capsys):
+    parent = write_ingestion(tmp_path)
+    path = write_prepared_toml(
+        tmp_path, parent.dataset_id, split=split_toml(episode_bars=None)
+    )
+
+    assert run(["prepare", "build", "--config", str(path), "-q"]) == 2
+
+    assert "embargo" in capsys.readouterr().err
 
 
 def test_missing_parent_dataset_exits_1(tmp_path, capsys):
@@ -83,7 +110,7 @@ def build_in_subprocess(config_path, threads):
         text=True,
         check=True,
     )
-    return out.stdout.split()[-1]
+    return out.stdout.split()  # the build id and the three role / Dataset id pairs
 
 
 def test_dataset_hash_is_identical_at_one_and_many_threads(tmp_path):

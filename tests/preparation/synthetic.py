@@ -1,8 +1,12 @@
-"""A tiny synthetic ingestion Dataset and prepared-config helpers.
+"""A synthetic ingestion Dataset and prepared-config helpers.
 
 Closes double every Bar within a Session (``BASE * 2**i``), so a log return
 over ``h`` Bars is exactly ``h * ln 2``; a Session's first ``h`` Bars have no
 return over ``h`` because windows never cross a Session start.
+
+Three weekly Sessions are written, each long enough for the spec's 288-Bar
+lookback: the default split makes Session 1 train, 2 validation and 3 test, and
+the default Embargo is ``E = 288 + EPISODE_BARS`` Bars.
 """
 
 from __future__ import annotations
@@ -17,8 +21,13 @@ from shadow_trader.preparation.config import PreparedConfig, load_prepared_confi
 
 SESSION_1 = datetime(2024, 1, 7, 22, 0, tzinfo=UTC)
 SESSION_2 = datetime(2024, 1, 14, 22, 0, tzinfo=UTC)
+SESSION_3 = datetime(2024, 1, 21, 22, 0, tzinfo=UTC)
+SESSIONS = (SESSION_1, SESSION_2, SESSION_3)
 BASE = 1.1
-BARS_PER_SESSION = 16
+BARS_PER_SESSION = 700
+LONGEST_LOOKBACK = 288
+EPISODE_BARS = 2
+EMBARGO = LONGEST_LOOKBACK + EPISODE_BARS
 GAP_INDEX = 5  # the Gap slot in the first Session
 
 
@@ -74,6 +83,7 @@ def write_ingestion(
     count: int = BARS_PER_SESSION,
     gaps: tuple[int, ...] = (GAP_INDEX,),
     flags: dict[int, tuple[str, ...]] | None = None,
+    sessions: tuple[datetime, ...] = SESSIONS,
 ) -> DatasetRef:
     """Write a synthetic ingestion Dataset under ``root / "ingestion"``."""
     path = root / "ingest.toml"
@@ -83,26 +93,55 @@ def write_ingestion(
         f"[build]\ninstruments = [{names}]\n"
     )
     bars = {
-        pair: session_bars(pair, SESSION_1, count, gaps, flags)
-        + session_bars(pair, SESSION_2, count, gaps, flags)
+        pair: [
+            bar for s in sessions for bar in session_bars(pair, s, count, gaps, flags)
+        ]
         for pair in instruments
     }
     return write_dataset(load_config(path), bar_size, bars)
 
 
-def write_prepared_toml(root: Path, dataset_id: str, extra: str = "") -> Path:
+def iso(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def split_toml(
+    train_start: datetime = SESSION_1,
+    validation_start: datetime = SESSION_2,
+    test_start: datetime = SESSION_3,
+    test_end: datetime | None = None,
+    episode_bars: int | None = EPISODE_BARS,
+) -> str:
+    text = (
+        '[split]\nscheme = "chronological"\n'
+        f"train_start = {iso(train_start)}\n"
+        f"validation_start = {iso(validation_start)}\n"
+        f"test_start = {iso(test_start)}\n"
+    )
+    if test_end is not None:
+        text += f"test_end = {iso(test_end)}\n"
+    if episode_bars is not None:
+        text += f"[embargo]\nepisode_bars = {episode_bars}\n"
+    return text
+
+
+def write_prepared_toml(
+    root: Path, dataset_id: str, extra: str = "", split: str | None = None
+) -> Path:
     path = root / "prepare.toml"
     path.write_text(
         f'[paths]\ndata_root = "{root / "ingestion"}"\n'
         f'prepared_root = "{root / "prepared"}"\n'
         f'[input]\ndataset_id = "{dataset_id}"\n'
-        "[spec]\nversion = 1\n" + extra
+        "[spec]\nversion = 1\n" + (split_toml() if split is None else split) + extra
     )
     return path
 
 
-def prepared_config(root: Path, dataset_id: str, extra: str = "") -> PreparedConfig:
-    return load_prepared_config(write_prepared_toml(root, dataset_id, extra))
+def prepared_config(
+    root: Path, dataset_id: str, extra: str = "", split: str | None = None
+) -> PreparedConfig:
+    return load_prepared_config(write_prepared_toml(root, dataset_id, extra, split))
 
 
 def write_bars(root: Path, bars: dict[str, list[Bar]], bar_size: int = 5) -> DatasetRef:
@@ -117,17 +156,20 @@ def write_bars(root: Path, bars: dict[str, list[Bar]], bar_size: int = 5) -> Dat
 
 
 def prepared_frame(root: Path, bars: list[Bar], version: int = 2):
-    """Build a prepared Dataset from one Instrument's Bars; return its frame."""
-    from shadow_trader.preparation import build_prepared, open_prepared
+    """Features and anomaly policy over one Instrument's Bars, read back from disk.
 
-    parent = write_bars(root, {"EURUSD": bars})
-    config = prepared_config(root, parent.dataset_id)
-    toml = (
-        (root / "prepare.toml")
-        .read_text()
-        .replace("version = 1", f"version = {version}")
+    Skips the split (these Bars are far shorter than a split's Embargo): the
+    frame is written as a plain prepared Dataset and read through the public API.
+    """
+    from shadow_trader.preparation import SPECS, open_prepared
+    from shadow_trader.preparation.build import featured_frame
+    from shadow_trader.preparation.dataset import write_prepared
+
+    spec = SPECS[version]
+    ref = write_prepared(
+        root / "prepared",
+        {"EURUSD": featured_frame(bars, spec)},
+        parent_ingestion="synthetic",
+        spec=spec,
     )
-    (root / "prepare.toml").write_text(toml)
-    config = load_prepared_config(root / "prepare.toml")
-    ref = build_prepared(config)
-    return open_prepared(config.paths.prepared_root, ref.dataset_id).read("EURUSD")
+    return open_prepared(root / "prepared", ref.dataset_id).read("EURUSD")

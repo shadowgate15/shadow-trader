@@ -17,7 +17,7 @@ from .synthetic import (
     SESSION_1,
     prepared_frame,
     priced,
-    write_bars,
+    write_ingestion,
     write_prepared_toml,
 )
 from .test_cli import build_in_subprocess
@@ -93,10 +93,7 @@ def test_each_column_recovers_after_a_gap_by_its_own_lookback(tmp_path):
 
 
 def test_finite_memory_dataset_hash_is_identical_at_one_and_many_threads(tmp_path):
-    bars = alternating()
-    bars[100] = gap_bar("EURUSD", bars[100].open_time, SESSION_1)
-    bars[150] = replace(bars[150], quality_flags=("price_spike",), tick_count=None)
-    parent = write_bars(tmp_path, {"EURUSD": bars})
+    parent = write_ingestion(tmp_path, gaps=(10,), flags={20: ("price_spike",)})
     ids = []
     for name, threads in (("one", 1), ("many", 4)):
         path = write_prepared_toml(tmp_path, parent.dataset_id)
