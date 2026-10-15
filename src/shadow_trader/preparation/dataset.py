@@ -166,6 +166,33 @@ def _builder_version() -> str | None:
         return None
 
 
+def _previous_same_role(
+    prepared_root: Path,
+    dataset_id: str,
+    manifest: Mapping[str, Any],
+    role: object,
+) -> Mapping[str, Any] | None:
+    """The latest other complete Dataset of the same role and series, if any.
+
+    Same role, bar size, Instruments, spec hash and policy hash. Only a source of
+    lineage and of linkable partitions: a link still needs a matching row hash.
+    """
+    found: list[tuple[str, Mapping[str, Any]]] = []
+    for path in (prepared_root / "datasets").glob("*/manifest.json"):
+        other = json.loads(path.read_text())
+        if (
+            other.get("kind") == KIND
+            and other["dataset_id"] != dataset_id
+            and other.get("role") == role
+            and other["bar_size"] == manifest["bar_size"]
+            and other["instruments"] == manifest["instruments"]
+            and other["feature_spec"]["hash"] == manifest["feature_spec"]["hash"]
+            and other["anomaly_policy"]["hash"] == manifest["anomaly_policy"]["hash"]
+        ):
+            found.append((other["created_at"], other))
+    return max(found, key=lambda item: item[0])[1] if found else None
+
+
 @dataclass(frozen=True)
 class PreparedPlan:
     """A prepared Dataset whose content hash is known but which is not written yet.
@@ -193,19 +220,53 @@ class PreparedPlan:
         if target.exists():  # incomplete earlier attempt: never read, safe to discard
             shutil.rmtree(target)
 
+        extra = dict(manifest_extra or {})
+        prepared_parent = _previous_same_role(
+            Path(prepared_root), self.dataset_id, self._manifest, extra.get("role")
+        )
+        parent_hashes: dict[str, str] = {}
+        if prepared_parent is not None:
+            parent_hashes = {
+                p["path"]: p["hash"] for p in prepared_parent["partitions"]
+            }
+        open_year: dict[str, int] = {}
+        for key, (pair, *_rest) in self._parts.items():
+            year = int(key.rsplit("=", 1)[1])
+            open_year[pair] = max(open_year.get(pair, year), year)
+
         entries: list[dict[str, Any]] = []
         for key, (pair, digest, rows, table) in sorted(self._parts.items()):
             rel = f"bars/{key}/part-0.parquet"
             dest = target / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
-            pq.write_table(table, dest)
+            closed = int(key.rsplit("=", 1)[1]) < open_year[pair]
+            # Link only a closed partition whose row hash matches the previous
+            # same-role Dataset's; anything else (open year, mismatch) is rewritten.
+            if (
+                closed
+                and prepared_parent is not None
+                and parent_hashes.get(rel) == digest
+            ):
+                source = (
+                    Path(prepared_root) / "datasets" / prepared_parent["dataset_id"]
+                )
+                try:
+                    os.link(source / rel, dest)
+                except OSError:  # e.g. no hardlink support: fall back to a write
+                    pq.write_table(table, dest)
+            else:
+                pq.write_table(table, dest)
             entries.append(
                 {"instrument": pair, "path": rel, "rows": rows, "hash": digest}
             )
 
         manifest = {
             **self._manifest,
-            **(manifest_extra or {}),
+            **extra,
+            # Lineage (recorded, never hashed): the previous same-role Dataset.
+            "prepared_parent": (
+                prepared_parent["dataset_id"] if prepared_parent else None
+            ),
             "partitions": entries,
             "row_count": sum(e["rows"] for e in entries),
             # Provenance: recorded, never hashed.
