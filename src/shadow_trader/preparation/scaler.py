@@ -84,20 +84,22 @@ class Scaler:
 
     @overload
     def apply(
-        self, frame: pl.DataFrame, *, spec_hash: str | None = ...
+        self, frame: pl.DataFrame, *, spec_hash: str | None
     ) -> pl.DataFrame: ...
     @overload
     def apply(
-        self, frame: pl.LazyFrame, *, spec_hash: str | None = ...
+        self, frame: pl.LazyFrame, *, spec_hash: str | None
     ) -> pl.LazyFrame: ...
     def apply(
-        self, frame: pl.DataFrame | pl.LazyFrame, *, spec_hash: str | None = None
+        self, frame: pl.DataFrame | pl.LazyFrame, *, spec_hash: str | None
     ) -> pl.DataFrame | pl.LazyFrame:
         """Scale ``feat_*`` columns; same kind, same names, nulls preserved.
 
-        ``spec_hash`` is the feature spec hash of the frame's Dataset (from its
-        manifest); a mismatch with the artifact is refused. The frame's ``feat_*``
-        column set must always equal the artifact's.
+        ``spec_hash`` is required: the feature spec hash of the frame's Dataset
+        (``manifest["feature_spec"]["hash"]``), since a bare frame cannot say
+        which spec produced it. A mismatch with the artifact is refused. Pass
+        ``spec_hash=None`` only to opt out explicitly; the frame's ``feat_*``
+        column set must equal the artifact's either way.
         """
         if spec_hash is not None and spec_hash != self.artifact["spec_hash"]:
             raise ScalerError(

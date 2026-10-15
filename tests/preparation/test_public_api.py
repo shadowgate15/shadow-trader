@@ -77,7 +77,9 @@ def test_build_open_and_load_scaler_work_from_the_package_root(tmp_path):
     assert train.manifest["role"] == "train"
     assert train.read("EURUSD").height
     scaler = load_scaler(config.paths.prepared_root, train.manifest["scaler"]["id"])
-    assert scaler.apply(train.read("EURUSD")).columns == train.read("EURUSD").columns
+    assert scaler.apply(
+        train.read("EURUSD"), spec_hash=train.manifest["feature_spec"]["hash"]
+    ).columns == train.read("EURUSD").columns
     # fit under spec v1, so the live spec (v3) is refused
     with pytest.raises(ScalerError):
         check_compat(scaler, FEATURE_SPEC)
