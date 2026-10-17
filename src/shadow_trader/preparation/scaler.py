@@ -1,0 +1,286 @@
+"""The scaler: a train-only fit, an immutable hash-addressed artifact and ``apply``.
+
+Robust scaling ``(x - median) / IQR`` (IQR = p75 - p25) then a clip at +-5, fit on
+the train Dataset only, per Instrument and column over non-null values. Columns
+whose spec marks them ``identity`` (time/session sin/cos, ``is_rollover``) are
+left alone. The fit is static: there is no refit. Prepared Datasets keep
+unscaled ``feat_*``; scaled values are only ever produced by ``Scaler.apply``.
+
+The artifact is JSON stored at ``<prepared_root>/scalers/<scaler_id>.json``;
+``scaler_id`` is the SHA-256 of its canonical content, so it is immutable.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, overload
+
+import polars as pl
+
+from ._io import atomic_write_json, canonical_json
+from .boundary import BoundaryContext, Check
+from .spec import FeatureSpec
+
+SCALER_VERSION = 1
+MIN_N_FIT = 30  # fewest non-null train values a robust_clip column may be fit on
+CLIP = 5.0
+ROBUST = "robust_clip"
+IDENTITY = "identity"
+
+
+class ScalerError(Exception):
+    """A scaler artifact is missing, corrupt or does not fit the frame."""
+
+
+class ScalerFitError(ScalerError):
+    """The fit is degenerate (CLI exit code 1); ``code`` is the closed failure code."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+        self.detail = detail
+
+
+@dataclass(frozen=True)
+class Scaler:
+    """A loaded scaler artifact."""
+
+    artifact: Mapping[str, Any]
+
+    @property
+    def scaler_id(self) -> str:
+        return hashlib.sha256(canonical_json(self.artifact)).hexdigest()
+
+    def _columns(self) -> set[str]:
+        return {
+            name
+            for entry in self.artifact["instruments"].values()
+            for name in entry["columns"]
+        }
+
+    def _expression(self, name: str) -> pl.Expr | None:
+        branches = {
+            pair: entry["columns"][name]
+            for pair, entry in self.artifact["instruments"].items()
+            if entry["columns"][name]["method"] == ROBUST
+        }
+        if not branches:
+            return None
+        value = pl.col(name)
+        chain: Any = pl
+        for pair, stats in branches.items():
+            scaled = ((value - stats["median"]) / stats["iqr"]).clip(-CLIP, CLIP)
+            chain = chain.when(pl.col("instrument") == pair).then(scaled)
+        return chain.otherwise(None).alias(name)
+
+    @overload
+    def apply(self, frame: pl.DataFrame, *, spec_hash: str | None) -> pl.DataFrame: ...
+    @overload
+    def apply(self, frame: pl.LazyFrame, *, spec_hash: str | None) -> pl.LazyFrame: ...
+    def apply(
+        self, frame: pl.DataFrame | pl.LazyFrame, *, spec_hash: str | None
+    ) -> pl.DataFrame | pl.LazyFrame:
+        """Scale ``feat_*`` columns; same kind, same names, nulls preserved.
+
+        ``spec_hash`` is required: the feature spec hash of the frame's Dataset
+        (``manifest["feature_spec"]["hash"]``), since a bare frame cannot say
+        which spec produced it. A mismatch with the artifact is refused. Pass
+        ``spec_hash=None`` only to opt out explicitly; the frame's ``feat_*``
+        column set must equal the artifact's either way.
+        """
+        if spec_hash is not None and spec_hash != self.artifact["spec_hash"]:
+            raise ScalerError(
+                f"spec hash mismatch: scaler was fit on spec "
+                f"{self.artifact['spec_hash']}, the frame is spec {spec_hash}"
+            )
+        names = (
+            frame.columns
+            if isinstance(frame, pl.DataFrame)
+            else frame.collect_schema().names()
+        )
+        present = {n for n in names if n.startswith("feat_")}
+        if present != self._columns():
+            raise ScalerError(
+                "feature columns do not match the scaler: "
+                f"missing {sorted(self._columns() - present)}, "
+                f"unexpected {sorted(present - self._columns())}"
+            )
+        fitted = set(self.artifact["instruments"])
+        seen = (
+            frame.select(pl.col("instrument").unique())
+            if isinstance(frame, pl.DataFrame)
+            else frame.select(pl.col("instrument").unique()).collect()
+        )["instrument"].drop_nulls()
+        unfitted = sorted(set(seen.to_list()) - fitted)
+        if unfitted:
+            raise ScalerError(
+                f"the frame has Instruments the scaler has no statistics for: "
+                f"{unfitted}; the scaler is fit on {sorted(fitted)}"
+            )
+        expressions = [
+            e for n in sorted(present) if (e := self._expression(n)) is not None
+        ]
+        return frame.with_columns(*expressions)
+
+
+def fit_scaler(
+    train: pl.DataFrame,
+    spec: FeatureSpec,
+    *,
+    policy_hash: str,
+    fit_dataset: str,
+) -> Scaler:
+    """Fit on the train frame (all Instruments, with an ``instrument`` column)."""
+    if train.height == 0:
+        raise ScalerFitError("scaler_insufficient_fit", "the train Dataset is empty")
+    instruments: dict[str, Any] = {}
+    for (pair,), part in train.group_by("instrument", maintain_order=True):
+        columns: dict[str, Any] = {}
+        for column in spec.columns:
+            if column.scaling == IDENTITY:
+                columns[column.name] = {"method": IDENTITY}
+                continue
+            values = part[column.name].drop_nulls()
+            n_fit = len(values)
+            if n_fit < MIN_N_FIT:
+                raise ScalerFitError(
+                    "scaler_insufficient_fit",
+                    f"{pair} {column.name} has {n_fit} non-null train values; "
+                    f"at least {MIN_N_FIT} are required",
+                )
+            median, p25, p75 = (
+                values.to_frame("v")
+                .select(
+                    pl.col("v").median().alias("median"),
+                    pl.col("v").quantile(0.25, "linear").alias("p25"),
+                    pl.col("v").quantile(0.75, "linear").alias("p75"),
+                )
+                .row(0)
+            )
+            if p75 - p25 == 0:
+                raise ScalerFitError(
+                    "zero_iqr",
+                    f"{pair} {column.name} has a zero IQR over its {n_fit} train "
+                    "values and cannot be robust-scaled",
+                )
+            columns[column.name] = {
+                "method": ROBUST,
+                "median": median,
+                "iqr": p75 - p25,
+                "n_fit": n_fit,
+            }
+        instruments[str(pair)] = {"columns": columns}
+    first, last = train.select(
+        pl.col("open_time").min().alias("first"),
+        pl.col("open_time").max().alias("last"),
+    ).row(0)
+    artifact = {
+        "kind": "scaler",
+        "scaler_version": SCALER_VERSION,
+        "spec_version": spec.version,
+        "spec_hash": spec.hash,
+        "anomaly_policy_hash": policy_hash,
+        "fit_dataset": fit_dataset,
+        "fit_range": [first.isoformat(), last.isoformat()],
+        "clip": CLIP,
+        "instruments": instruments,
+    }
+    return Scaler(artifact)
+
+
+def scaler_fit_range_check(scaler: Scaler) -> Check:
+    """The ``boundary_check`` check: the fit range lies inside the train range.
+
+    Judged twice, independently of how the fit range was derived: against the
+    Instrument's actual train rows and against the split's train bounds
+    (``train_start`` up to, not including, ``validation_start``).
+    """
+
+    def check(ctx: BoundaryContext) -> str | None:
+        frame = ctx.roles["train"].frame
+        if frame.height == 0:
+            return None  # reported by dataset_length
+        low, high = frame.select(
+            pl.col("open_time").min().alias("low"),
+            pl.col("open_time").max().alias("high"),
+        ).row(0)
+        start, end = (datetime.fromisoformat(v) for v in scaler.artifact["fit_range"])
+        if start < low or end > high:
+            return (
+                f"scaler fit range {start.isoformat()}..{end.isoformat()} is not "
+                f"inside the train range {low.isoformat()}..{high.isoformat()}"
+            )
+        bound_start, bound_end = ctx.bounds.start("train"), ctx.bounds.end("train")
+        if start < bound_start or (bound_end is not None and end >= bound_end):
+            return (
+                f"scaler fit range {start.isoformat()}..{end.isoformat()} is not "
+                f"inside the train bounds {bound_start.isoformat()}.."
+                f"{'open' if bound_end is None else bound_end.isoformat()}"
+            )
+        return None
+
+    return check
+
+
+def fit_matches_train(
+    scaler: Scaler, train: Mapping[str, pl.DataFrame], train_dataset_id: str
+) -> str | None:
+    """Compare a stored artifact with the stored train Dataset it claims to be fit on.
+
+    ``train`` maps each Instrument to its train rows. Returns a detail string on
+    mismatch: the artifact's ``fit_dataset`` must be the train Dataset's id and
+    its ``fit_range`` the first and last ``open_time`` over all Instruments.
+    """
+    if scaler.artifact["fit_dataset"] != train_dataset_id:
+        return (
+            f"scaler fit_dataset {scaler.artifact['fit_dataset']} is not the train "
+            f"Dataset {train_dataset_id}"
+        )
+    lows, highs = zip(
+        *(
+            frame.select(
+                pl.col("open_time").min().alias("low"),
+                pl.col("open_time").max().alias("high"),
+            ).row(0)
+            for frame in train.values()
+        ),
+        strict=True,
+    )
+    actual = [min(lows).isoformat(), max(highs).isoformat()]
+    if list(scaler.artifact["fit_range"]) != actual:
+        return (
+            f"scaler fit range {scaler.artifact['fit_range']} differs from the "
+            f"train Dataset's range {actual}"
+        )
+    return None
+
+
+def scaler_path(prepared_root: Path, scaler_id: str) -> Path:
+    return Path(prepared_root) / "scalers" / f"{scaler_id}.json"
+
+
+def write_scaler(prepared_root: Path, scaler: Scaler) -> Path:
+    """Write the immutable artifact by atomic rename; an existing one is kept."""
+    path = scaler_path(prepared_root, scaler.scaler_id)
+    if path.is_file():
+        return path
+    atomic_write_json(path, scaler.artifact)
+    return path
+
+
+def load_scaler(prepared_root: Path, scaler_id: str) -> Scaler:
+    """Load a scaler from the prepared root; its content must hash to the id."""
+    path = scaler_path(prepared_root, scaler_id)
+    if not path.is_file():
+        raise ScalerError(f"scaler {scaler_id} not found under {prepared_root}")
+    scaler = Scaler(json.loads(path.read_text()))
+    if scaler.scaler_id != scaler_id:
+        raise ScalerError(
+            f"scaler artifact hash mismatch: {path} hashes to {scaler.scaler_id}"
+        )
+    return scaler

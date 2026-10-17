@@ -70,3 +70,27 @@ _Avoid_: Correction, patch
 **Repair window**:
 The period after a live Bar closes during which late or catch-up quotes may still produce a new Revision. Once it passes, the Bar is sealed and later quotes are dropped and counted.
 _Avoid_: Grace period, lookback
+
+**Feature spec**:
+The versioned definition of every `feat_*` column a prepared Dataset carries: what each is computed from and over how many Bars it looks back. Each feature value for a Bar depends only on that Bar and earlier ones. A change to any definition produces a new version, never an edit. The volatility family is the sample std of 1-Bar returns over horizons 3 and up (a std of one return is undefined, so there is no 1-Bar volatility column) plus ATR over close from spec v4.
+_Avoid_: Feature config, indicator list
+
+**Warm-up**:
+The stretch at the start of a Session, or of a Dataset, during which a history-dependent feature has not yet seen a full lookback inside it. Features are null throughout; a window never crosses a Session boundary. In live use, the extra Bars a recursive feature needs beyond its lookback before a Tail's last value matches the full-history value.
+_Avoid_: Burn-in, priming
+
+**Usable Bar**:
+A prepared Bar that is priced, carries no distrusted quality flag, and has every history-dependent feature present. Everything else is unusable, and a Bar records why; a feature left null by a missing input (such as `tick_count`) is reported as `window_contains_gap`. Raw rows are never changed to express this.
+_Avoid_: Valid Bar, clean Bar
+
+**Embargo**:
+The stretch of Bars cut from the end of an earlier split so that nothing used for training or selection on it can reach into the next split. Sized to the longest feature lookback plus the episode length, in Bars; the cut Bars are absent from that split's Dataset.
+_Avoid_: Purge, gap
+
+**Scaler**:
+The train-only statistics that rescale features into model inputs, stored as one immutable artifact per build and cited by spec, policy and training Dataset. Prepared Datasets always hold unscaled features; scaling happens at use.
+_Avoid_: Normalizer, preprocessor
+
+**Tail**:
+The most recent run of live Bars, long enough to cover the longest lookback plus Warm-up, from which live features for the latest Bar are computed with the same definitions as a batch build. A short Tail yields null features, not errors.
+_Avoid_: Window, buffer
