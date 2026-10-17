@@ -1,4 +1,6 @@
+import re
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 
@@ -159,6 +161,24 @@ def test_unknown_distrusted_flag_names_are_refused_with_the_known_set(tmp_path):
         )
     )
     assert config.anomaly.distrusted_flags == ("spread_spike", "suspected_outage")
+
+
+def test_readme_example_config_loads(tmp_path):
+    readme = (Path(__file__).parents[2] / "README.md").read_text()
+    section = readme.split("\n## Dataset preparation\n", 1)[1].split("\n## ", 1)[0]
+    blocks = re.findall(r"^```toml\n(.*?)^```", section, re.DOTALL | re.MULTILINE)
+    assert len(blocks) == 1, "expected one toml example under Dataset preparation"
+    text = blocks[0]
+    text = text.replace("/data/shadow-trader-prepared", str(tmp_path / "prepared"))
+    text = text.replace("/data/shadow-trader", str(tmp_path / "ingestion"))
+    text = text.replace("<ingestion dataset_id>", "abc")
+    path = tmp_path / "prepare.toml"
+    path.write_text(text)
+
+    config = load_prepared_config(path)
+
+    assert config.input.dataset_id == "abc"
+    assert config.embargo.episode_bars >= 1
 
 
 def test_an_empty_distrusted_flags_list_is_refused(tmp_path):
