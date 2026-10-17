@@ -307,3 +307,34 @@ def test_apply_requires_the_spec_hash_unless_explicitly_opted_out(tmp_path):
         scaler.apply(frame)  # type: ignore[call-arg]
     # None is the explicit opt-out; the feat_* column set is still checked.
     assert scaler.apply(frame, spec_hash=None).columns == frame.columns
+
+
+def test_apply_refuses_an_instrument_the_scaler_was_not_fit_on(tmp_path):
+    config, ref, scaler = built_scaler(tmp_path)
+    frame = dataset(config, ref, "validation").read("EURUSD")
+    foreign = frame.with_columns(instrument=pl.lit("GBPUSD"))
+    spec_hash = spec_hash_of(scaler)
+
+    with pytest.raises(ScalerError, match="GBPUSD") as eager:
+        scaler.apply(foreign, spec_hash=spec_hash)
+    assert "EURUSD" in str(eager.value)  # names the Instruments it does have
+    # The lazy check refuses at apply time, before anything is collected.
+    with pytest.raises(ScalerError, match="GBPUSD"):
+        scaler.apply(foreign.lazy(), spec_hash=spec_hash)
+    assert scaler.apply(foreign.clear(), spec_hash=spec_hash).height == 0
+
+
+def test_apply_scales_a_frame_of_several_fitted_instruments(tmp_path):
+    config, ref, scaler = built_scaler(tmp_path)
+    frame = dataset(config, ref, "validation").read("EURUSD")
+    instruments = dict(scaler.artifact["instruments"])
+    instruments["GBPUSD"] = instruments["EURUSD"]
+    both = scaler_module.Scaler({**scaler.artifact, "instruments": instruments})
+    mixed = pl.concat([frame, frame.with_columns(instrument=pl.lit("GBPUSD"))])
+
+    scaled = both.apply(mixed, spec_hash=spec_hash_of(scaler))
+
+    single = scaler.apply(frame, spec_hash=spec_hash_of(scaler))
+    assert scaled.height == 2 * frame.height
+    assert scaled[FEATURE].null_count() == 2 * single[FEATURE].null_count()
+    assert scaled.head(frame.height).equals(single)

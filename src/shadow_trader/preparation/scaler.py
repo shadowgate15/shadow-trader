@@ -110,6 +110,18 @@ class Scaler:
                 f"missing {sorted(self._columns() - present)}, "
                 f"unexpected {sorted(present - self._columns())}"
             )
+        fitted = set(self.artifact["instruments"])
+        seen = (
+            frame.select(pl.col("instrument").unique())
+            if isinstance(frame, pl.DataFrame)
+            else frame.select(pl.col("instrument").unique()).collect()
+        )["instrument"].drop_nulls()
+        unfitted = sorted(set(seen.to_list()) - fitted)
+        if unfitted:
+            raise ScalerError(
+                f"the frame has Instruments the scaler has no statistics for: "
+                f"{unfitted}; the scaler is fit on {sorted(fitted)}"
+            )
         expressions = [
             e for n in sorted(present) if (e := self._expression(n)) is not None
         ]
