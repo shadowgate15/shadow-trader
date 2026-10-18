@@ -41,7 +41,12 @@ from .ledger import (
     LedgerError,
     verify_ledger,
 )
-from .observation import Observation, ObservationConfig, build_observation
+from .observation import (
+    Observation,
+    ObservationConfig,
+    build_observation,
+    window_inputs,
+)
 from .session_calendar import market_from_row
 
 if TYPE_CHECKING:
@@ -85,4 +90,5 @@ __all__ = [
     "market_from_row",
     "step",
     "verify_ledger",
+    "window_inputs",
 ]
