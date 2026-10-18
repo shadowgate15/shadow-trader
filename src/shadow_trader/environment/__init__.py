@@ -6,13 +6,16 @@ This ticket's pieces are the Gymnasium-free engine and ledger layers:
 - ``initial_state``, ``step``, ``Market``, ``EngineState``, ``StepEvents``: the pure
   engine implementing the Execution model.
 - ``LedgerBuilder``, ``Ledger``, ``verify_ledger``: reward-independent tables and
-  the invariant checker.
+  the invariant checker. Positions are FIFO lots; closed lots are in
+  ``StepEvents.closed_lots`` and the ledger ``closed_lots`` table.
 """
 
 from .config import ConfigError, EngineConfig, InstrumentSpec
 from .engine import (
+    ClosedLot,
     EngineState,
     Fill,
+    Lot,
     Market,
     StepEvents,
     initial_state,
@@ -20,6 +23,7 @@ from .engine import (
     step,
 )
 from .ledger import (
+    CLOSED_LOTS_SCHEMA,
     FILLS_SCHEMA,
     STEPS_SCHEMA,
     Ledger,
@@ -29,8 +33,10 @@ from .ledger import (
 )
 
 __all__ = [
+    "CLOSED_LOTS_SCHEMA",
     "FILLS_SCHEMA",
     "STEPS_SCHEMA",
+    "ClosedLot",
     "ConfigError",
     "EngineConfig",
     "EngineState",
@@ -39,6 +45,7 @@ __all__ = [
     "Ledger",
     "LedgerBuilder",
     "LedgerError",
+    "Lot",
     "Market",
     "StepEvents",
     "initial_state",
