@@ -85,6 +85,7 @@ def test_steps_and_fills_tables_have_the_documented_columns() -> None:
         "clipped",
         "closeout",
         "forced_flat",
+        "halt",
         "unfilled_forced_flat",
     ]
     assert ledger.steps.height == 5

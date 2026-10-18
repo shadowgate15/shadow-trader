@@ -64,6 +64,7 @@ from dataclasses import dataclass
 from .config import EngineConfig
 
 __all__ = [
+    "AccountSnapshot",
     "ClosedLot",
     "EngineState",
     "Fill",
@@ -71,9 +72,15 @@ __all__ = [
     "Market",
     "OrderPlan",
     "StepEvents",
+    "TargetMemo",
     "clip_order",
+    "engine_state_from_snapshot",
+    "halt_flatten",
     "initial_state",
     "level_to_units",
+    "memo_from_state",
+    "plan_order",
+    "snapshot_from_state",
     "step",
 ]
 
@@ -109,6 +116,7 @@ class Fill:
     clipped: bool = False  # the order was cut back by the margin limit
     closeout: bool = False  # the fill closes the position on margin closeout
     forced_flat: bool = False  # the fill is the Session-end force-flat
+    halt: bool = False  # live only: the fill is a Halt flatten (bypasses plan_order)
     unfilled_forced_flat: bool = False  # synthetic liquidation on an unfillable Bar
 
 
@@ -171,12 +179,47 @@ class StepEvents:
 
 @dataclass(frozen=True, slots=True)
 class OrderPlan:
-    """What an order wants and what the margin limit allows (signed units)."""
+    """What an order wants and what the margin limit allows (signed units).
+
+    ``override`` is ``None`` when the Policy's target stands, ``"session_end"``
+    when the Session-final Bar forces flat and ``"closeout"`` when the account is
+    under the closeout threshold; either way the plan is to go flat and
+    ``target_level`` / ``target_units`` are the (reset) target to carry forward.
+    """
 
     desired_delta: int
     allowed_delta: int
     clipped: bool
     shortfall: int  # target minus the post-fill position; 0 when nothing is clipped
+    override: str | None = None
+    target_level: float = 0.0
+    target_units: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class AccountSnapshot:
+    """A broker-style account snapshot: what a broker can report after a restart.
+
+    ``avg_prices`` is each open position's average entry price (empty when flat).
+    It cannot carry the frozen target, a pending order or FIFO lot detail; those
+    are reconciled by ``engine_state_from_snapshot`` (the broker wins on position,
+    cash and equity), not reconstructed.
+    """
+
+    cash: float
+    equity: float
+    positions: tuple[int, ...]
+    avg_prices: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TargetMemo:
+    """What live orchestration persists beside the broker's account: the last
+    accepted level and the unit target frozen when it changed (the shortfall to
+    retry is the unit target minus the position, so it needs no field)."""
+
+    target_levels: tuple[float, ...]
+    target_units: tuple[int, ...]
 
 
 def initial_state(
@@ -199,6 +242,54 @@ def initial_state(
         target_units=(0,) * n,
         lots=((),) * n,
         trusted_marks=trusted_marks,
+    )
+
+
+def snapshot_from_state(state: EngineState) -> AccountSnapshot:
+    """Project an engine state to what a broker would report."""
+    prices = tuple(
+        sum(lot.units * lot.price for lot in held) / sum(lot.units for lot in held)
+        if held
+        else 0.0
+        for held in state.lots
+    )
+    return AccountSnapshot(state.cash, state.equity, state.positions, prices)
+
+
+def memo_from_state(state: EngineState) -> TargetMemo:
+    """The target/retry memo of a state, for live orchestration to persist."""
+    return TargetMemo(state.target_levels, state.target_units)
+
+
+def engine_state_from_snapshot(
+    snapshot: AccountSnapshot, memo: TargetMemo | None, config: EngineConfig
+) -> EngineState:
+    """Rebuild an engine state from the broker's account and the saved memo.
+
+    The snapshot wins: position, cash and equity are the broker's. FIFO detail is
+    reconciled, not reconstructed: each open position becomes one lot at its
+    average price. The memo supplies the target; a missing memo (a crash before it
+    was written) means flat with nothing pending.
+    """
+    n = len(config.instruments)
+    if len(snapshot.positions) != n or (memo and len(memo.target_levels) != n):
+        raise ValueError(f"expected {n} position(s) for {config.symbols}")
+    lots: list[tuple[Lot, ...]] = []
+    for i, held in enumerate(snapshot.positions):
+        if held == 0:
+            lots.append(())
+            continue
+        price = snapshot.avg_prices[i] if i < len(snapshot.avg_prices) else 0.0
+        if not price > 0.0:
+            raise ValueError(f"position {held} needs a positive average price")
+        lots.append((Lot(held, price),))
+    return EngineState(
+        cash=snapshot.cash,
+        equity=snapshot.equity,
+        positions=tuple(snapshot.positions),
+        target_levels=memo.target_levels if memo else (0.0,) * n,
+        target_units=memo.target_units if memo else (0,) * n,
+        lots=tuple(lots),
     )
 
 
@@ -263,11 +354,79 @@ def clip_order(
     return OrderPlan(desired, allowed - position, clipped, target_units - allowed)
 
 
+def _open_equity(state: EngineState, config: EngineConfig, markets: Sequence[Market]):
+    """Equity and used margin marked at the Bar's open, for the closeout check."""
+    equity = state.cash
+    used = 0.0
+    for i, spec in enumerate(config.instruments):
+        held = state.positions[i]
+        bar = markets[i]
+        mark = bar.open_bid + bar.open_spread if held < 0 else bar.open_bid
+        equity += held * mark
+        used += abs(held) * mark * spec.margin_rate
+    return equity, used
+
+
+def plan_order(
+    state: EngineState,
+    config: EngineConfig,
+    market: Market,
+    target: float,
+    instrument: int = 0,
+) -> OrderPlan:
+    """The one pre-trade clipping entry point (``step`` uses it too).
+
+    Applies the Session-end force-flat and the closeout override itself, so a
+    caller passes the Policy's target through untouched; ``override`` says which
+    applied. Otherwise a changed level freezes new units and the order is clipped
+    to the margin limit (``clip_order``).
+    """
+    if not -1.0 <= target <= 1.0:  # False for NaN as well
+        raise ValueError(f"target {target} is outside [-1, 1]")
+    cap = config.effective_leverage_cap
+    position = state.positions[instrument]
+    override: str | None = None
+    if market.is_session_final:
+        override = "session_end"
+    elif position != 0:
+        markets = [market] * len(config.instruments)
+        equity, used = _open_equity(state, config, markets)
+        if used > 0.0 and equity < config.closeout_fraction * used:
+            override = "closeout"
+    if override is not None:
+        level, units = 0.0, 0
+    elif target != state.target_levels[instrument]:  # a level change freezes units
+        level = float(target)
+        units = level_to_units(target, state.equity, market.open_bid, cap)
+    else:
+        level, units = float(target), state.target_units[instrument]
+    plan = clip_order(position, units, state.equity, market.open_bid, cap)
+    return OrderPlan(
+        plan.desired_delta,
+        plan.allowed_delta,
+        plan.clipped,
+        plan.shortfall,
+        override,
+        level,
+        units,
+    )
+
+
+def halt_flatten(
+    state: EngineState, config: EngineConfig, market: Market | Sequence[Market]
+) -> tuple[EngineState, StepEvents]:
+    """Live only: flatten at the open on a Halt. It bypasses ``plan_order`` (no
+    clipping, no override) and its fills carry the ``halt`` flag."""
+    return step(state, config, market, 0.0, halt=True)
+
+
 def step(
     state: EngineState,
     config: EngineConfig,
     market: Market | Sequence[Market],
     target: float | Sequence[float],
+    *,
+    halt: bool = False,
 ) -> tuple[EngineState, StepEvents]:
     """Advance one Bar: accept the target, fill at the open, mark to the close."""
     markets = (market,) if isinstance(market, Market) else tuple(market)
@@ -289,7 +448,6 @@ def step(
         for i, bar in enumerate(markets)
     ]
 
-    cap = config.effective_leverage_cap
     cash = state.cash
     positions = list(state.positions)
     target_units = list(state.target_units)
@@ -299,6 +457,7 @@ def step(
     shortfall = [0] * n
     clipped = False
     forced_flat = False
+    closed_at_open = False
     unfilled_forced_flat = False
     levels = [float(level) for level in targets]
     for i, spec in enumerate(config.instruments):
@@ -332,16 +491,12 @@ def step(
             )
             closed_lots.extend(_apply_fill(lots[i], i, -held, price))
             continue
-        if bar.is_session_final:  # the engine overrides the target: be flat
-            levels[i] = 0.0
-            target_units[i] = 0
-        elif targets[i] != state.target_levels[i]:  # a level change freezes new units
-            target_units[i] = level_to_units(
-                targets[i], state.equity, bar.open_bid, cap
-            )
-        plan = clip_order(
-            positions[i], target_units[i], state.equity, bar.open_bid, cap
-        )
+        if halt:  # a Halt flatten bypasses plan_order
+            plan = OrderPlan(-positions[i], -positions[i], False, 0)
+            levels[i], target_units[i] = 0.0, 0
+        else:
+            plan = plan_order(state, config, bar, targets[i], i)
+            levels[i], target_units[i] = plan.target_level, plan.target_units
         shortfall[i] = plan.shortfall
         clipped = clipped or plan.clipped
         delta = plan.allowed_delta
@@ -356,8 +511,10 @@ def step(
             spread_cost = 0.0
         cash -= delta * price
         positions[i] += delta
-        forced = bar.is_session_final
+        forced = plan.override == "session_end"
         forced_flat = forced_flat or forced
+        override_closeout = plan.override == "closeout"
+        closed_at_open = closed_at_open or override_closeout
         fills.append(
             Fill(
                 i,
@@ -366,7 +523,9 @@ def step(
                 spread_cost,
                 abs(delta) * slippage,
                 plan.clipped,
-                forced_flat=forced,
+                override_closeout,
+                forced,
+                halt,
             )
         )
         closed_lots.extend(_apply_fill(lots[i], i, delta, price))
@@ -400,7 +559,7 @@ def step(
 
     # Closeout: equity under the closeout fraction of used margin closes everything.
     all_fillable = all(bar.fillable for bar in markets)  # only trusted prices count
-    closeout = (
+    closeout = closed_at_open or (
         all_fillable
         and used_margin > 0.0
         and equity < config.closeout_fraction * used_margin

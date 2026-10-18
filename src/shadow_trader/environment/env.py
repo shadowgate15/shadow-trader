@@ -112,6 +112,18 @@ class TradingEnv(gym.Env):
         self._done = True
         self._explicit = False
         self._builder: LedgerBuilder | None = None
+        #: Dataset id and Scaler hash for manifests; ``make_env`` fills them in.
+        self.provenance: dict[str, str] = {}
+
+    @property
+    def config(self) -> EnvConfig:
+        return self._config
+
+    @property
+    def seed_entropy(self) -> int:
+        """Entropy of the env's current ``SeedSequence`` (recorded in manifests)."""
+        seed_seq = getattr(self.np_random.bit_generator, "seed_seq")  # noqa: B009
+        return int(seed_seq.entropy)
 
     @property
     def records_ledger(self) -> bool:
@@ -356,4 +368,9 @@ def make_env(
         config.engine.instruments[0].symbol,
         config.observation.bar_minutes,
     )
-    return TradingEnv(data, config, seed=seed, record_ledger=record_ledger)
+    env = TradingEnv(data, config, seed=seed, record_ledger=record_ledger)
+    env.provenance = {
+        "dataset_id": dataset.dataset_id,
+        "scaler_hash": scaler.scaler_id,
+    }
+    return env

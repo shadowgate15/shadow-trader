@@ -76,6 +76,7 @@ FILLS_SCHEMA: dict[str, pl.DataType] = {
     "clipped": pl.Boolean(),
     "closeout": pl.Boolean(),
     "forced_flat": pl.Boolean(),
+    "halt": pl.Boolean(),  # live only: a Halt flatten (always false in simulation)
     "unfilled_forced_flat": pl.Boolean(),  # synthetic liquidation on an unfillable Bar
 }
 
@@ -91,6 +92,8 @@ EPISODES_SCHEMA: dict[str, pl.DataType] = {
 }
 SESSION_END = "session_end"
 CLOSEOUT = "closeout"
+HALT = "halt"  # live only: the operator or watchdog halted the run
+STOPPED = "stopped"  # live only: the run was stopped
 
 CLOSED_LOTS_SCHEMA: dict[str, pl.DataType] = {
     "step": pl.Int64(),
@@ -214,6 +217,7 @@ class LedgerBuilder:
                     fill.clipped,
                     fill.closeout,
                     fill.forced_flat,
+                    fill.halt,
                     fill.unfilled_forced_flat,
                 )
             )
