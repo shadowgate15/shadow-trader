@@ -1,9 +1,14 @@
 """The Gymnasium environment layer: ``TradingEnv`` and ``make_env``.
 
 The env adds actions, episodes, reward and ``info`` on top of the pure engine,
-observation assembler and ledger. This is the skeleton: one agent step is exactly
-one Bar, and a training episode is a random window of ``EpisodeConfig.window_bars``
-Bars inside one Session whose Bars are all usable. A margin closeout ends the
+observation assembler and ledger. The agent acts only on Decision Bars (usable
+Bars): one env step advances at least one Bar and spans every following Gap or
+non-usable Bar with the target frozen, up to and including the next usable Bar, the
+window end or the Session end. The engine still runs on each spanned Bar, so
+pending fills, rollover and the Session-final force-flat happen; unfillable Bars
+are marked at the last trusted close. The observation is that of the last Decision
+Bar. A training episode is a random window of ``EpisodeConfig.window_bars``
+Bars inside one Session that starts on a usable Bar. A margin closeout ends the
 episode as ``terminated``; window end, Session end and dataset end are
 ``truncated``. On the Session's final Bar the engine forces any position flat at
 the open (the cost lands in that last step).
@@ -13,7 +18,11 @@ Session with ordinal ``k`` from ``start_bar`` (default: its first usable Bar) wi
 ``equity`` (default: the starting equity) through to the Session's end. Options
 make the episode fully deterministic; the RNG is not touched. ``chain=True`` keeps
 recording into the same Ledger (an evaluation sweep, see ``sweep.run_sweep``).
-Gap stepping arrives with a later ticket.
+
+``info`` reports ``bars_advanced`` (Bars stepped), ``gap_bars`` (Gap rows among
+them), ``unfillable_bars`` (Bars that could not fill: Gaps plus distrusted ones) and
+``blind_run`` (stepped Bars that were not Decision Bars, i.e. the agent was blind).
+There is no blind-run cap.
 
 Gymnasium is imported here (and in nothing else of the package); the package
 ``__init__`` exposes this module lazily.
@@ -22,6 +31,7 @@ Gymnasium is imported here (and in nothing else of the package); the package
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Any
 
 import gymnasium as gym
@@ -96,6 +106,7 @@ class TradingEnv(gym.Env):
         )
         self._state: EngineState | None = None
         self._row = 0
+        self._obs_row = 0  # the last Decision Bar: the observation is built there
         self._end = 0
         self._episode = -1
         self._done = True
@@ -151,8 +162,12 @@ class TradingEnv(gym.Env):
             start = int(self._starts[self.np_random.integers(len(self._starts))])
             self._end = start + self._config.episode.window_bars
             self._explicit = False
-        self._row = start
-        self._state = initial_state(self._config.engine, equity)
+        self._row = self._obs_row = start
+        self._state = initial_state(
+            self._config.engine,
+            equity,
+            ((float(data.close_bid[start]), float(data.close_spread[start])),),
+        )
         self._done = False
         self._episode += 1
         session = int(data.session_index[start])
@@ -183,21 +198,41 @@ class TradingEnv(gym.Env):
             raise RuntimeError("call reset() before step(): the episode is over")
         data = self._data
         previous = self._state.equity
-        row = self._row + 1
-        self._state, events = step(
-            self._state,
-            self._config.engine,
-            data.market(row),
-            self._levels[int(action)],
-        )
-        self._row = row
-        if self._builder is not None:
-            self._builder.add_step(
-                data.open_time[row],
-                events,
-                episode_id=self._episode,
-                session_id=int(data.session_index[row]),
+        level = self._levels[int(action)]
+        gap_bars = unfillable = blind = skipped = advanced = 0
+        flags = {"clipped": False, "closeout": False, "forced_flat": False}
+        unfilled_forced_flat = False
+        events = None
+        row = self._row
+        while True:
+            row += 1
+            self._state, events = step(
+                self._state, self._config.engine, data.market(row), level
             )
+            advanced += 1
+            decision = bool(data.usable[row])
+            blind = 0 if decision else blind + 1  # the run so far, 0 on a decision
+            skipped += int(not decision)
+            gap_bars += int(data.is_gap[row])
+            unfillable += int(not data.fillable[row])
+            flags["clipped"] |= events.clipped
+            flags["closeout"] |= events.closeout
+            flags["forced_flat"] |= events.forced_flat
+            unfilled_forced_flat |= events.unfilled_forced_flat
+            if self._builder is not None:
+                self._builder.add_step(
+                    data.open_time[row],
+                    events,
+                    episode_id=self._episode,
+                    session_id=int(data.session_index[row]),
+                    is_decision=decision,
+                    blind_run=blind,
+                )
+            if events.closeout or row >= self._end or decision:
+                break
+        self._row = row
+        if data.usable[row]:
+            self._obs_row = row
         terminated = events.closeout
         truncated = row >= self._end and not terminated
         self._done = terminated or truncated
@@ -214,10 +249,14 @@ class TradingEnv(gym.Env):
         info = {
             "ending": ending,
             "equity_delta": events.equity - previous,
-            "bars_advanced": 1,
-            "clipped": events.clipped,
-            "closeout": events.closeout,
-            "forced_flat": events.forced_flat,
+            "bars_advanced": advanced,
+            "gap_bars": gap_bars,
+            "unfillable_bars": unfillable,
+            "blind_run": skipped,
+            "clipped": flags["clipped"],
+            "closeout": flags["closeout"],
+            "forced_flat": flags["forced_flat"],
+            "unfilled_forced_flat": unfilled_forced_flat,
         }
         reward = log_return_reward(previous, events.equity, self._config.reward)
         return self._observation(), reward, terminated, truncated, info
@@ -262,11 +301,6 @@ class TradingEnv(gym.Env):
                 f"start_bar {offset} is not a usable Bar before the end of Session "
                 f"{session}"
             )
-        if not data.usable[start:hi].all() or not data.fillable[start:hi].all():
-            raise ValueError(
-                f"Session {session} has unusable Bars after the start; Gap stepping "
-                "is not supported yet"
-            )
         equity = options.get("equity", self._config.engine.starting_equity)
         if (
             isinstance(equity, bool)
@@ -280,12 +314,17 @@ class TradingEnv(gym.Env):
     def _observation(self) -> dict[str, np.ndarray]:
         assert self._state is not None
         data = self._data
-        window, valid = data.window(self._row, self._config.observation.window_bars)
+        row = self._obs_row  # the last Decision Bar; later Bars are blind
+        window, valid = data.window(row, self._config.observation.window_bars)
+        market = replace(
+            data.market(row),
+            bars_to_session_final=int(data.bars_to_session_final[self._row]),
+        )
         obs: Observation = build_observation(
             window,
             valid,
             self._state,
-            data.market(self._row),
+            market,
             self._config.engine,
             self._config.observation,
         )

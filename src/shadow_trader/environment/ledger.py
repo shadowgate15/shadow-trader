@@ -61,6 +61,9 @@ STEPS_SCHEMA: dict[str, pl.DataType] = {
     "clipped": pl.Boolean(),
     "shortfall_units": pl.Int64(),
     "closeout": pl.Boolean(),
+    "is_decision": pl.Boolean(),  # a usable Bar: the agent is consulted here
+    "carried_mark": pl.Boolean(),  # unfillable Bar, marked at the last trusted close
+    "blind_run": pl.Int64(),  # consecutive non-decision Bars so far, 0 on a decision
 }
 FILLS_SCHEMA: dict[str, pl.DataType] = {
     "step": pl.Int64(),
@@ -73,6 +76,7 @@ FILLS_SCHEMA: dict[str, pl.DataType] = {
     "clipped": pl.Boolean(),
     "closeout": pl.Boolean(),
     "forced_flat": pl.Boolean(),
+    "unfilled_forced_flat": pl.Boolean(),  # synthetic liquidation on an unfillable Bar
 }
 
 EPISODES_SCHEMA: dict[str, pl.DataType] = {
@@ -174,6 +178,8 @@ class LedgerBuilder:
         *,
         episode_id: int = 0,
         session_id: int = 0,
+        is_decision: bool = True,
+        blind_run: int = 0,
     ) -> None:
         index = len(self._steps)
         self._steps.append(
@@ -190,6 +196,9 @@ class LedgerBuilder:
                 events.clipped,
                 events.shortfall[0] if events.shortfall else 0,
                 events.closeout,
+                is_decision,
+                events.carried_mark,
+                blind_run,
             )
         )
         for fill in events.fills:
@@ -205,6 +214,7 @@ class LedgerBuilder:
                     fill.clipped,
                     fill.closeout,
                     fill.forced_flat,
+                    fill.unfilled_forced_flat,
                 )
             )
 
@@ -278,6 +288,7 @@ def verify_ledger(ledger: Ledger) -> None:
             if not problems:
                 problems.extend(_replay(ledger))
                 problems.extend(_check_closeout(ledger))
+                problems.extend(_check_unfillable(ledger))
     elif fills.height:
         problems.append("fills reference a step that is not in steps")
 
@@ -290,17 +301,18 @@ def _replay(ledger: Ledger) -> list[str]:
     steps, fills = ledger.steps, ledger.fills
     by_step: dict[int, list[tuple[int, float]]] = {}
     open_bid: dict[int, float] = {}  # per step: open bid behind its last opening fill
-    for s, units, price, spread, slip, closeout in zip(
+    for s, units, price, spread, slip, closeout, unfilled in zip(
         fills["step"].to_list(),
         fills["units"].to_list(),
         fills["price"].to_list(),
         fills["spread_cost"].to_list(),
         fills["slippage_cost"].to_list(),
         fills["closeout"].to_list(),
+        fills["unfilled_forced_flat"].to_list(),
         strict=True,
     ):
         by_step.setdefault(s, []).append((units, price))
-        if not closeout:  # a closeout fill is priced at the close, not the open
+        if not (closeout or unfilled):  # those are priced at the close, not the open
             per_unit = (spread + slip) / abs(units)
             open_bid[s] = price - per_unit if units > 0 else price + per_unit
 
@@ -468,6 +480,25 @@ def _check_closeout(ledger: Ledger) -> list[str]:
             problems.append(f"closeout row {s} is not flat")
         if s not in fill_steps:
             problems.append(f"closeout row {s} has no closeout-flagged fill")
+    return problems
+
+
+def _check_unfillable(ledger: Ledger) -> list[str]:
+    """Nothing fills on a carried-mark (unfillable) Bar except the synthetic
+    liquidation, which is flagged and sells or buys the whole position."""
+    steps, fills = ledger.steps, ledger.fills
+    carried = set(steps.filter(pl.col("carried_mark"))["step"].to_list())
+    problems: list[str] = []
+    for row in fills.iter_rows(named=True):
+        on_carried = row["step"] in carried
+        if on_carried and not row["unfilled_forced_flat"]:
+            problems.append(f"fill on unfillable step {row['step']}")
+        if row["unfilled_forced_flat"] and not on_carried:
+            problems.append(f"unfilled_forced_flat fill on fillable step {row['step']}")
+    for row in steps.filter(pl.col("carried_mark") & pl.col("is_decision")).iter_rows(
+        named=True
+    ):
+        problems.append(f"step {row['step']} is a decision Bar but unfillable")
     return problems
 
 

@@ -70,6 +70,9 @@ def test_steps_and_fills_tables_have_the_documented_columns() -> None:
         "clipped",
         "shortfall_units",
         "closeout",
+        "is_decision",
+        "carried_mark",
+        "blind_run",
     ]
     assert ledger.fills.columns == [
         "step",
@@ -82,6 +85,7 @@ def test_steps_and_fills_tables_have_the_documented_columns() -> None:
         "clipped",
         "closeout",
         "forced_flat",
+        "unfilled_forced_flat",
     ]
     assert ledger.steps.height == 5
     assert ledger.steps["position_units"].to_list()[:3] == [
