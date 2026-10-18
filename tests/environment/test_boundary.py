@@ -10,7 +10,15 @@ from pathlib import Path
 import shadow_trader.environment as environment
 
 PACKAGE = Path(environment.__file__).parent
-PURE_MODULES = ["__init__", "config", "engine", "ledger"]
+PURE_MODULES = [
+    "__init__",
+    "config",
+    "engine",
+    "ledger",
+    "env_config",
+    "reward",
+    "market_data",
+]
 
 
 def imported_roots(path: Path) -> set[str]:
@@ -30,4 +38,14 @@ def test_pure_modules_do_not_import_gymnasium() -> None:
 
 def test_importing_the_package_does_not_load_gymnasium() -> None:
     code = "import sys, shadow_trader.environment;sys.exit('gymnasium' in sys.modules)"
+    assert subprocess.run([sys.executable, "-I", "-c", code]).returncode == 0
+
+
+def test_env_exports_load_lazily() -> None:
+    code = (
+        "import sys, shadow_trader.environment as e;"
+        "assert 'gymnasium' not in sys.modules;"
+        "e.make_env; e.TradingEnv;"
+        "assert 'gymnasium' in sys.modules"
+    )
     assert subprocess.run([sys.executable, "-I", "-c", code]).returncode == 0
