@@ -94,3 +94,7 @@ _Avoid_: Normalizer, preprocessor
 **Tail**:
 The most recent run of live Bars, long enough to cover the longest lookback plus Warm-up, from which live features for the latest Bar are computed with the same definitions as a batch build. A short Tail yields null features, not errors.
 _Avoid_: Window, buffer
+
+**Run summary**:
+The counts and totals read straight off a Ledger for one run, and for each episode in it: Bars, decisions, fills, flagged events, costs, and starting and final equity. It holds no ratios, drawdowns or comparisons; those belong to evaluation.
+_Avoid_: Metrics, performance report
