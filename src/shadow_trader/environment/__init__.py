@@ -5,6 +5,10 @@ This ticket's pieces are the Gymnasium-free engine and ledger layers:
 - ``EngineConfig`` / ``InstrumentSpec``: frozen, validated, hashable configuration.
 - ``initial_state``, ``step``, ``Market``, ``EngineState``, ``StepEvents``: the pure
   engine implementing the Execution model.
+- ``market_from_row`` and the calendar helper (``session_calendar``): ``Market`` and
+  its Session-final, rollover and fillable facts from timestamps.
+- ``build_observation``, ``Observation``, ``ObservationConfig``: the pure,
+  Gymnasium-free observation assembler shared by training and live.
 - ``LedgerBuilder``, ``Ledger``, ``verify_ledger``: reward-independent tables and
   the invariant checker. Positions are FIFO lots; closed lots are in
   ``StepEvents.closed_lots`` and the ledger ``closed_lots`` table.
@@ -31,6 +35,8 @@ from .ledger import (
     LedgerError,
     verify_ledger,
 )
+from .observation import Observation, ObservationConfig, build_observation
+from .session_calendar import market_from_row
 
 __all__ = [
     "CLOSED_LOTS_SCHEMA",
@@ -47,9 +53,13 @@ __all__ = [
     "LedgerError",
     "Lot",
     "Market",
+    "Observation",
+    "ObservationConfig",
     "StepEvents",
+    "build_observation",
     "initial_state",
     "level_to_units",
+    "market_from_row",
     "step",
     "verify_ledger",
 ]

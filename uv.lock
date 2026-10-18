@@ -329,6 +329,7 @@ name = "shadow-trader"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "numpy" },
     { name = "polars" },
     { name = "pyarrow" },
     { name = "rich" },
@@ -348,6 +349,7 @@ oracle = [
 
 [package.metadata]
 requires-dist = [
+    { name = "numpy", specifier = ">=2.5.4" },
     { name = "polars", specifier = ">=2" },
     { name = "pyarrow", specifier = ">=26.0.0" },
     { name = "rich", specifier = ">=15.0.0" },

@@ -67,6 +67,7 @@ class Market:
     fillable: bool = True
     is_session_final: bool = False
     rollover_days: int = 0
+    bars_to_session_final: int = 0
 
 
 @dataclass(frozen=True, slots=True)
