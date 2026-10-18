@@ -98,3 +98,7 @@ _Avoid_: Window, buffer
 **Episode**:
 One run of the trading environment from a reset to its end, always inside a single Session. It starts flat on a usable Bar and ends either by margin closeout (terminated) or by a time-based end: a fixed window length, the Session's end, or the end of the Dataset (truncated).
 _Avoid_: Game, rollout, run
+
+**Decision Bar**:
+A usable Bar at whose close the agent is asked for an action. Every other Bar inside an Episode (a Gap, or a Bar made non-usable by a distrusted flag or a Gap in its lookback) is stepped through without consulting the agent, so one agent step can span several Bars.
+_Avoid_: Tick, turn
