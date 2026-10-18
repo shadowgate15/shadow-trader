@@ -10,13 +10,16 @@ This ticket's pieces are the Gymnasium-free engine and ledger layers:
 - ``build_observation``, ``Observation``, ``ObservationConfig``: the pure,
   Gymnasium-free observation assembler shared by training and live.
 - ``LedgerBuilder``, ``Ledger``, ``verify_ledger``: reward-independent tables and
-  the invariant checker.
+  the invariant checker. Positions are FIFO lots; closed lots are in
+  ``StepEvents.closed_lots`` and the ledger ``closed_lots`` table.
 """
 
 from .config import ConfigError, EngineConfig, InstrumentSpec
 from .engine import (
+    ClosedLot,
     EngineState,
     Fill,
+    Lot,
     Market,
     StepEvents,
     initial_state,
@@ -24,6 +27,7 @@ from .engine import (
     step,
 )
 from .ledger import (
+    CLOSED_LOTS_SCHEMA,
     FILLS_SCHEMA,
     STEPS_SCHEMA,
     Ledger,
@@ -35,8 +39,10 @@ from .observation import Observation, ObservationConfig, build_observation
 from .session_calendar import market_from_row
 
 __all__ = [
+    "CLOSED_LOTS_SCHEMA",
     "FILLS_SCHEMA",
     "STEPS_SCHEMA",
+    "ClosedLot",
     "ConfigError",
     "EngineConfig",
     "EngineState",
@@ -45,6 +51,7 @@ __all__ = [
     "Ledger",
     "LedgerBuilder",
     "LedgerError",
+    "Lot",
     "Market",
     "Observation",
     "ObservationConfig",

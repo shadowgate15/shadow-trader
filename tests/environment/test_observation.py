@@ -16,6 +16,7 @@ import pytest
 
 from shadow_trader.environment import (
     EngineConfig,
+    Lot,
     Market,
     Observation,
     ObservationConfig,
@@ -97,7 +98,11 @@ def test_pending_target_differs_from_position_before_the_fill() -> None:
 
 
 def test_position_frac_is_safety_clipped_at_five() -> None:
-    state = replace(initial_state(CONFIG), positions=(10_000_000,), entry_prices=(1.1,))
+    state = replace(
+        initial_state(CONFIG),
+        positions=(10_000_000,),
+        lots=((Lot(10_000_000, 1.1),),),
+    )
     obs = observe(state)
     assert obs.position[0, 0] == 5.0
     negative = replace(state, positions=(-10_000_000,))

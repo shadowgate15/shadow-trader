@@ -58,6 +58,15 @@ class Observation:
     account: npt.NDArray[np.float32]
 
 
+def _average_entry(state: EngineState, instrument: int) -> float:
+    """Unit-weighted average price of the open FIFO lots (0.0 when flat)."""
+    lots = state.lots[instrument] if state.lots else ()
+    units = sum(abs(lot.units) for lot in lots)
+    if units == 0:
+        return 0.0
+    return sum(abs(lot.units) * lot.price for lot in lots) / units
+
+
 def build_observation(
     scaled_window: npt.ArrayLike,
     valid: npt.ArrayLike,
@@ -93,7 +102,6 @@ def build_observation(
     features = np.where(row_ok[:, :, None], window, 0.0).astype(np.float32)
     out_valid = mask & row_ok
 
-    entries = engine_state.entry_prices or (0.0,) * n
     position = np.zeros((n, len(POSITION_FIELDS)), dtype=np.float64)
     used_margin = 0.0
     for i, spec in enumerate(config.instruments):
@@ -108,9 +116,10 @@ def build_observation(
         clip = observation_config.position_clip
         position[i, 0] = max(-clip, min(clip, units / max_units))
         position[i, 1] = engine_state.target_levels[i]
-        if units != 0 and entries[i] > 0:
+        entry = _average_entry(engine_state, i)
+        if units != 0 and entry > 0:
             direction = 1.0 if units > 0 else -1.0
-            position[i, 2] = direction * (mark - entries[i]) / entries[i]
+            position[i, 2] = direction * (mark - entry) / entry
         used_margin += abs(units) * mark * spec.margin_rate
 
     nominal = slots_per_session(observation_config.bar_minutes) - 1

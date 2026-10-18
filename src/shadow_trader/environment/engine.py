@@ -17,7 +17,14 @@ targets are tuples aligned with it while cash and equity are pooled (v1 is one
 Instrument, and ``step`` also accepts a bare ``Market`` and a bare target for that
 case).
 
-Not yet handled (later tickets): FIFO lots, margin clipping and shortfall retry,
+Open positions are held as FIFO lots (``Lot``, signed units at the fill price).
+A fill closes lots oldest first, each (partly) closed lot is reported as a
+``ClosedLot`` with its realised P&L, and any remainder opens a new lot (a flip
+through zero closes everything, then opens the opposite lot). Lot prices are
+fill prices, so spread and slippage are already inside realised P&L and the
+mark-to-market of open lots; no cost is subtracted again.
+
+Not yet handled (later tickets): margin clipping and shortfall retry,
 closeout, rollover accrual, Session-end force-flat and unfillable Bars. ``step``
 raises ``NotImplementedError`` for a ``Market`` that needs them rather than
 silently ignoring it.
@@ -32,8 +39,10 @@ from dataclasses import dataclass
 from .config import EngineConfig
 
 __all__ = [
+    "ClosedLot",
     "EngineState",
     "Fill",
+    "Lot",
     "Market",
     "StepEvents",
     "initial_state",
@@ -73,6 +82,29 @@ class Fill:
 
 
 @dataclass(frozen=True, slots=True)
+class Lot:
+    """An open FIFO lot: signed ``units`` (positive long) filled at ``price``."""
+
+    units: int
+    price: float
+
+
+@dataclass(frozen=True, slots=True)
+class ClosedLot:
+    """A lot (or the part of one) closed by a fill.
+
+    ``units`` is signed like the lot it closed (positive for a long) and
+    ``realised_pnl`` is ``units * (close_price - open_price)`` in USD.
+    """
+
+    instrument: int
+    units: int
+    open_price: float
+    close_price: float
+    realised_pnl: float
+
+
+@dataclass(frozen=True, slots=True)
 class EngineState:
     """Account state between steps. ``target_levels`` and ``target_units`` are the
     last accepted level and the unit target frozen when it changed."""
@@ -82,7 +114,7 @@ class EngineState:
     positions: tuple[int, ...]
     target_levels: tuple[float, ...]
     target_units: tuple[int, ...]
-    entry_prices: tuple[float, ...] = ()  # average fill price of the open position
+    lots: tuple[tuple[Lot, ...], ...] = ()  # per Instrument, oldest first
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +127,7 @@ class StepEvents:
     rollover_charge: float
     positions: tuple[int, ...]
     mark_prices: tuple[float, ...]
+    closed_lots: tuple[ClosedLot, ...] = ()
 
 
 def initial_state(config: EngineConfig) -> EngineState:
@@ -106,8 +139,37 @@ def initial_state(config: EngineConfig) -> EngineState:
         positions=(0,) * n,
         target_levels=(0.0,) * n,
         target_units=(0,) * n,
-        entry_prices=(0.0,) * n,
+        lots=((),) * n,
     )
+
+
+def _apply_fill(
+    lots: list[Lot], instrument: int, delta: int, price: float
+) -> list[ClosedLot]:
+    """Apply a signed fill to one Instrument's FIFO lots, in place.
+
+    Returns the lots closed, oldest first. Whatever of ``delta`` is left after
+    closing opposite-signed lots opens a new lot at ``price``.
+    """
+    closed: list[ClosedLot] = []
+    remaining = delta
+    while remaining != 0 and lots and (lots[0].units > 0) != (remaining > 0):
+        head = lots[0]
+        if abs(remaining) >= abs(head.units):
+            taken = head.units
+            lots.pop(0)
+        else:
+            taken = -remaining  # same sign as the lot, smaller than it
+            lots[0] = Lot(head.units - taken, head.price)
+        closed.append(
+            ClosedLot(
+                instrument, taken, head.price, price, taken * (price - head.price)
+            )
+        )
+        remaining += taken
+    if remaining != 0:
+        lots.append(Lot(remaining, price))
+    return closed
 
 
 def level_to_units(level: float, equity: float, price: float, cap: float) -> int:
@@ -117,17 +179,6 @@ def level_to_units(level: float, equity: float, price: float, cap: float) -> int
         return 0
     units = max(1, math.floor(abs(level) * equity * cap / price))
     return units if level > 0 else -units
-
-
-def _entry_price(position: int, entry: float, delta: int, price: float) -> float:
-    """Average entry price after a fill: weighted when adding, unchanged when
-    reducing, the fill price when flipping through zero, 0 when flat."""
-    new = position + delta
-    if new == 0:
-        return 0.0
-    if position == 0 or (position > 0) == (delta > 0):
-        return (entry * abs(position) + price * abs(delta)) / abs(new)
-    return entry if (new > 0) == (position > 0) else price
 
 
 def step(
@@ -155,8 +206,9 @@ def step(
     cash = state.cash
     positions = list(state.positions)
     target_units = list(state.target_units)
-    entry_prices = list(state.entry_prices or (0.0,) * n)
+    lots = [list(held) for held in state.lots] or [[] for _ in range(n)]
     fills: list[Fill] = []
+    closed_lots: list[ClosedLot] = []
     for i, spec in enumerate(config.instruments):
         bar = markets[i]
         if targets[i] != state.target_levels[i]:  # a level change freezes new units
@@ -174,9 +226,9 @@ def step(
             price = bar.open_bid - slippage
             spread_cost = 0.0
         cash -= delta * price
-        entry_prices[i] = _entry_price(positions[i], entry_prices[i], delta, price)
         positions[i] += delta
         fills.append(Fill(i, delta, price, spread_cost, abs(delta) * slippage))
+        closed_lots.extend(_apply_fill(lots[i], i, delta, price))
 
     equity = cash
     used_margin = 0.0
@@ -194,7 +246,7 @@ def step(
         positions=tuple(positions),
         target_levels=tuple(float(level) for level in targets),
         target_units=tuple(target_units),
-        entry_prices=tuple(entry_prices),
+        lots=tuple(tuple(held) for held in lots),
     )
     events = StepEvents(
         fills=tuple(fills),
@@ -203,5 +255,6 @@ def step(
         rollover_charge=0.0,
         positions=new_state.positions,
         mark_prices=tuple(marks),
+        closed_lots=tuple(closed_lots),
     )
     return new_state, events
