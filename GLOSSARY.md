@@ -70,3 +70,7 @@ _Avoid_: Correction, patch
 **Repair window**:
 The period after a live Bar closes during which late or catch-up quotes may still produce a new Revision. Once it passes, the Bar is sealed and later quotes are dropped and counted.
 _Avoid_: Grace period, lookback
+
+**Ledger**:
+The reward-independent record of what the trading environment did over a run: each stepped Bar's equity and position, every fill, every closed lot, and each episode's start and end. Evaluation computes everything from it, and a scripted baseline produces one in the same form.
+_Avoid_: Trade log, history
