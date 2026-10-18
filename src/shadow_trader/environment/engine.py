@@ -28,8 +28,18 @@ Rollover is accrued on the position held after the Bar's fills, on its notional
 at the mark, ``rollover_days`` times the per-day rate (positive charges, negative
 credits), and comes out of cash so it is part of equity.
 
-Not yet handled (later tickets): margin clipping and shortfall retry,
-closeout, Session-end force-flat and unfillable Bars. ``step``
+Margin: ``clip_order`` is the one clipping path. An order may add exposure only
+up to ``floor(equity x leverage_cap / open_bid)`` units; the rest is the shortfall.
+The unit target stays frozen, so the shortfall is retried every Bar, until it fills
+or a different level replaces the target. A clip never forces a reduction.
+
+Closeout: after rollover and the close mark, used margin above zero with equity
+below ``closeout_fraction`` x used margin closes the whole position at once, at
+this Bar's close with normal spread and slippage (the env episode ends, so there is
+no next open), flags the fill and resets the target to flat. ``StepEvents.used_margin``
+keeps the margin that triggered it.
+
+Not yet handled (later tickets): Session-end force-flat and unfillable Bars. ``step``
 raises ``NotImplementedError`` for a ``Market`` that needs them rather than
 silently ignoring it.
 """
@@ -48,7 +58,9 @@ __all__ = [
     "Fill",
     "Lot",
     "Market",
+    "OrderPlan",
     "StepEvents",
+    "clip_order",
     "initial_state",
     "level_to_units",
     "step",
@@ -83,6 +95,8 @@ class Fill:
     price: float
     spread_cost: float
     slippage_cost: float
+    clipped: bool = False  # the order was cut back by the margin limit
+    closeout: bool = False  # the fill closes the position on margin closeout
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +146,19 @@ class StepEvents:
     positions: tuple[int, ...]
     mark_prices: tuple[float, ...]
     closed_lots: tuple[ClosedLot, ...] = ()
+    clipped: bool = False  # some order was cut back by the margin limit
+    shortfall: tuple[int, ...] = ()  # signed units still wanted, per Instrument
+    closeout: bool = False  # the position was closed on margin closeout
+
+
+@dataclass(frozen=True, slots=True)
+class OrderPlan:
+    """What an order wants and what the margin limit allows (signed units)."""
+
+    desired_delta: int
+    allowed_delta: int
+    clipped: bool
+    shortfall: int  # target minus the post-fill position; 0 when nothing is clipped
 
 
 def initial_state(config: EngineConfig) -> EngineState:
@@ -185,6 +212,29 @@ def level_to_units(level: float, equity: float, price: float, cap: float) -> int
     return units if level > 0 else -units
 
 
+def clip_order(
+    position: int, target_units: int, equity: float, price: float, cap: float
+) -> OrderPlan:
+    """Clip the order from ``position`` to ``target_units`` to the margin limit.
+
+    The limit is ``floor(equity x cap / price)`` units on either side (at least the
+    1-unit minimum while equity is positive, none otherwise). Reducing
+    exposure is never clipped, and a position already beyond the limit is left as
+    it is (never force-sold) while any addition becomes shortfall.
+    """
+    limit = max(1, math.floor(equity * cap / price)) if equity > 0 else 0
+    desired = target_units - position
+    sign = 1 if target_units > 0 else -1
+    if abs(target_units) <= limit:
+        allowed = target_units
+    elif position != 0 and (position > 0) == (sign > 0):
+        allowed = sign * min(abs(target_units), max(limit, abs(position)))
+    else:
+        allowed = sign * limit
+    clipped = allowed != target_units
+    return OrderPlan(desired, allowed - position, clipped, target_units - allowed)
+
+
 def step(
     state: EngineState,
     config: EngineConfig,
@@ -215,13 +265,20 @@ def step(
     lots = [list(held) for held in state.lots] or [[] for _ in range(n)]
     fills: list[Fill] = []
     closed_lots: list[ClosedLot] = []
+    shortfall = [0] * n
+    clipped = False
     for i, spec in enumerate(config.instruments):
         bar = markets[i]
         if targets[i] != state.target_levels[i]:  # a level change freezes new units
             target_units[i] = level_to_units(
                 targets[i], state.equity, bar.open_bid, cap
             )
-        delta = target_units[i] - positions[i]
+        plan = clip_order(
+            positions[i], target_units[i], state.equity, bar.open_bid, cap
+        )
+        shortfall[i] = plan.shortfall
+        clipped = clipped or plan.clipped
+        delta = plan.allowed_delta
         if delta == 0:
             continue
         slippage = spec.slippage
@@ -233,7 +290,9 @@ def step(
             spread_cost = 0.0
         cash -= delta * price
         positions[i] += delta
-        fills.append(Fill(i, delta, price, spread_cost, abs(delta) * slippage))
+        fills.append(
+            Fill(i, delta, price, spread_cost, abs(delta) * slippage, plan.clipped)
+        )
         closed_lots.extend(_apply_fill(lots[i], i, delta, price))
 
     # Rollover: a position held through the 17:00 New York marker pays the long or
@@ -262,11 +321,38 @@ def step(
         equity += positions[i] * mark
         used_margin += abs(positions[i]) * mark * spec.margin_rate
 
+    # Closeout: equity under the closeout fraction of used margin closes everything.
+    closeout = used_margin > 0.0 and equity < config.closeout_fraction * used_margin
+    levels = [float(level) for level in targets]
+    if closeout:
+        for i, spec in enumerate(config.instruments):
+            held = positions[i]
+            if held == 0:
+                continue
+            bar = markets[i]
+            if held > 0:
+                price = bar.close_bid - spec.slippage
+                spread_cost = 0.0
+            else:
+                price = bar.close_bid + bar.close_spread + spec.slippage
+                spread_cost = -held * bar.close_spread
+            cash -= -held * price
+            fills.append(
+                Fill(
+                    i, -held, price, spread_cost, abs(held) * spec.slippage, False, True
+                )
+            )
+            closed_lots.extend(_apply_fill(lots[i], i, -held, price))
+            positions[i] = 0
+            target_units[i] = 0
+            levels[i] = 0.0
+        equity = cash
+
     new_state = EngineState(
         cash=cash,
         equity=equity,
         positions=tuple(positions),
-        target_levels=tuple(float(level) for level in targets),
+        target_levels=tuple(levels),
         target_units=tuple(target_units),
         lots=tuple(tuple(held) for held in lots),
     )
@@ -278,5 +364,8 @@ def step(
         positions=new_state.positions,
         mark_prices=tuple(marks),
         closed_lots=tuple(closed_lots),
+        clipped=clipped,
+        shortfall=tuple(shortfall),
+        closeout=closeout,
     )
     return new_state, events

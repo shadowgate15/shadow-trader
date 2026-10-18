@@ -305,3 +305,51 @@ def test_bar_size_mismatch_is_rejected(prepared) -> None:
 
     with pytest.raises(ConfigError, match="bar"):
         make_env(dataset, scaler, config, seed=0)
+
+
+# --- closeout, clips and endings ------------------------------------------------
+
+# 50x leverage with a closeout fraction of 1 closes out on the first adverse mark:
+# the spread alone pushes equity under used margin.
+HAIR_TRIGGER = EngineConfig(leverage_cap=50.0, closeout_fraction=1.0)
+
+
+def test_closeout_terminates_names_the_ending_and_ends_the_ledger(prepared) -> None:
+    env = build(prepared, engine=HAIR_TRIGGER)
+    env.reset(seed=1)
+
+    _, reward, terminated, truncated, info = env.step(2)  # go long
+
+    assert terminated and not truncated
+    assert info["ending"] == "closeout"
+    ledger = env.ledger()
+    verify_ledger(ledger)
+    assert ledger.steps["closeout"].to_list() == [True]
+    assert ledger.steps["position_units"].to_list() == [0]
+    assert ledger.fills["closeout"].to_list() == [False, True]
+    with pytest.raises(RuntimeError):
+        env.step(2)
+    # no reward special-casing: the reward is the equity delta's log return
+    scale = EnvConfig().reward.reward_scale
+    assert reward == pytest.approx(
+        math.log(ledger.steps["equity"][0] / ledger.starting_equity) * scale
+    )
+
+
+def test_time_based_endings_are_truncated_not_terminated(prepared) -> None:
+    env = build(prepared)
+    _, infos, _ = run(env, [1])  # always flat
+    assert infos[-1]["ending"] == "window_end"
+    env.reset(seed=1)
+    for _ in range(N - 1):
+        _, _, terminated, truncated, info = env.step(1)
+        assert not terminated and not truncated and info["ending"] is None
+    _, _, terminated, truncated, info = env.step(1)
+    assert truncated and not terminated and info["ending"] == "window_end"
+
+
+def test_info_reports_clips_and_closeouts(prepared) -> None:
+    env = build(prepared, engine=HAIR_TRIGGER)
+    env.reset(seed=1)
+    _, _, _, _, info = env.step(2)
+    assert info["closeout"] is True and info["clipped"] is False

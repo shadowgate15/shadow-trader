@@ -33,6 +33,8 @@ def run(markets: list[Market], targets: list[float]) -> Ledger:
     for i, (market, target) in enumerate(zip(markets, targets, strict=True)):
         state, events = step(state, CONFIG, market, target)
         builder.add_step(T0 + i * BAR, events)
+        if events.closeout:  # a closeout ends the episode
+            break
     return builder.build()
 
 
@@ -65,6 +67,9 @@ def test_steps_and_fills_tables_have_the_documented_columns() -> None:
         "position_units",
         "rollover_charge",
         "mark_price",
+        "clipped",
+        "shortfall_units",
+        "closeout",
     ]
     assert ledger.fills.columns == [
         "step",
@@ -74,6 +79,8 @@ def test_steps_and_fills_tables_have_the_documented_columns() -> None:
         "price",
         "spread_cost",
         "slippage_cost",
+        "clipped",
+        "closeout",
     ]
     assert ledger.steps.height == 5
     assert ledger.steps["position_units"].to_list()[:3] == [

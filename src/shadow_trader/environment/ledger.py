@@ -16,6 +16,12 @@ open lots left must sum to the final position, and equity must equal starting
 equity plus cumulative realised P&L plus the mark-to-market of the open lots minus
 cumulative rollover. Lot prices are fill prices, so spread and slippage are
 already inside those terms and are not subtracted again.
+
+Margin and closeout: when ``Ledger.leverage_cap`` is known, a step that grows the
+position must stay within ``equity before the step x cap`` of notional at the
+fill's open bid (recovered from the fill price less its recorded costs). A closeout
+row is exempt from nothing else: it must be the last row, flat, and carry a
+closeout-flagged fill, and closeout-flagged fills appear nowhere else.
 """
 
 from __future__ import annotations
@@ -51,6 +57,9 @@ STEPS_SCHEMA: dict[str, pl.DataType] = {
     "position_units": pl.Int64(),
     "rollover_charge": pl.Float64(),
     "mark_price": pl.Float64(),
+    "clipped": pl.Boolean(),
+    "shortfall_units": pl.Int64(),
+    "closeout": pl.Boolean(),
 }
 FILLS_SCHEMA: dict[str, pl.DataType] = {
     "step": pl.Int64(),
@@ -60,6 +69,8 @@ FILLS_SCHEMA: dict[str, pl.DataType] = {
     "price": pl.Float64(),
     "spread_cost": pl.Float64(),
     "slippage_cost": pl.Float64(),
+    "clipped": pl.Boolean(),
+    "closeout": pl.Boolean(),
 }
 
 CLOSED_LOTS_SCHEMA: dict[str, pl.DataType] = {
@@ -89,6 +100,7 @@ class Ledger:
     closed_lots: pl.DataFrame = field(
         default_factory=lambda: pl.DataFrame(schema=CLOSED_LOTS_SCHEMA)
     )
+    leverage_cap: float | None = None  # effective cap; None skips the margin check
 
 
 class LedgerBuilder:
@@ -128,6 +140,9 @@ class LedgerBuilder:
                 events.positions[0],
                 events.rollover_charge,
                 events.mark_prices[0],
+                events.clipped,
+                events.shortfall[0] if events.shortfall else 0,
+                events.closeout,
             )
         )
         for fill in events.fills:
@@ -140,6 +155,8 @@ class LedgerBuilder:
                     fill.price,
                     fill.spread_cost,
                     fill.slippage_cost,
+                    fill.clipped,
+                    fill.closeout,
                 )
             )
 
@@ -164,6 +181,7 @@ class LedgerBuilder:
             closed_lots=pl.DataFrame(
                 self._closed, schema=CLOSED_LOTS_SCHEMA, orient="row"
             ),
+            leverage_cap=self._config.effective_leverage_cap,
         )
 
 
@@ -189,6 +207,7 @@ def verify_ledger(ledger: Ledger) -> None:
             problems.append("fills reference a step that is not in steps")
         elif not problems:
             problems.extend(_replay(ledger))
+            problems.extend(_check_closeout(ledger))
     elif fills.height:
         problems.append("fills reference a step that is not in steps")
 
@@ -200,13 +219,20 @@ def _replay(ledger: Ledger) -> list[str]:
     """Position continuity, FIFO lot conservation and equity reconciliation."""
     steps, fills = ledger.steps, ledger.fills
     by_step: dict[int, list[tuple[int, float]]] = {}
-    for s, units, price in zip(
+    open_bid: dict[int, float] = {}  # per step: open bid behind its last opening fill
+    for s, units, price, spread, slip, closeout in zip(
         fills["step"].to_list(),
         fills["units"].to_list(),
         fills["price"].to_list(),
+        fills["spread_cost"].to_list(),
+        fills["slippage_cost"].to_list(),
+        fills["closeout"].to_list(),
         strict=True,
     ):
         by_step.setdefault(s, []).append((units, price))
+        if not closeout:  # a closeout fill is priced at the close, not the open
+            per_unit = (spread + slip) / abs(units)
+            open_bid[s] = price - per_unit if units > 0 else price + per_unit
 
     problems: list[str] = []
     lots: list[tuple[int, float]] = []  # open FIFO lots: (signed units, price)
@@ -215,8 +241,10 @@ def _replay(ledger: Ledger) -> list[str]:
     position = 0
     realised = 0.0
     rollover = 0.0
+    previous_equity = ledger.starting_equity
     for row in steps.iter_rows(named=True):
         s = row["step"]
+        before = position
         spent = 0.0  # sum of units x price in fill order
         for units, price in by_step.get(s, ()):
             spent += units * price
@@ -242,6 +270,16 @@ def _replay(ledger: Ledger) -> list[str]:
                 f"imply {position}"
             )
             break  # later rows would only repeat the discrepancy
+        if ledger.leverage_cap is not None and s in open_bid:
+            peak = max(abs(before), abs(position))  # position right after the open
+            if peak > max(abs(before), 1):  # one unit is the minimum size
+                limit = previous_equity * ledger.leverage_cap
+                if peak * open_bid[s] > limit * (1 + RECONCILIATION_RTOL) + 1e-9:
+                    problems.append(
+                        f"step {s} holds {peak} units, beyond the leverage limit "
+                        f"of {limit!r} notional on equity {previous_equity!r}"
+                    )
+        previous_equity = row["equity"]
         cash = cash - spent - row["rollover_charge"]
         rollover += row["rollover_charge"]
         value = position * row["mark_price"]
@@ -268,6 +306,24 @@ def _replay(ledger: Ledger) -> list[str]:
         if sum(units for units, _ in lots) != position:
             problems.append("open lots do not sum to the final position")
         problems.extend(_check_closed_lots(ledger.closed_lots, expected_closed))
+    return problems
+
+
+def _check_closeout(ledger: Ledger) -> list[str]:
+    """A closeout is the last row, flat, with a closeout-flagged fill."""
+    steps, fills = ledger.steps, ledger.fills
+    flagged = steps.filter(pl.col("closeout"))["step"].to_list()
+    fill_steps = set(fills.filter(pl.col("closeout"))["step"].to_list())
+    problems: list[str] = []
+    if len(flagged) > 1 or (flagged and flagged[0] != steps.height - 1):
+        problems.append("a closeout row is not the last row of the episode")
+    if fill_steps - set(flagged):
+        problems.append("a closeout-flagged fill is on a row that is not a closeout")
+    for s in flagged:
+        if steps["position_units"][s] != 0:
+            problems.append(f"closeout row {s} is not flat")
+        if s not in fill_steps:
+            problems.append(f"closeout row {s} has no closeout-flagged fill")
     return problems
 
 
