@@ -22,7 +22,7 @@ from shadow_trader.ingestion.session import slots_per_session
 from .config import ConfigError, EngineConfig
 from .engine import EngineState, Market, level_to_units
 
-__all__ = ["Observation", "ObservationConfig", "build_observation"]
+__all__ = ["Observation", "ObservationConfig", "build_observation", "window_inputs"]
 
 POSITION_FIELDS = ("position_frac", "pending_target", "unrealized_return")
 ACCOUNT_FIELDS = ("used_margin_frac", "session_progress")
@@ -56,6 +56,35 @@ class Observation:
     valid: npt.NDArray[np.bool_]
     position: npt.NDArray[np.float32]
     account: npt.NDArray[np.float32]
+
+
+def window_inputs(
+    scaled_rows: npt.ArrayLike, config: ObservationConfig
+) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.bool_]]:
+    """Shape scaled rows into the model window; shared by training and live.
+
+    ``scaled_rows`` is [I, R, F], oldest to newest, holding the Instrument's scaled
+    rows from the current Session only (R may be less than ``window_bars`` near the
+    Session start; extra older rows are dropped). Returns ``features`` [I, W, F]
+    float32 and ``valid`` [I, W]. Positions before the first row are zero and
+    invalid, as is any older row with a non-finite value (zeroed entirely). A
+    non-finite value in the current (last) row raises ``ValueError``.
+    """
+    rows = np.asarray(scaled_rows, dtype=np.float64)
+    if rows.ndim != 3 or rows.shape[1] < 1:
+        raise ValueError(f"scaled_rows must be [I, R>=1, F]; got {rows.shape}")
+    w = config.window_bars
+    rows = rows[:, -w:, :]
+    n, r, f = rows.shape
+    finite = np.isfinite(rows)
+    if not finite[:, -1, :].all():
+        raise ValueError("null or non-finite value in the current row")
+    row_ok = finite.all(axis=2)
+    features = np.zeros((n, w, f), dtype=np.float32)
+    valid = np.zeros((n, w), dtype=np.bool_)
+    features[:, w - r :, :] = np.where(row_ok[:, :, None], rows, 0.0)
+    valid[:, w - r :] = row_ok
+    return features, valid
 
 
 def _average_entry(state: EngineState, instrument: int) -> float:
@@ -95,11 +124,7 @@ def build_observation(
     if len(markets) != n or len(engine_state.positions) != n:
         raise ValueError(f"expected {n} market(s) for {config.symbols}")
 
-    finite = np.isfinite(window)
-    if not finite[:, -1, :].all():
-        raise ValueError("null or non-finite value in the current row")
-    row_ok = finite.all(axis=2)
-    features = np.where(row_ok[:, :, None], window, 0.0).astype(np.float32)
+    features, row_ok = window_inputs(window, observation_config)
     out_valid = mask & row_ok
 
     position = np.zeros((n, len(POSITION_FIELDS)), dtype=np.float64)
