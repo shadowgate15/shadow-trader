@@ -22,6 +22,7 @@ from shadow_trader.preparation.scaler import Scaler, ScalerError
 
 from .config import ConfigError
 from .engine import Market
+from .observation import ObservationConfig, window_inputs
 from .session_calendar import market_from_row
 
 __all__ = ["MarketData", "eligible_starts", "from_prepared"]
@@ -80,17 +81,12 @@ class MarketData:
 
     def window(
         self, row: int, bars: int
-    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.bool_]]:
+    ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.bool_]]:
         """``[1, bars, F]`` features and ``[1, bars]`` in-Session mask ending at
         ``row``. Rows before the Session start are zero and not valid."""
-        first = row - bars + 1
         start = int(self.session_start[self.session_index[row]])
-        out = np.zeros((1, bars, self.n_features), dtype=np.float64)
-        valid = np.zeros((1, bars), dtype=np.bool_)
-        lo = max(first, start)
-        out[0, lo - first :] = self.features[lo : row + 1]
-        valid[0, lo - first :] = True
-        return out, valid
+        rows = self.features[max(start, row - bars + 1) : row + 1]
+        return window_inputs(rows[None], ObservationConfig(window_bars=bars))
 
 
 def from_prepared(
