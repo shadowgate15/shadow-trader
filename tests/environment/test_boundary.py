@@ -18,6 +18,7 @@ PURE_MODULES = [
     "env_config",
     "reward",
     "market_data",
+    "report",
 ]
 
 

@@ -42,21 +42,25 @@ from .ledger import (
     LedgerError,
     verify_ledger,
 )
+from .report import summarize, summary_document
 from .sweep import SweepResult, run_sweep
 
 __all__ = [
     "MANIFEST_FILE",
     "SCHEMA_VERSION",
+    "SUMMARY_FILE",
     "ManifestError",
     "build_manifest",
     "persist_sweep",
     "read_ledger",
     "read_manifest",
+    "verify_summary",
     "write_ledger",
 ]
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MANIFEST_FILE = "manifest.json"
+SUMMARY_FILE = "summary.json"
 EPISODE_MODE_SWEEP = "eval_sweep"
 
 _TABLES: dict[str, dict[str, pl.DataType]] = {
@@ -81,6 +85,19 @@ def _file_hash(path: Path) -> str:
 
 def _manifest_hash(doc: dict[str, Any]) -> str:
     return _sha(canonical_json({k: v for k, v in doc.items() if k != "manifest_hash"}))
+
+
+def _summary_bytes(ledger: Ledger) -> bytes:
+    return canonical_json(summary_document(summarize(ledger)))
+
+
+def verify_summary(path: Path, ledger: Ledger) -> None:
+    """Reject a missing, edited or stale ``summary.json`` beside ``ledger``'s tables."""
+    file = Path(path) / SUMMARY_FILE
+    if not file.is_file():
+        raise ManifestError(f"summary missing: {file}")
+    if file.read_bytes() != _summary_bytes(ledger):
+        raise ManifestError("summary.json does not match the recomputed summary")
 
 
 def build_manifest(
@@ -146,6 +163,7 @@ def write_ledger(
         getattr(ledger, name).write_parquet(file)
         tables[name] = _file_hash(file)
     manifest["tables"] = tables
+    (path / SUMMARY_FILE).write_bytes(_summary_bytes(ledger))
     manifest["manifest_hash"] = _manifest_hash(manifest)
     target = path / MANIFEST_FILE
     tmp = target.with_name(MANIFEST_FILE + ".tmp")
@@ -222,4 +240,5 @@ def read_ledger(path: Path) -> Ledger:
         episodes=frames["episodes"],
     )
     verify_ledger(ledger)
+    verify_summary(path, ledger)
     return ledger
