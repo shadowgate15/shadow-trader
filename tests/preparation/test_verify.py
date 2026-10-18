@@ -1,0 +1,134 @@
+import json
+
+import polars as pl
+import pyarrow.parquet as pq
+
+from shadow_trader import main
+
+from .synthetic import write_ingestion, write_prepared_toml
+
+
+def run(argv):
+    try:
+        return main(argv)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 1
+
+
+def built(tmp_path, capsys):
+    parent = write_ingestion(tmp_path)
+    config = write_prepared_toml(tmp_path, parent.dataset_id)
+    assert run(["prepare", "build", "--config", str(config), "-q"]) == 0
+    first, *rest = capsys.readouterr().out.splitlines()
+    ids = {line.split()[0]: line.split()[1] for line in rest}
+    return config, first.split()[-1], ids, tmp_path / "prepared"
+
+
+def verify(config, build_id):
+    return run(["prepare", "verify", build_id, "--config", str(config)])
+
+
+def snapshot(root):
+    return {
+        str(p): (p.stat().st_mtime_ns, p.stat().st_size)
+        for p in sorted(root.rglob("*"))
+        if p.is_file()
+    }
+
+
+def failed_lines(out):
+    return [line for line in out.splitlines() if line.startswith("FAIL")]
+
+
+def test_intact_build_passes_every_check_and_changes_nothing(tmp_path, capsys):
+    config, build_id, _, _ = built(tmp_path, capsys)
+    before = snapshot(tmp_path)
+
+    assert verify(config, build_id) == 0
+
+    out = capsys.readouterr().out
+    assert out.count("PASS") >= 5 and not failed_lines(out)
+    assert snapshot(tmp_path) == before
+
+
+def test_corrupted_partition_fails_its_hash_check(tmp_path, capsys):
+    config, build_id, ids, prepared = built(tmp_path, capsys)
+    part = next((prepared / "datasets" / ids["train"]).rglob("*.parquet"))
+    table = pq.read_table(part)
+    frame = pl.DataFrame(table).with_columns(pl.col("close") + 1.0)
+    pq.write_table(frame.to_arrow().cast(table.schema), part)
+
+    assert verify(config, build_id) == 1
+
+    assert any("train" in line for line in failed_lines(capsys.readouterr().out))
+
+
+def test_broken_bound_fails_boundary_check(tmp_path, capsys):
+    config, build_id, ids, prepared = built(tmp_path, capsys)
+    path = prepared / "datasets" / ids["train"] / "manifest.json"
+    manifest = json.loads(path.read_text())
+    snapped = manifest["split"]["snapped_bounds"]
+    snapped["validation_start"] = snapped["train_start"]
+    path.write_text(json.dumps(manifest))
+
+    assert verify(config, build_id) == 1
+
+    assert any("boundary" in line for line in failed_lines(capsys.readouterr().out))
+
+
+def test_removed_scaler_artifact_fails_scaler_check(tmp_path, capsys):
+    config, build_id, _, prepared = built(tmp_path, capsys)
+    for artifact in (prepared / "scalers").glob("*.json"):
+        artifact.unlink()
+
+    assert verify(config, build_id) == 1
+
+    assert any("scaler" in line for line in failed_lines(capsys.readouterr().out))
+
+
+def test_manifest_scaler_ref_differing_from_the_build_record_fails(tmp_path, capsys):
+    config, build_id, ids, prepared = built(tmp_path, capsys)
+    path = prepared / "datasets" / ids["validation"] / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["scaler"]["id"] = "0" * 64
+    path.write_text(json.dumps(manifest))
+
+    assert verify(config, build_id) == 1
+
+    assert any("scaler.ref" in line for line in failed_lines(capsys.readouterr().out))
+
+
+def test_intact_build_reports_the_scaler_fit_checks(tmp_path, capsys):
+    config, build_id, _, _ = built(tmp_path, capsys)
+
+    assert verify(config, build_id) == 0
+
+    out = capsys.readouterr().out
+    assert "scaler.ref" in out and "scaler.fit_matches_train" in out
+
+
+def test_unknown_build_gets_a_plain_message_and_bad_config_is_exit_2(tmp_path, capsys):
+    config, _, _, prepared = built(tmp_path, capsys)
+    absent = "ab" * 32
+
+    assert verify(config, absent) == 1
+    out = capsys.readouterr().out
+    assert f"no build record {absent} under {prepared}" in out
+    assert "Error" not in out
+    assert (
+        run(["prepare", "verify", absent, "--config", str(tmp_path / "no.toml")]) == 2
+    )
+
+
+def test_malformed_build_ids_are_a_bad_argument_and_never_touch_the_store(
+    tmp_path, capsys
+):
+    config, build_id, _, _ = built(tmp_path, capsys)
+
+    for bad in ("deadbeef", "../../x", "../../../x", build_id.upper(), build_id + "0"):
+        assert verify(config, bad) == 2
+    # Rejected before the config is read, so even a missing config is exit 2 quietly.
+    assert verify(tmp_path / "no.toml", "../x") == 2
+    err = capsys.readouterr().err
+    assert "64" in err and "hex" in err
+    assert "FileNotFoundError" not in err
