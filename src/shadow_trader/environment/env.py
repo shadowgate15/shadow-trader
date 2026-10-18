@@ -49,6 +49,7 @@ from .env_config import EnvConfig
 from .ledger import Ledger, LedgerBuilder
 from .market_data import MarketData
 from .observation import POSITION_FIELDS, Observation, build_observation
+from .report import EpisodeAccumulator
 from .reward import log_return_reward
 
 __all__ = ["TradingEnv", "make_env"]
@@ -112,6 +113,7 @@ class TradingEnv(gym.Env):
         self._done = True
         self._explicit = False
         self._builder: LedgerBuilder | None = None
+        self._acc = EpisodeAccumulator()
         #: Dataset id and Scaler hash for manifests; ``make_env`` fills them in.
         self.provenance: dict[str, str] = {}
 
@@ -183,6 +185,7 @@ class TradingEnv(gym.Env):
         self._done = False
         self._episode += 1
         session = int(data.session_index[start])
+        self._acc.begin(self._episode, session, equity)
         if self._record:
             if not (chain and self._builder is not None):
                 self._builder = LedgerBuilder(self._config.engine)
@@ -227,6 +230,7 @@ class TradingEnv(gym.Env):
             skipped += int(not decision)
             gap_bars += int(data.is_gap[row])
             unfillable += int(not data.fillable[row])
+            self._acc.add(events, is_decision=decision, blind_run=blind)
             flags["clipped"] |= events.clipped
             flags["closeout"] |= events.closeout
             flags["forced_flat"] |= events.forced_flat
@@ -256,8 +260,11 @@ class TradingEnv(gym.Env):
                 ending = SESSION_END
             else:
                 ending = DATASET_END if self._explicit else WINDOW_END
-        if self._builder is not None and ending is not None:
-            self._builder.end_episode(ending)
+        episode = None
+        if ending is not None:
+            episode = self._acc.finish(ending)
+            if self._builder is not None:
+                self._builder.end_episode(ending)
         info = {
             "ending": ending,
             "equity_delta": events.equity - previous,
@@ -270,6 +277,8 @@ class TradingEnv(gym.Env):
             "forced_flat": flags["forced_flat"],
             "unfilled_forced_flat": unfilled_forced_flat,
         }
+        if episode is not None:
+            info["episode"] = episode
         reward = log_return_reward(previous, events.equity, self._config.reward)
         return self._observation(), reward, terminated, truncated, info
 
