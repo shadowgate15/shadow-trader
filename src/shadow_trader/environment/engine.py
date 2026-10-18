@@ -24,8 +24,12 @@ through zero closes everything, then opens the opposite lot). Lot prices are
 fill prices, so spread and slippage are already inside realised P&L and the
 mark-to-market of open lots; no cost is subtracted again.
 
+Rollover is accrued on the position held after the Bar's fills, on its notional
+at the mark, ``rollover_days`` times the per-day rate (positive charges, negative
+credits), and comes out of cash so it is part of equity.
+
 Not yet handled (later tickets): margin clipping and shortfall retry,
-closeout, rollover accrual, Session-end force-flat and unfillable Bars. ``step``
+closeout, Session-end force-flat and unfillable Bars. ``step``
 raises ``NotImplementedError`` for a ``Market`` that needs them rather than
 silently ignoring it.
 """
@@ -197,9 +201,11 @@ def step(
         if not -1.0 <= level <= 1.0:  # False for NaN as well
             raise ValueError(f"target {level} is outside [-1, 1]")
     for bar in markets:
-        if not bar.fillable or bar.is_session_final or bar.rollover_days != 0:
+        if bar.rollover_days not in (0, 1, 3):
+            raise ValueError(f"rollover_days {bar.rollover_days} is not 0, 1 or 3")
+        if not bar.fillable or bar.is_session_final:
             raise NotImplementedError(
-                "unfillable, Session-final and rollover Bars are not handled yet"
+                "unfillable and Session-final Bars are not handled yet"
             )
 
     cap = config.effective_leverage_cap
@@ -230,6 +236,22 @@ def step(
         fills.append(Fill(i, delta, price, spread_cost, abs(delta) * slippage))
         closed_lots.extend(_apply_fill(lots[i], i, delta, price))
 
+    # Rollover: a position held through the 17:00 New York marker pays the long or
+    # short rate times the rollover days (3 on Wednesday) on its notional at the
+    # mark. A positive rate is a charge, a negative one a credit. Fills at this
+    # Bar's open come first, so a position closed at the open pays nothing.
+    rollover_charge = 0.0
+    for i, spec in enumerate(config.instruments):
+        bar = markets[i]
+        if bar.rollover_days == 0 or positions[i] == 0:
+            continue
+        if positions[i] > 0:
+            rate, mark = spec.rollover_long, bar.close_bid
+        else:
+            rate, mark = spec.rollover_short, bar.close_bid + bar.close_spread
+        rollover_charge += abs(positions[i]) * mark * rate * bar.rollover_days
+    cash -= rollover_charge
+
     equity = cash
     used_margin = 0.0
     marks: list[float] = []
@@ -252,7 +274,7 @@ def step(
         fills=tuple(fills),
         equity=equity,
         used_margin=used_margin,
-        rollover_charge=0.0,
+        rollover_charge=rollover_charge,
         positions=new_state.positions,
         mark_prices=tuple(marks),
         closed_lots=tuple(closed_lots),

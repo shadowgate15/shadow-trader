@@ -42,9 +42,8 @@ class InstrumentSpec:
     """Per-Instrument trading terms.
 
     ``rollover_long`` / ``rollover_short`` are fractions of notional charged per
-    rollover day (positive is a charge); they are carried here for the rollover
-    ticket and not yet read by ``step``. v1 supports USD-quote pairs only, so P&L
-    is already in the account currency.
+    rollover day (positive is a charge, negative a credit), read by ``step``.
+    v1 supports USD-quote pairs only, so P&L is already in the account currency.
     """
 
     symbol: str = "EURUSD"
