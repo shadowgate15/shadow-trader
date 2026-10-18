@@ -112,7 +112,8 @@ def test_flat_target_from_flat_does_nothing() -> None:
     state, events = step(initial_state(CONFIG), CONFIG, FLAT_MARKET, 0.0)
     assert events.fills == ()
     assert events.equity == 10_000.0
-    assert state == initial_state(CONFIG)
+    marks = ((FLAT_MARKET.close_bid, FLAT_MARKET.close_spread),)
+    assert state == initial_state(CONFIG, trusted_marks=marks)
 
 
 def test_holding_the_current_target_trades_nothing_as_equity_drifts() -> None:
@@ -145,12 +146,10 @@ def test_mismatched_instrument_count_raises() -> None:
         step(initial_state(CONFIG), CONFIG, (FLAT_MARKET, FLAT_MARKET), (1.0, 1.0))
 
 
-def test_unhandled_market_conditions_fail_loudly() -> None:
-    # unfillable handling belongs to a later ticket;
-    # until then the engine must not silently ignore it.
-    for market in (Market(1.1, 0.0001, 1.1, 0.0001, fillable=False),):
-        with pytest.raises(NotImplementedError):
-            step(initial_state(CONFIG), CONFIG, market, 1.0)
+def test_an_unfillable_bar_without_a_trusted_close_raises() -> None:
+    market = Market(1.1, 0.0001, 1.1, 0.0001, fillable=False)
+    with pytest.raises(ValueError, match="trusted close"):
+        step(initial_state(CONFIG), CONFIG, market, 1.0)
 
 
 def test_two_instruments_share_one_pooled_equity() -> None:

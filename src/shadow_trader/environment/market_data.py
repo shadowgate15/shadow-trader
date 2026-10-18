@@ -59,6 +59,7 @@ class MarketData:
     session_start: npt.NDArray[np.int64]  # [S] first row of each Session
     session_end: npt.NDArray[np.int64]  # [S] one past the last row
     session_open: tuple[datetime, ...]  # [S] the Session ids (UTC open)
+    is_gap: npt.NDArray[np.bool_]  # [n] the Bar is a Gap row (no ticks)
 
     def __len__(self) -> int:
         return len(self.open_time)
@@ -148,6 +149,7 @@ def from_prepared(
         session_start=starts,
         session_end=ends,
         session_open=tuple(session_ids[i] for i in boundaries),
+        is_gap=scaled["is_gap"].to_numpy().astype(np.bool_),
     )
 
 
@@ -155,26 +157,18 @@ def eligible_starts(data: MarketData, window_bars: int) -> npt.NDArray[np.int64]
     """Rows a training window of ``window_bars`` stepped Bars may start from, in
     ascending order.
 
-    The start Bar and every Bar stepped before the last must be usable and not the
-    Session's final Bar; the last stepped Bar must be usable, lie in the start's
-    Session and may be its final Bar (where the engine forces flat).
-    (Gap stepping, which lifts the all-usable requirement, is a later ticket.)
-    Sessions with no usable Bar, or none that fit a window, are logged.
+    The start Bar must be usable (the agent observes it) and the window's last
+    stepped Bar must lie in the start's Session; it may be the Session's final Bar
+    (where the engine forces flat). The Bars in between may be Gaps or otherwise
+    non-usable: one env step spans them. Sessions with no usable Bar, or none that
+    fit a window, are logged.
     """
-    good = data.usable & ~data.is_session_final
-    csum = np.concatenate([[0], np.cumsum(good)])
     n = len(data)
     rows = np.arange(n)
     last = rows + window_bars
     in_range = last < n
-    clipped = np.minimum(last, n - 1)
-    # the start and the Bars before the last are usable and not Session-final; the
-    # last stepped Bar must be usable and may be the Session's final Bar (forced flat)
-    all_good = (
-        in_range & (csum[clipped] - csum[rows] == window_bars) & data.usable[clipped]
-    )
     same_session = in_range & (data.session_end[data.session_index] > last)
-    starts = rows[all_good & same_session].astype(np.int64)
+    starts = rows[data.usable & same_session].astype(np.int64)
     covered = set(data.session_index[starts].tolist())
     for k, opened in enumerate(data.session_open):
         lo, hi = data.session_start[k], data.session_end[k]

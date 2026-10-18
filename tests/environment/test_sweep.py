@@ -180,12 +180,12 @@ def test_a_sweep_runs_one_episode_per_session_in_order_and_chains(prepared) -> N
     assert isinstance(result, SweepResult)
     ledger = result.ledger
     verify_ledger(ledger)
-    assert result.sessions_run == [0, 1, 2, 4, 5]
+    assert result.sessions_run == [0, 1, 2, 4, 5, 6, 7]
     assert result.skipped == [3]  # the Session with no usable Bar
     assert result.closeout is False
     episodes = ledger.episodes
-    assert episodes["session_id"].to_list() == [0, 1, 2, 4, 5]
-    assert episodes["chained"].to_list() == [False, True, True, True, True]
+    assert episodes["session_id"].to_list() == [0, 1, 2, 4, 5, 6, 7]
+    assert episodes["chained"].to_list() == [False] + [True] * 6
     ends, starts = episodes["end_equity"].to_list(), episodes["start_equity"].to_list()
     assert starts[1:] == ends[:-1]
     assert starts[0] == EngineConfig().starting_equity
@@ -195,14 +195,16 @@ def test_a_sweep_runs_one_episode_per_session_in_order_and_chains(prepared) -> N
         "dataset_end",
         "session_end",
         "session_end",
+        "dataset_end",  # the outage Session stops short of the weekly close
+        "session_end",  # the tail Session ends on an unfillable final Bar
     ]
     # every Session-final episode ends flat
     final_rows = (
-        ledger.steps.filter(pl.col("episode_id").is_in([3, 4]))
+        ledger.steps.filter(pl.col("episode_id").is_in([3, 4, 6]))
         .group_by("episode_id", maintain_order=True)
         .last()
     )
-    assert final_rows["position_units"].to_list() == [0, 0]
+    assert final_rows["position_units"].to_list() == [0, 0, 0]
 
 
 def test_a_sweep_can_cover_chosen_sessions(prepared) -> None:

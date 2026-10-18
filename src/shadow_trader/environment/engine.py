@@ -44,8 +44,15 @@ agent's target with flat, so any position is closed at that Bar's open with norm
 spread and slippage. The fill is flagged ``forced_flat`` and its cost lands in this
 (last) step; the target is left flat and a flat account is simply not traded.
 
-Not yet handled (a later ticket): unfillable Bars. ``step`` raises
-``NotImplementedError`` for one rather than silently ignoring it.
+Unfillable Bars (a Gap or a distrusted Bar): nothing trades and the Bar's own
+prices are ignored. ``EngineState.trusted_marks`` holds each Instrument's last
+trusted close bid and close spread (refreshed on every fillable Bar); an unfillable
+Bar marks equity there (``StepEvents.carried_mark``), still accrues rollover on that
+notional, never runs the closeout check, and leaves the target pending (it is
+accepted and sized at the next fillable Bar). If it is the Session-final Bar, any
+position is liquidated at the trusted close with normal spread and slippage
+(``Fill.unfilled_forced_flat``). ``step`` raises ``ValueError`` if there is no
+trusted close to carry.
 """
 
 from __future__ import annotations
@@ -110,6 +117,7 @@ class Fill:
     closeout: bool = False  # the fill closes the position on margin closeout
     forced_flat: bool = False  # the fill is the Session-end force-flat
     halt: bool = False  # live only: the fill is a Halt flatten (bypasses plan_order)
+    unfilled_forced_flat: bool = False  # synthetic liquidation on an unfillable Bar
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +154,8 @@ class EngineState:
     target_levels: tuple[float, ...]
     target_units: tuple[int, ...]
     lots: tuple[tuple[Lot, ...], ...] = ()  # per Instrument, oldest first
+    # per Instrument (close bid, close spread) of the last trusted (fillable) Bar
+    trusted_marks: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +173,8 @@ class StepEvents:
     shortfall: tuple[int, ...] = ()  # signed units still wanted, per Instrument
     closeout: bool = False  # the position was closed on margin closeout
     forced_flat: bool = False  # a Session-end force-flat order was filled
+    carried_mark: bool = False  # some Bar was unfillable: marked at the trusted close
+    unfilled_forced_flat: bool = False  # synthetic liquidation on an unfillable Bar
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,9 +222,16 @@ class TargetMemo:
     target_units: tuple[int, ...]
 
 
-def initial_state(config: EngineConfig, equity: float | None = None) -> EngineState:
+def initial_state(
+    config: EngineConfig,
+    equity: float | None = None,
+    trusted_marks: tuple[tuple[float, float], ...] = (),
+) -> EngineState:
     """A flat account with every target flat, at ``equity`` (default: the config's
-    starting equity; an evaluation sweep passes the equity carried in)."""
+    starting equity; an evaluation sweep passes the equity carried in).
+
+    ``trusted_marks`` seeds the (close bid, close spread) an unfillable first Bar
+    carries: the close of the Bar the episode starts on."""
     n = len(config.instruments)
     start = config.starting_equity if equity is None else equity
     return EngineState(
@@ -222,6 +241,7 @@ def initial_state(config: EngineConfig, equity: float | None = None) -> EngineSt
         target_levels=(0.0,) * n,
         target_units=(0,) * n,
         lots=((),) * n,
+        trusted_marks=trusted_marks,
     )
 
 
@@ -420,8 +440,13 @@ def step(
     for bar in markets:
         if bar.rollover_days not in (0, 1, 3):
             raise ValueError(f"rollover_days {bar.rollover_days} is not 0, 1 or 3")
-        if not bar.fillable:
-            raise NotImplementedError("unfillable Bars are not handled yet")
+    trusted = state.trusted_marks
+    if not all(bar.fillable for bar in markets) and len(trusted) != n:
+        raise ValueError("an unfillable Bar needs a trusted close to carry")
+    closes = [
+        (bar.close_bid, bar.close_spread) if bar.fillable else trusted[i]
+        for i, bar in enumerate(markets)
+    ]
 
     cash = state.cash
     positions = list(state.positions)
@@ -433,9 +458,39 @@ def step(
     clipped = False
     forced_flat = False
     closed_at_open = False
+    unfilled_forced_flat = False
     levels = [float(level) for level in targets]
     for i, spec in enumerate(config.instruments):
         bar = markets[i]
+        if not bar.fillable:
+            if not bar.is_session_final:  # the target stays pending, unaccepted
+                levels[i] = state.target_levels[i]
+                continue
+            levels[i], target_units[i] = 0.0, 0
+            held = positions[i]
+            if held == 0:
+                continue
+            mark, mark_spread = closes[i]  # liquidate at the last trusted close
+            if held > 0:
+                price, spread_cost = mark - spec.slippage, 0.0
+            else:
+                price = mark + mark_spread + spec.slippage
+                spread_cost = -held * mark_spread
+            cash -= -held * price
+            positions[i] = 0
+            unfilled_forced_flat = True
+            fills.append(
+                Fill(
+                    i,
+                    -held,
+                    price,
+                    spread_cost,
+                    abs(held) * spec.slippage,
+                    unfilled_forced_flat=True,
+                )
+            )
+            closed_lots.extend(_apply_fill(lots[i], i, -held, price))
+            continue
         if halt:  # a Halt flatten bypasses plan_order
             plan = OrderPlan(-positions[i], -positions[i], False, 0)
             levels[i], target_units[i] = 0.0, 0
@@ -484,10 +539,11 @@ def step(
         bar = markets[i]
         if bar.rollover_days == 0 or positions[i] == 0:
             continue
+        close_bid, close_spread = closes[i]
         if positions[i] > 0:
-            rate, mark = spec.rollover_long, bar.close_bid
+            rate, mark = spec.rollover_long, close_bid
         else:
-            rate, mark = spec.rollover_short, bar.close_bid + bar.close_spread
+            rate, mark = spec.rollover_short, close_bid + close_spread
         rollover_charge += abs(positions[i]) * mark * rate * bar.rollover_days
     cash -= rollover_charge
 
@@ -495,15 +551,18 @@ def step(
     used_margin = 0.0
     marks: list[float] = []
     for i, spec in enumerate(config.instruments):
-        bar = markets[i]
-        mark = bar.close_bid + bar.close_spread if positions[i] < 0 else bar.close_bid
+        close_bid, close_spread = closes[i]
+        mark = close_bid + close_spread if positions[i] < 0 else close_bid
         marks.append(mark)
         equity += positions[i] * mark
         used_margin += abs(positions[i]) * mark * spec.margin_rate
 
     # Closeout: equity under the closeout fraction of used margin closes everything.
+    all_fillable = all(bar.fillable for bar in markets)  # only trusted prices count
     closeout = closed_at_open or (
-        used_margin > 0.0 and equity < config.closeout_fraction * used_margin
+        all_fillable
+        and used_margin > 0.0
+        and equity < config.closeout_fraction * used_margin
     )
     if closeout:
         for i, spec in enumerate(config.instruments):
@@ -536,6 +595,7 @@ def step(
         target_levels=tuple(levels),
         target_units=tuple(target_units),
         lots=tuple(tuple(held) for held in lots),
+        trusted_marks=tuple(closes),
     )
     events = StepEvents(
         fills=tuple(fills),
@@ -549,5 +609,7 @@ def step(
         shortfall=tuple(shortfall),
         closeout=closeout,
         forced_flat=forced_flat,
+        carried_mark=not all_fillable,
+        unfilled_forced_flat=unfilled_forced_flat,
     )
     return new_state, events

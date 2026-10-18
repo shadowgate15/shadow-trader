@@ -2,11 +2,11 @@
   "anomaly_policy": {
     "counts_by_reason": {
       "dataset_start": 6,
-      "distrusted_flag": 0,
-      "gap": 0,
-      "session_warm_up": 29,
-      "window_contains_distrusted_flag": 0,
-      "window_contains_gap": 0
+      "distrusted_flag": 1,
+      "gap": 8,
+      "session_warm_up": 41,
+      "window_contains_distrusted_flag": 6,
+      "window_contains_gap": 6
     },
     "distrusted_flags": [
       "crossed_quote",
@@ -14,16 +14,16 @@
       "stale_quote"
     ],
     "hash": "7ae44d734956716f907a37a79d3c58a5470b7d32f24050825eb08645a2eae5ac",
-    "usable_count": 930,
-    "usable_fraction": 0.9637305699481865,
+    "usable_count": 1037,
+    "usable_fraction": 0.9384615384615385,
     "version": 1
   },
   "bar_size": 5,
-  "builder_git_revision": "5b00f71d9053176c084ceced65153dd588f467a9",
+  "builder_git_revision": "4ab9a2c38a9fe9705553ad3f293f7f203ed84684",
   "builder_version": "0.1.0",
-  "content_hash": "114feabd41aafba284fafd6b1192201adb26b8ddbaf982abc929a7b09c215ed0",
+  "content_hash": "d5c88cace0f566a60b399b7076c369d99013d189ee2b2f66110a5d7dcf3c55fa",
   "created_at": "2024-02-01T00:00:00+00:00",
-  "dataset_id": "114feabd41aafba284fafd6b1192201adb26b8ddbaf982abc929a7b09c215ed0",
+  "dataset_id": "d5c88cace0f566a60b399b7076c369d99013d189ee2b2f66110a5d7dcf3c55fa",
   "feature_spec": {
     "columns": [
       "feat_ret_1",
@@ -40,19 +40,19 @@
   "parent_ingestion": "fixture",
   "partitions": [
     {
-      "hash": "a06603e320589a4a8e1b6fcb1ce9620ed1451c3556737e38af18aeef2b052199",
+      "hash": "fdc24e0aa5b7dac6e4b8c613661ae687f67e8823796fd6547a8633ca05431f23",
       "instrument": "EURUSD",
       "path": "bars/instrument=EURUSD/year=2024/part-0.parquet",
-      "rows": 965
+      "rows": 1105
     }
   ],
   "polars_version": "2.0.0",
   "prepared_parent": null,
   "role": "train",
-  "row_count": 965,
+  "row_count": 1105,
   "scaler": {
     "fit": true,
-    "id": "31b3d09737da382b0a7f83b4eca755974a7a8cebc6bdba5aaaa54b077884c850"
+    "id": "7fe0a0bf2dad8444ad3271040a0d6370209d73009116ec69875306a64140be08"
   },
   "schema_version": 1
 }
