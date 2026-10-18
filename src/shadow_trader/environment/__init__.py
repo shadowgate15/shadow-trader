@@ -1,6 +1,6 @@
 """Trading environment Subsystem.
 
-This ticket's pieces are the Gymnasium-free engine and ledger layers:
+Gymnasium-free layers (engine, observation, ledger) and the lazily loaded env:
 
 - ``EngineConfig`` / ``InstrumentSpec``: frozen, validated, hashable configuration.
 - ``initial_state``, ``step``, ``Market``, ``EngineState``, ``StepEvents``: the pure
@@ -21,16 +21,10 @@ from typing import TYPE_CHECKING, Any
 
 from .config import ConfigError, EngineConfig, InstrumentSpec
 from .engine import (
-    ClosedLot,
     EngineState,
-    Fill,
-    Lot,
     Market,
-    OrderPlan,
     StepEvents,
-    clip_order,
     initial_state,
-    level_to_units,
     step,
 )
 from .env_config import EnvConfig, EpisodeConfig, RewardConfig
@@ -74,30 +68,24 @@ __all__ = [
     "EPISODES_SCHEMA",
     "FILLS_SCHEMA",
     "STEPS_SCHEMA",
-    "ClosedLot",
     "ConfigError",
     "EngineConfig",
     "EngineState",
     "EnvConfig",
     "EpisodeConfig",
-    "Fill",
     "InstrumentSpec",
     "Ledger",
     "LedgerBuilder",
     "LedgerError",
-    "Lot",
     "Market",
     "Observation",
     "ObservationConfig",
-    "OrderPlan",
     "RewardConfig",
     "StepEvents",
     "SweepResult",
     "TradingEnv",
     "build_observation",
-    "clip_order",
     "initial_state",
-    "level_to_units",
     "make_env",
     "market_from_row",
     "run_sweep",

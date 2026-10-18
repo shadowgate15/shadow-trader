@@ -8,7 +8,6 @@ Session of 5 Bars that has no usable Bar. Windows are short (N=50) so they fit.
 from __future__ import annotations
 
 import itertools
-import logging
 import math
 from collections.abc import Sequence
 from datetime import datetime
@@ -189,18 +188,13 @@ def test_reward_scale_only_rescales(prepared) -> None:
     assert b == pytest.approx([100.0 * r for r in a])
 
 
-def test_episodes_stay_in_one_session_and_start_on_usable_bars(
-    prepared, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_episodes_stay_in_one_session_and_start_on_usable_bars(prepared) -> None:
     dataset, _scaler = prepared
     frame = dataset.read("EURUSD")
     usable = dict(zip(frame["open_time"], frame["usable"], strict=True))
     session_of = dict(zip(frame["open_time"], frame["session_id"], strict=True))
 
-    with caplog.at_level(logging.WARNING):
-        env = build(prepared)
-    skipped = [r.getMessage() for r in caplog.records]
-    assert any(str(SHORT.date()) in message for message in skipped)
+    env = build(prepared)
 
     seen_sessions = set()
     for seed in range(40):
@@ -218,7 +212,7 @@ def test_episodes_stay_in_one_session_and_start_on_usable_bars(
     assert info["start_bar_in_session"] >= WARM_UP
 
 
-def test_last_step_truncates_with_window_end_and_equity_delta(prepared) -> None:
+def test_last_step_truncates_with_window_end(prepared) -> None:
     env = build(prepared)
     env.reset(seed=1)
 
@@ -237,10 +231,6 @@ def test_last_step_truncates_with_window_end_and_equity_delta(prepared) -> None:
     assert truncated
     assert not terminated
     assert info["ending"] == "window_end"
-    equity = env.ledger().steps["equity"].to_list()
-    for n, (_, _, _, _, info) in enumerate(results):
-        before = 10_000.0 if n == 0 else equity[n - 1]
-        assert info["equity_delta"] == pytest.approx(equity[n] - before, abs=1e-9)
     with pytest.raises(RuntimeError):
         env.step(2)
 

@@ -15,9 +15,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from .endings import CLOSEOUT
 from .ledger import Ledger
+
+if TYPE_CHECKING:
+    from .env import TradingEnv
 
 __all__ = ["SweepResult", "run_sweep"]
 
@@ -27,8 +31,9 @@ class SweepResult:
     """The sweep's Ledger and what it covered.
 
     ``sessions_run`` are Session ordinals in the order played, ``skipped`` the ones
-    with nothing to trade, and ``closeout`` whether a closeout stopped the sweep
-    (``sessions_run[-1]`` is then the Session it happened in).
+    with nothing to trade or outside the env's split, and ``closeout`` whether a
+    closeout stopped the sweep (``sessions_run[-1]`` is then the Session it
+    happened in).
     """
 
     ledger: Ledger
@@ -38,7 +43,7 @@ class SweepResult:
 
 
 def run_sweep(
-    env: Any,
+    env: TradingEnv,
     policy: Callable[[Any], int],
     *,
     sessions: Iterable[int] | None = None,
@@ -72,7 +77,7 @@ def run_sweep(
             obs, _, terminated, truncated, info = env.step(policy(obs))
             done = terminated or truncated
         equity = env.equity
-        if info["ending"] == "closeout":
+        if info["ending"] == CLOSEOUT:
             closeout = True
             break
     return SweepResult(env.ledger(), played, skipped, closeout)

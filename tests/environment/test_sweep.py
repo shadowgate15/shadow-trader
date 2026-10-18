@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable
 from pathlib import Path
 
@@ -62,7 +61,7 @@ def test_reset_options_pick_the_session_start_bar_and_equity(prepared) -> None:
     assert info["start_bar_in_session"] == 100
     assert env.equity == 7_500.0
     _, _, _, _, step_info = env.step(FLAT)
-    assert step_info["equity_delta"] == 0.0
+    assert step_info["ending"] is None
 
 
 def test_default_start_is_the_first_usable_bar(prepared) -> None:
@@ -234,10 +233,9 @@ def test_a_closeout_stops_the_sweep_and_records_the_stop(prepared) -> None:
     assert ledger.episodes.height == 1
 
 
-def test_skipped_sessions_are_logged(prepared, caplog) -> None:
-    with caplog.at_level(logging.WARNING):
-        run_sweep(build(prepared), always(FLAT))
-    assert any("no usable" in r.message for r in caplog.records)
+def test_sessions_without_usable_bars_are_reported_as_skipped(prepared) -> None:
+    result = run_sweep(build(prepared), always(FLAT))
+    assert result.skipped
 
 
 def test_a_scripted_baseline_goes_through_the_same_engine_and_ledger(prepared) -> None:

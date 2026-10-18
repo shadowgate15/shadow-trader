@@ -19,19 +19,18 @@ sweeps always persist, through ``persist_sweep``.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from collections.abc import Callable, Iterable
 from importlib import metadata
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import polars as pl
 
 from shadow_trader.preparation._io import canonical_json
 
-from .env import TradingEnv
+from ._common import sha256
 from .env_config import EnvConfig
 from .ledger import (
     CLOSED_LOTS_SCHEMA,
@@ -45,6 +44,9 @@ from .ledger import (
 from .report import summarize, summary_document
 from .sweep import SweepResult, run_sweep
 
+if TYPE_CHECKING:
+    from .env import TradingEnv
+
 __all__ = [
     "MANIFEST_FILE",
     "SCHEMA_VERSION",
@@ -56,9 +58,10 @@ __all__ = [
     "read_manifest",
     "verify_summary",
     "write_ledger",
+    "write_worker_ledger",
 ]
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MANIFEST_FILE = "manifest.json"
 SUMMARY_FILE = "summary.json"
 EPISODE_MODE_SWEEP = "eval_sweep"
@@ -75,16 +78,14 @@ class ManifestError(LedgerError):
     """A persisted Ledger's manifest is missing, malformed or does not match."""
 
 
-def _sha(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
 def _file_hash(path: Path) -> str:
-    return _sha(path.read_bytes())
+    return sha256(path.read_bytes())
 
 
 def _manifest_hash(doc: dict[str, Any]) -> str:
-    return _sha(canonical_json({k: v for k, v in doc.items() if k != "manifest_hash"}))
+    return sha256(
+        canonical_json({k: v for k, v in doc.items() if k != "manifest_hash"})
+    )
 
 
 def _summary_bytes(ledger: Ledger) -> bytes:
@@ -204,18 +205,60 @@ def read_manifest(path: Path) -> dict[str, Any]:
         )
     configs = doc.get("configs", {})
     for name, entry in configs.items():
-        if _sha(canonical_json(entry["json"])) != entry["hash"]:
+        if sha256(canonical_json(entry["json"])) != entry["hash"]:
             raise ManifestError(f"config {name!r} json does not match its hash")
     combined = {name: entry["json"] for name, entry in configs.items()}
-    if _sha(canonical_json(combined)) != doc.get("env_config_hash"):
+    if sha256(canonical_json(combined)) != doc.get("env_config_hash"):
         raise ManifestError("env_config_hash does not match the sub-configs")
     return doc
 
 
-def read_ledger(path: Path) -> Ledger:
-    """Load a persisted Ledger, checking the manifest and running ``verify_ledger``."""
+def write_worker_ledger(
+    env: TradingEnv,
+    root: Path,
+    spawn_index: int,
+    *,
+    episode_mode: str,
+    seam_version: int,
+) -> Path:
+    """Persist a vectorised worker's Ledger under ``root/worker-<spawn_index>``.
+
+    Each worker writes to its own directory, so workers never share files.
+    """
+    return write_ledger(
+        env,
+        Path(root) / f"worker-{spawn_index}",
+        episode_mode=episode_mode,
+        seam_version=seam_version,
+    )
+
+
+def read_ledger(
+    path: Path,
+    *,
+    dataset_id: str | None = None,
+    scaler_hash: str | None = None,
+    config: EnvConfig | None = None,
+) -> Ledger:
+    """Load a persisted Ledger, checking the manifest and running ``verify_ledger``.
+
+    Any of ``dataset_id``, ``scaler_hash`` and ``config`` that is given must match
+    what the manifest recorded (``ManifestError`` otherwise).
+    """
     path = Path(path)
     doc = read_manifest(path)
+    if dataset_id is not None and doc.get("dataset_id") != dataset_id:
+        raise ManifestError(
+            f"dataset mismatch: the Ledger is for {doc.get('dataset_id')!r}, "
+            f"expected {dataset_id!r}"
+        )
+    if scaler_hash is not None and doc.get("scaler_hash") != scaler_hash:
+        raise ManifestError(
+            f"scaler mismatch: the Ledger used {doc.get('scaler_hash')!r}, "
+            f"expected {scaler_hash!r}"
+        )
+    if config is not None and doc.get("env_config_hash") != config.config_hash():
+        raise ManifestError("config mismatch: the Ledger was made with another config")
     frames: dict[str, pl.DataFrame] = {}
     for name, schema in _TABLES.items():
         file = path / f"{name}.parquet"

@@ -24,8 +24,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from .endings import ENDINGS
 from .engine import ClosedLot, Fill, StepEvents
-from .ledger import CLOSEOUT, HALT, SESSION_END, STOPPED, Ledger
+from .ledger import Ledger
 
 __all__ = [
     "ENDINGS",
@@ -38,9 +39,6 @@ __all__ = [
 ]
 
 SUMMARY_VERSION = 1
-#: Every ending reason a Run summary counts; ``halt`` and ``stopped`` are live only
-#: and so always zero in simulation.
-ENDINGS = (CLOSEOUT, SESSION_END, "dataset_end", "window_end", HALT, STOPPED)
 
 
 @dataclass(frozen=True, slots=True)

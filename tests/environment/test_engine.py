@@ -154,7 +154,7 @@ def test_an_unfillable_bar_without_a_trusted_close_raises() -> None:
 
 def test_two_instruments_share_one_pooled_equity() -> None:
     config = EngineConfig(
-        instruments=(InstrumentSpec(symbol="EURUSD"), InstrumentSpec(symbol="GBPUSD"))
+        instruments=(InstrumentSpec(name="EURUSD"), InstrumentSpec(name="GBPUSD"))
     )
     gbp = Market(
         open_bid=1.3000, open_spread=0.0002, close_bid=1.3010, close_spread=0.0002

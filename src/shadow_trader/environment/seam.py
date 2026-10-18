@@ -15,6 +15,7 @@ memo and the live ledger; a Halt flatten uses ``halt_flatten``, which bypasses
 from __future__ import annotations
 
 from .config import EngineConfig, InstrumentSpec
+from .endings import HALT, STOPPED
 from .engine import (
     AccountSnapshot,
     EngineState,
@@ -34,9 +35,7 @@ from .ledger import (
     CLOSED_LOTS_SCHEMA,
     EPISODES_SCHEMA,
     FILLS_SCHEMA,
-    HALT,
     STEPS_SCHEMA,
-    STOPPED,
     Ledger,
     LedgerBuilder,
 )
@@ -54,7 +53,9 @@ from .session_calendar import (
     rollover_days,
 )
 
-SEAM_VERSION = 1
+#: 2: ``EngineConfig.names``/``InstrumentSpec.name`` replace ``symbols``/``symbol``,
+#: ``effective_leverage_cap`` is gone, and the episodes table carries counters.
+SEAM_VERSION = 2
 
 __all__ = [
     "CLOSED_LOTS_SCHEMA",

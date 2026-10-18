@@ -9,7 +9,6 @@ Session ids are contiguous runs because the weekly closure has no rows.
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -27,7 +26,6 @@ from .session_calendar import market_from_row
 
 __all__ = ["MarketData", "eligible_starts", "from_prepared"]
 
-log = logging.getLogger(__name__)
 
 _ROW_COLUMNS = (
     "open_time",
@@ -153,29 +151,25 @@ def from_prepared(
     )
 
 
-def eligible_starts(data: MarketData, window_bars: int) -> npt.NDArray[np.int64]:
+def eligible_starts(
+    data: MarketData, window_bars: int, sessions: frozenset[int] | None = None
+) -> npt.NDArray[np.int64]:
     """Rows a training window of ``window_bars`` stepped Bars may start from, in
     ascending order.
 
     The start Bar must be usable (the agent observes it) and the window's last
     stepped Bar must lie in the start's Session; it may be the Session's final Bar
     (where the engine forces flat). The Bars in between may be Gaps or otherwise
-    non-usable: one env step spans them. Sessions with no usable Bar, or none that
-    fit a window, are logged.
+    non-usable: one env step spans them. ``sessions`` (Session ordinals) restricts
+    the starts to those Sessions. Sessions with no eligible start simply do not
+    appear; the env emits no logging.
     """
     n = len(data)
     rows = np.arange(n)
     last = rows + window_bars
     in_range = last < n
     same_session = in_range & (data.session_end[data.session_index] > last)
-    starts = rows[data.usable & same_session].astype(np.int64)
-    covered = set(data.session_index[starts].tolist())
-    for k, opened in enumerate(data.session_open):
-        lo, hi = data.session_start[k], data.session_end[k]
-        if not data.usable[lo:hi].any():
-            log.warning("skipping Session %s: it has no usable Bars", opened)
-        elif k not in covered:
-            log.warning(
-                "skipping Session %s: no window of %d Bars fits", opened, window_bars
-            )
-    return starts
+    ok = data.usable & same_session
+    if sessions is not None:
+        ok &= np.isin(data.session_index, sorted(sessions))
+    return rows[ok].astype(np.int64)
