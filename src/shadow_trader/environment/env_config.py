@@ -84,6 +84,14 @@ class EnvConfig:
     def config_hash(self) -> str:
         return hashlib.sha256(self.canonical_json()).hexdigest()
 
+    def sub_configs(self) -> dict[str, Any]:
+        """Each sub-config as plain data, keyed by its field name."""
+        return asdict(self)
+
+    def sub_config_hashes(self) -> dict[str, str]:
+        """SHA-256 of each sub-config's canonical JSON; independent of the others."""
+        return {name: _hash(value) for name, value in self.sub_configs().items()}
+
     @classmethod
     def from_toml(cls, path: Path) -> EnvConfig:
         """Load a TOML file over the code defaults; raise ConfigError on any problem."""
