@@ -155,8 +155,9 @@ def eligible_starts(data: MarketData, window_bars: int) -> npt.NDArray[np.int64]
     """Rows a training window of ``window_bars`` stepped Bars may start from, in
     ascending order.
 
-    The start Bar and every Bar stepped after it must be usable and not the
-    Session's final Bar, and the last stepped Bar must lie in the start's Session.
+    The start Bar and every Bar stepped before the last must be usable and not the
+    Session's final Bar; the last stepped Bar must be usable, lie in the start's
+    Session and may be its final Bar (where the engine forces flat).
     (Gap stepping, which lifts the all-usable requirement, is a later ticket.)
     Sessions with no usable Bar, or none that fit a window, are logged.
     """
@@ -167,7 +168,11 @@ def eligible_starts(data: MarketData, window_bars: int) -> npt.NDArray[np.int64]
     last = rows + window_bars
     in_range = last < n
     clipped = np.minimum(last, n - 1)
-    all_good = in_range & (csum[clipped + 1] - csum[rows] == window_bars + 1)
+    # the start and the Bars before the last are usable and not Session-final; the
+    # last stepped Bar must be usable and may be the Session's final Bar (forced flat)
+    all_good = (
+        in_range & (csum[clipped] - csum[rows] == window_bars) & data.usable[clipped]
+    )
     same_session = in_range & (data.session_end[data.session_index] > last)
     starts = rows[all_good & same_session].astype(np.int64)
     covered = set(data.session_index[starts].tolist())

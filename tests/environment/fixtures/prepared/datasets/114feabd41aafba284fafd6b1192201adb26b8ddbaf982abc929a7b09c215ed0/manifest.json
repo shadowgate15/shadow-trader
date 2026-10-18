@@ -4,7 +4,7 @@
       "dataset_start": 6,
       "distrusted_flag": 0,
       "gap": 0,
-      "session_warm_up": 17,
+      "session_warm_up": 29,
       "window_contains_distrusted_flag": 0,
       "window_contains_gap": 0
     },
@@ -14,16 +14,16 @@
       "stale_quote"
     ],
     "hash": "7ae44d734956716f907a37a79d3c58a5470b7d32f24050825eb08645a2eae5ac",
-    "usable_count": 822,
-    "usable_fraction": 0.9727810650887574,
+    "usable_count": 930,
+    "usable_fraction": 0.9637305699481865,
     "version": 1
   },
   "bar_size": 5,
-  "builder_git_revision": "f4acd7e919775b787e40016a866ff11650b183ef",
+  "builder_git_revision": "5b00f71d9053176c084ceced65153dd588f467a9",
   "builder_version": "0.1.0",
-  "content_hash": "2d118e26391bbfbb898bf8c3caa3b2864c6e449577267d42842362f7263593db",
+  "content_hash": "114feabd41aafba284fafd6b1192201adb26b8ddbaf982abc929a7b09c215ed0",
   "created_at": "2024-02-01T00:00:00+00:00",
-  "dataset_id": "2d118e26391bbfbb898bf8c3caa3b2864c6e449577267d42842362f7263593db",
+  "dataset_id": "114feabd41aafba284fafd6b1192201adb26b8ddbaf982abc929a7b09c215ed0",
   "feature_spec": {
     "columns": [
       "feat_ret_1",
@@ -40,19 +40,19 @@
   "parent_ingestion": "fixture",
   "partitions": [
     {
-      "hash": "3ce1f1f3d1b3a4102e1ad5a2d21ec866f9019c69c8fd7fdfc3bca1460a3c9e1a",
+      "hash": "a06603e320589a4a8e1b6fcb1ce9620ed1451c3556737e38af18aeef2b052199",
       "instrument": "EURUSD",
       "path": "bars/instrument=EURUSD/year=2024/part-0.parquet",
-      "rows": 845
+      "rows": 965
     }
   ],
   "polars_version": "2.0.0",
   "prepared_parent": null,
   "role": "train",
-  "row_count": 845,
+  "row_count": 965,
   "scaler": {
     "fit": true,
-    "id": "712128aab65d64f410cabeb2033e4820ef40469d675f22ed753672bedf92a901"
+    "id": "31b3d09737da382b0a7f83b4eca755974a7a8cebc6bdba5aaaa54b077884c850"
   },
   "schema_version": 1
 }

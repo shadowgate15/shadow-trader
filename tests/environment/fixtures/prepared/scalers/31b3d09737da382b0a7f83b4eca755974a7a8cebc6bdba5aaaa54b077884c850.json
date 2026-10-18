@@ -1,31 +1,31 @@
 {
   "anomaly_policy_hash": "fixture",
   "clip": 5.0,
-  "fit_dataset": "2d118e26391bbfbb898bf8c3caa3b2864c6e449577267d42842362f7263593db",
+  "fit_dataset": "114feabd41aafba284fafd6b1192201adb26b8ddbaf982abc929a7b09c215ed0",
   "fit_range": [
     "2024-01-07T22:00:00+00:00",
-    "2024-01-28T22:20:00+00:00"
+    "2024-02-16T21:55:00+00:00"
   ],
   "instruments": {
     "EURUSD": {
       "columns": {
         "feat_ret_1": {
-          "iqr": 0.0003834918401050651,
-          "median": -9.114399384017612e-06,
+          "iqr": 0.0003826414607142661,
+          "median": -9.096242796886343e-06,
           "method": "robust_clip",
-          "n_fit": 841
+          "n_fit": 959
         },
         "feat_ret_3": {
-          "iqr": 0.0006724113934148475,
-          "median": -1.828237122413461e-05,
+          "iqr": 0.0006649303334589774,
+          "median": -1.8283206874862223e-05,
           "method": "robust_clip",
-          "n_fit": 833
+          "n_fit": 947
         },
         "feat_ret_6": {
-          "iqr": 0.0009223099243816861,
-          "median": -8.216214948168196e-05,
+          "iqr": 0.0008843935010057272,
+          "median": -7.287877931399456e-05,
           "method": "robust_clip",
-          "n_fit": 822
+          "n_fit": 930
         }
       }
     }

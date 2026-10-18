@@ -4,8 +4,16 @@ The env adds actions, episodes, reward and ``info`` on top of the pure engine,
 observation assembler and ledger. This is the skeleton: one agent step is exactly
 one Bar, and a training episode is a random window of ``EpisodeConfig.window_bars``
 Bars inside one Session whose Bars are all usable. A margin closeout ends the
-episode as ``terminated``; window end is ``truncated``. Session-end
-force-flat, Gap stepping and evaluation sweeps arrive with later tickets.
+episode as ``terminated``; window end, Session end and dataset end are
+``truncated``. On the Session's final Bar the engine forces any position flat at
+the open (the cost lands in that last step).
+
+``reset(options={"session": k, ...})`` instead starts an evaluation episode: the
+Session with ordinal ``k`` from ``start_bar`` (default: its first usable Bar) with
+``equity`` (default: the starting equity) through to the Session's end. Options
+make the episode fully deterministic; the RNG is not touched. ``chain=True`` keeps
+recording into the same Ledger (an evaluation sweep, see ``sweep.run_sweep``).
+Gap stepping arrives with a later ticket.
 
 Gymnasium is imported here (and in nothing else of the package); the package
 ``__init__`` exposes this module lazily.
@@ -13,6 +21,7 @@ Gymnasium is imported here (and in nothing else of the package); the package
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import gymnasium as gym
@@ -34,8 +43,13 @@ from .reward import log_return_reward
 
 __all__ = ["TradingEnv", "make_env"]
 
+log = logging.getLogger(__name__)
+
 WINDOW_END = "window_end"
+SESSION_END = "session_end"
+DATASET_END = "dataset_end"
 CLOSEOUT = "closeout"
+_OPTION_KEYS = frozenset({"session", "start_bar", "equity", "chain"})
 
 
 class TradingEnv(gym.Env):
@@ -85,7 +99,38 @@ class TradingEnv(gym.Env):
         self._end = 0
         self._episode = -1
         self._done = True
+        self._explicit = False
         self._builder: LedgerBuilder | None = None
+
+    @property
+    def records_ledger(self) -> bool:
+        return self._record
+
+    @property
+    def session_count(self) -> int:
+        return len(self._data.session_open)
+
+    @property
+    def equity(self) -> float:
+        """Account equity now (after the last step, or the carried-in equity)."""
+        if self._state is None:
+            raise RuntimeError("call reset() first")
+        return self._state.equity
+
+    def sweep_sessions(self) -> list[int]:
+        """Ordinals of the Sessions an evaluation sweep can run, chronologically.
+
+        A Session with no usable Bar is skipped and logged.
+        """
+        data = self._data
+        runnable = []
+        for k, opened in enumerate(data.session_open):
+            lo, hi = int(data.session_start[k]), int(data.session_end[k])
+            if data.usable[lo:hi].any():
+                runnable.append(k)
+            else:
+                log.warning("skipping Session %s: it has no usable Bars", opened)
+        return runnable
 
     # -- Gymnasium API -------------------------------------------------------
 
@@ -97,14 +142,32 @@ class TradingEnv(gym.Env):
     ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         super().reset(seed=seed)
         data = self._data
-        start = int(self._starts[self.np_random.integers(len(self._starts))])
+        equity = self._config.engine.starting_equity
+        chain = False
+        if options:
+            start, self._end, equity, chain = self._explicit_start(options)
+            self._explicit = True
+        else:
+            start = int(self._starts[self.np_random.integers(len(self._starts))])
+            self._end = start + self._config.episode.window_bars
+            self._explicit = False
         self._row = start
-        self._end = start + self._config.episode.window_bars
-        self._state = initial_state(self._config.engine)
+        self._state = initial_state(self._config.engine, equity)
         self._done = False
         self._episode += 1
-        self._builder = LedgerBuilder(self._config.engine) if self._record else None
         session = int(data.session_index[start])
+        if self._record:
+            if not (chain and self._builder is not None):
+                self._builder = LedgerBuilder(self._config.engine)
+            self._builder.begin_episode(
+                self._episode,
+                session,
+                data.open_time[start],
+                equity,
+                chained=chain and self._episode > 0,
+            )
+        else:
+            self._builder = None
         info = {
             "session": session,
             "session_open": data.session_open[session],
@@ -138,13 +201,23 @@ class TradingEnv(gym.Env):
         terminated = events.closeout
         truncated = row >= self._end and not terminated
         self._done = terminated or truncated
-        ending = CLOSEOUT if terminated else WINDOW_END if truncated else None
+        ending = None
+        if terminated:
+            ending = CLOSEOUT
+        elif truncated:
+            if data.is_session_final[row]:
+                ending = SESSION_END
+            else:
+                ending = DATASET_END if self._explicit else WINDOW_END
+        if self._builder is not None and ending is not None:
+            self._builder.end_episode(ending)
         info = {
             "ending": ending,
             "equity_delta": events.equity - previous,
             "bars_advanced": 1,
             "clipped": events.clipped,
             "closeout": events.closeout,
+            "forced_flat": events.forced_flat,
         }
         reward = log_return_reward(previous, events.equity, self._config.reward)
         return self._observation(), reward, terminated, truncated, info
@@ -162,6 +235,47 @@ class TradingEnv(gym.Env):
         return self._builder.build()
 
     # -- internals ---------------------------------------------------------------
+
+    def _explicit_start(self, options: dict[str, Any]) -> tuple[int, int, float, bool]:
+        """Validate ``reset`` options: (start row, last row, equity, chain)."""
+        data = self._data
+        unknown = sorted(set(options) - _OPTION_KEYS)
+        if unknown:
+            raise ValueError(f"unknown reset option(s): {', '.join(unknown)}")
+        if "session" not in options:
+            raise ValueError("reset options need a 'session'")
+        session = options["session"]
+        if (
+            isinstance(session, bool)
+            or not isinstance(session, int | np.integer)
+            or not 0 <= session < len(data.session_open)
+        ):
+            raise ValueError(f"session {session!r} is not a Session ordinal")
+        lo, hi = int(data.session_start[session]), int(data.session_end[session])
+        usable = np.flatnonzero(data.usable[lo:hi])
+        if len(usable) == 0:
+            raise ValueError(f"Session {session} has no usable Bars")
+        offset = int(options.get("start_bar", usable[0]))
+        start = lo + offset
+        if not 0 <= offset < hi - lo - 1 or not data.usable[start]:
+            raise ValueError(
+                f"start_bar {offset} is not a usable Bar before the end of Session "
+                f"{session}"
+            )
+        if not data.usable[start:hi].all() or not data.fillable[start:hi].all():
+            raise ValueError(
+                f"Session {session} has unusable Bars after the start; Gap stepping "
+                "is not supported yet"
+            )
+        equity = options.get("equity", self._config.engine.starting_equity)
+        if (
+            isinstance(equity, bool)
+            or not isinstance(equity, int | float)
+            or not np.isfinite(equity)
+            or equity <= 0
+        ):
+            raise ValueError(f"equity {equity!r} must be a positive number")
+        return start, hi - 1, float(equity), bool(options.get("chain", False))
 
     def _observation(self) -> dict[str, np.ndarray]:
         assert self._state is not None

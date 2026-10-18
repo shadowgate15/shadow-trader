@@ -37,6 +37,7 @@ from .engine import StepEvents
 
 __all__ = [
     "CLOSED_LOTS_SCHEMA",
+    "EPISODES_SCHEMA",
     "FILLS_SCHEMA",
     "STEPS_SCHEMA",
     "Ledger",
@@ -71,7 +72,21 @@ FILLS_SCHEMA: dict[str, pl.DataType] = {
     "slippage_cost": pl.Float64(),
     "clipped": pl.Boolean(),
     "closeout": pl.Boolean(),
+    "forced_flat": pl.Boolean(),
 }
+
+EPISODES_SCHEMA: dict[str, pl.DataType] = {
+    "episode_id": pl.Int64(),
+    "session_id": pl.Int64(),
+    "start_time": UTC_US,
+    "start_equity": pl.Float64(),
+    "end_equity": pl.Float64(),
+    "ending": pl.String(),  # null while the episode is still open
+    "bars": pl.Int64(),
+    "chained": pl.Boolean(),  # start equity carried in from the previous episode
+}
+SESSION_END = "session_end"
+CLOSEOUT = "closeout"
 
 CLOSED_LOTS_SCHEMA: dict[str, pl.DataType] = {
     "step": pl.Int64(),
@@ -101,6 +116,9 @@ class Ledger:
         default_factory=lambda: pl.DataFrame(schema=CLOSED_LOTS_SCHEMA)
     )
     leverage_cap: float | None = None  # effective cap; None skips the margin check
+    episodes: pl.DataFrame = field(
+        default_factory=lambda: pl.DataFrame(schema=EPISODES_SCHEMA)
+    )  # empty: all steps are one episode from ``starting_equity``
 
 
 class LedgerBuilder:
@@ -119,6 +137,35 @@ class LedgerBuilder:
         self._steps: list[tuple[object, ...]] = []
         self._fills: list[tuple[object, ...]] = []
         self._closed: list[tuple[object, ...]] = []
+        self._episodes: list[dict[str, object]] = []
+
+    def begin_episode(
+        self,
+        episode_id: int,
+        session_id: int,
+        start_time: datetime,
+        start_equity: float,
+        *,
+        chained: bool = False,
+    ) -> None:
+        """Open an episode row; its steps follow via ``add_step(episode_id=...)``.
+
+        ``chained`` says the start equity was carried in from the previous episode.
+        """
+        self._episodes.append(
+            {
+                "episode_id": episode_id,
+                "session_id": session_id,
+                "start_time": start_time,
+                "start_equity": start_equity,
+                "ending": None,
+                "chained": chained,
+            }
+        )
+
+    def end_episode(self, ending: str) -> None:
+        """Record why the open episode ended."""
+        self._episodes[-1]["ending"] = ending
 
     def add_step(
         self,
@@ -157,6 +204,7 @@ class LedgerBuilder:
                     fill.slippage_cost,
                     fill.clipped,
                     fill.closeout,
+                    fill.forced_flat,
                 )
             )
 
@@ -173,6 +221,20 @@ class LedgerBuilder:
                 )
             )
 
+    def _episodes_frame(self) -> pl.DataFrame:
+        """Episode rows with end equity and Bar count taken from their steps."""
+        rows = []
+        for episode in self._episodes:
+            mine = [s for s in self._steps if s[2] == episode["episode_id"]]
+            rows.append(
+                {
+                    **episode,
+                    "end_equity": mine[-1][4] if mine else episode["start_equity"],
+                    "bars": len(mine),
+                }
+            )
+        return pl.DataFrame(rows, schema=EPISODES_SCHEMA)
+
     def build(self) -> Ledger:
         return Ledger(
             steps=pl.DataFrame(self._steps, schema=STEPS_SCHEMA, orient="row"),
@@ -182,6 +244,7 @@ class LedgerBuilder:
                 self._closed, schema=CLOSED_LOTS_SCHEMA, orient="row"
             ),
             leverage_cap=self._config.effective_leverage_cap,
+            episodes=self._episodes_frame(),
         )
 
 
@@ -191,7 +254,12 @@ def verify_ledger(ledger: Ledger) -> None:
     steps, fills = ledger.steps, ledger.fills
 
     closed = ledger.closed_lots
-    for name, frame in (("steps", steps), ("fills", fills), ("closed_lots", closed)):
+    for name, frame in (
+        ("steps", steps),
+        ("fills", fills),
+        ("closed_lots", closed),
+        ("episodes", ledger.episodes),
+    ):
         for column in frame.columns:
             if frame.schema[column].is_float():
                 values = frame[column].to_list()
@@ -206,8 +274,10 @@ def verify_ledger(ledger: Ledger) -> None:
         if any(not 0 <= s < steps.height for s in fill_steps):
             problems.append("fills reference a step that is not in steps")
         elif not problems:
-            problems.extend(_replay(ledger))
-            problems.extend(_check_closeout(ledger))
+            problems.extend(_check_episodes(ledger))
+            if not problems:
+                problems.extend(_replay(ledger))
+                problems.extend(_check_closeout(ledger))
     elif fills.height:
         problems.append("fills reference a step that is not in steps")
 
@@ -235,15 +305,31 @@ def _replay(ledger: Ledger) -> list[str]:
             open_bid[s] = price - per_unit if units > 0 else price + per_unit
 
     problems: list[str] = []
+    starts: dict[int, float] = dict(
+        zip(
+            ledger.episodes["episode_id"].to_list(),
+            ledger.episodes["start_equity"].to_list(),
+            strict=True,
+        )
+    )
     lots: list[tuple[int, float]] = []  # open FIFO lots: (signed units, price)
     expected_closed: list[tuple[int, int, float, float, float]] = []
-    cash = ledger.starting_equity
+    start_equity = ledger.starting_equity
+    cash = start_equity
     position = 0
     realised = 0.0
     rollover = 0.0
-    previous_equity = ledger.starting_equity
+    previous_equity = start_equity
+    current: int | None = None
     for row in steps.iter_rows(named=True):
         s = row["step"]
+        if starts and row["episode_id"] != current:  # an episode starts flat
+            if current is not None and sum(u for u, _ in lots) != position:
+                problems.append("open lots do not sum to the final position")
+            current = row["episode_id"]
+            start_equity = starts[current]
+            cash = previous_equity = start_equity
+            position, realised, rollover, lots = 0, 0.0, 0.0, []
         before = position
         spent = 0.0  # sum of units x price in fill order
         for units, price in by_step.get(s, ()):
@@ -284,7 +370,7 @@ def _replay(ledger: Ledger) -> list[str]:
         rollover += row["rollover_charge"]
         value = position * row["mark_price"]
         expected = cash + value
-        scale = max(abs(expected), abs(cash), abs(value), ledger.starting_equity)
+        scale = max(abs(expected), abs(cash), abs(value), start_equity)
         if abs(row["equity"] - expected) > RECONCILIATION_RTOL * scale:
             problems.append(
                 f"equity at step {s} is {row['equity']!r} but cash and position "
@@ -293,8 +379,8 @@ def _replay(ledger: Ledger) -> list[str]:
             break
         # the same equity from lots: realised P&L plus open lots marked, less rollover
         mtm = sum(units * (row["mark_price"] - price) for units, price in lots)
-        by_lots = ledger.starting_equity + realised + mtm - rollover
-        scale = max(abs(by_lots), abs(realised), abs(mtm), ledger.starting_equity)
+        by_lots = start_equity + realised + mtm - rollover
+        scale = max(abs(by_lots), abs(realised), abs(mtm), start_equity)
         if abs(row["equity"] - by_lots) > RECONCILIATION_RTOL * scale:
             problems.append(
                 f"equity at step {s} is {row['equity']!r} but realised P&L and "
@@ -309,13 +395,71 @@ def _replay(ledger: Ledger) -> list[str]:
     return problems
 
 
+def _check_episodes(ledger: Ledger) -> list[str]:
+    """The ``episodes`` table agrees with ``steps`` and chains across a sweep.
+
+    The first row's start equity is checked by the replay (the first step must
+    reconcile from it); here the Bar counts, end equity, chaining and the ending
+    reasons are checked. An empty table means one episode from ``starting_equity``.
+    """
+    table = ledger.episodes
+    if table.height == 0:
+        return []
+    steps = ledger.steps
+    problems: list[str] = []
+    ids = table["episode_id"].to_list()
+    if len(set(ids)) != len(ids):
+        return ["episodes has duplicate episode ids"]
+    step_ids = steps["episode_id"].to_list()
+    if set(step_ids) - set(ids):
+        return ["steps reference an episode that is not in episodes"]
+    runs = [e for n, e in enumerate(step_ids) if n == 0 or e != step_ids[n - 1]]
+    if len(runs) != len(set(runs)):
+        return ["the steps of an episode are not contiguous"]
+    previous: dict[str, object] | None = None
+    for row in table.iter_rows(named=True):
+        mine = steps.filter(pl.col("episode_id") == row["episode_id"])
+        label = f"episode {row['episode_id']}"
+        if row["bars"] != mine.height:
+            problems.append(
+                f"{label} records {row['bars']} bars but has {mine.height} steps"
+            )
+        last = mine["equity"][-1] if mine.height else row["start_equity"]
+        if abs(row["end_equity"] - last) > RECONCILIATION_RTOL * max(1.0, abs(last)):
+            problems.append(
+                f"{label} end equity {row['end_equity']!r} is not its last "
+                f"steps row {last!r}"
+            )
+        if row["ending"] == SESSION_END and mine.height and mine["position_units"][-1]:
+            problems.append(f"{label} ends at Session end but is not flat")
+        if row["ending"] == CLOSEOUT and not (mine.height and mine["closeout"][-1]):
+            problems.append(f"{label} ends in closeout but its last row is not one")
+        if row["chained"] and previous is not None:
+            end = previous["end_equity"]
+            if abs(row["start_equity"] - end) > RECONCILIATION_RTOL * max(
+                1.0, abs(end)
+            ):
+                problems.append(
+                    f"{label} does not chain: it starts at {row['start_equity']!r} "
+                    f"but the previous episode ended at {end!r}"
+                )
+            if previous["ending"] == CLOSEOUT:
+                problems.append(f"{label} continues a sweep after a closeout")
+        previous = row
+    return problems
+
+
 def _check_closeout(ledger: Ledger) -> list[str]:
-    """A closeout is the last row, flat, with a closeout-flagged fill."""
+    """A closeout is the last row of its episode, flat, with a closeout fill."""
     steps, fills = ledger.steps, ledger.fills
     flagged = steps.filter(pl.col("closeout"))["step"].to_list()
     fill_steps = set(fills.filter(pl.col("closeout"))["step"].to_list())
+    episode_of = steps["episode_id"].to_list()
+    last_of: dict[int, int] = {}
+    for n, e in enumerate(episode_of):
+        last_of[e] = n
     problems: list[str] = []
-    if len(flagged) > 1 or (flagged and flagged[0] != steps.height - 1):
+    if any(last_of[episode_of[s]] != s for s in flagged):
         problems.append("a closeout row is not the last row of the episode")
     if fill_steps - set(flagged):
         problems.append("a closeout-flagged fill is on a row that is not a closeout")
