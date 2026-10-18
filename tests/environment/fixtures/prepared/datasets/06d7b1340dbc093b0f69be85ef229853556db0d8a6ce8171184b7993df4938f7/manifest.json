@@ -1,0 +1,58 @@
+{
+  "anomaly_policy": {
+    "counts_by_reason": {
+      "dataset_start": 6,
+      "distrusted_flag": 1,
+      "gap": 8,
+      "session_warm_up": 47,
+      "window_contains_distrusted_flag": 6,
+      "window_contains_gap": 6
+    },
+    "distrusted_flags": [
+      "crossed_quote",
+      "price_spike",
+      "stale_quote"
+    ],
+    "hash": "7ae44d734956716f907a37a79d3c58a5470b7d32f24050825eb08645a2eae5ac",
+    "usable_count": 1331,
+    "usable_fraction": 0.9473309608540925,
+    "version": 1
+  },
+  "bar_size": 5,
+  "builder_git_revision": "23e9a22ea2a8181221e2328773504675db92f84a",
+  "builder_version": "0.1.0",
+  "content_hash": "06d7b1340dbc093b0f69be85ef229853556db0d8a6ce8171184b7993df4938f7",
+  "created_at": "2024-02-01T00:00:00+00:00",
+  "dataset_id": "06d7b1340dbc093b0f69be85ef229853556db0d8a6ce8171184b7993df4938f7",
+  "feature_spec": {
+    "columns": [
+      "feat_ret_1",
+      "feat_ret_3",
+      "feat_ret_6"
+    ],
+    "hash": "d78d672acee8cf473dccecc2de0856b731fa01f040692e0760347e4aad839db2",
+    "version": 1
+  },
+  "instruments": [
+    "EURUSD"
+  ],
+  "kind": "prepared",
+  "parent_ingestion": "fixture",
+  "partitions": [
+    {
+      "hash": "ca6bbdefa466d28ebaaf332a3859ff72723a4afd552ffe4b45f4b8110ac3222d",
+      "instrument": "EURUSD",
+      "path": "bars/instrument=EURUSD/year=2024/part-0.parquet",
+      "rows": 1405
+    }
+  ],
+  "polars_version": "2.0.0",
+  "prepared_parent": null,
+  "role": "train",
+  "row_count": 1405,
+  "scaler": {
+    "fit": true,
+    "id": "d725fdc7f0e0f22e6217c1dc7f5ff8433ec0f3b2bf4ad35992ea064e90bd85f2"
+  },
+  "schema_version": 1
+}

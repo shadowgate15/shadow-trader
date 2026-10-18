@@ -94,3 +94,23 @@ _Avoid_: Normalizer, preprocessor
 **Tail**:
 The most recent run of live Bars, long enough to cover the longest lookback plus Warm-up, from which live features for the latest Bar are computed with the same definitions as a batch build. A short Tail yields null features, not errors.
 _Avoid_: Window, buffer
+
+**Ledger**:
+The reward-independent record of what the trading environment did over a run: each stepped Bar's equity and position, every fill, every closed lot, and each episode's start and end. Evaluation computes everything from it, and a scripted baseline produces one in the same form.
+_Avoid_: Trade log, history
+
+**Run summary**:
+The counts and totals read straight off a Ledger for one run, and for each episode in it: Bars, decisions, fills, flagged events, costs, and starting and final equity. It holds no ratios, drawdowns or comparisons; those belong to evaluation.
+_Avoid_: Metrics, performance report
+
+**Episode**:
+One run of the trading environment from a reset to its end, always inside a single Session. It starts flat on a usable Bar and ends either by margin closeout (terminated) or by a time-based end: a fixed window length, the Session's end, or the end of the Dataset (truncated).
+_Avoid_: Game, rollout, run
+
+**Closeout**:
+The forced flattening of the whole position when margin cannot be held. The engine detects it at a Bar's close and flattens in the same step, at that same close, rather than at the next Bar's open (a recorded deviation from the Execution model's open-fill rule: there is no later Bar to wait for inside an Episode that ends on it). It is the only terminating Episode ending. A step's reward is floored numerically at a wiped-out account (equity at or below zero), a guard rather than shaping.
+_Avoid_: Liquidation, margin call
+
+**Decision Bar**:
+A usable Bar at whose close the agent is asked for an action. Every other Bar inside an Episode (a Gap, or a Bar made non-usable by a distrusted flag or a Gap in its lookback) is stepped through without consulting the agent, so one agent step can span several Bars.
+_Avoid_: Tick, turn

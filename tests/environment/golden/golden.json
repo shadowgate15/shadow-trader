@@ -1,0 +1,13 @@
+{
+  "hash": "386a1854310b84969d42ccacb0736207669240756d39b613c2120e7d4087b118",
+  "platform": "darwin-arm64",
+  "entropy": 125,
+  "parts": [
+    "sweep",
+    "closeout",
+    "random-0",
+    "random-1",
+    "random-2",
+    "random-3"
+  ]
+}
