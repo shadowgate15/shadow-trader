@@ -36,6 +36,7 @@ from .engine import (
 from .env_config import EnvConfig, EpisodeConfig, RewardConfig
 from .ledger import (
     CLOSED_LOTS_SCHEMA,
+    EPISODES_SCHEMA,
     FILLS_SCHEMA,
     STEPS_SCHEMA,
     Ledger,
@@ -53,6 +54,7 @@ from .session_calendar import market_from_row
 
 if TYPE_CHECKING:
     from .env import TradingEnv, make_env
+    from .sweep import SweepResult, run_sweep
 
 
 def __getattr__(name: str) -> Any:
@@ -60,11 +62,16 @@ def __getattr__(name: str) -> Any:
         from . import env
 
         return getattr(env, name)
+    if name in ("SweepResult", "run_sweep"):
+        from . import sweep
+
+        return getattr(sweep, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
     "CLOSED_LOTS_SCHEMA",
+    "EPISODES_SCHEMA",
     "FILLS_SCHEMA",
     "STEPS_SCHEMA",
     "ClosedLot",
@@ -85,6 +92,7 @@ __all__ = [
     "OrderPlan",
     "RewardConfig",
     "StepEvents",
+    "SweepResult",
     "TradingEnv",
     "build_observation",
     "clip_order",
@@ -92,6 +100,7 @@ __all__ = [
     "level_to_units",
     "make_env",
     "market_from_row",
+    "run_sweep",
     "step",
     "verify_ledger",
     "window_inputs",

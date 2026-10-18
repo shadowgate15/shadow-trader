@@ -1,14 +1,16 @@
 """The small checked-in fixture Dataset for the environment tests.
 
 A prepared Dataset (one Instrument, EURUSD, 5-minute Bars) plus its Scaler lives in
-``tests/environment/fixtures/prepared``. It has four Sessions, none crossing a
-17:00 New York rollover or reaching the weekly close, so the engine can step
-every Bar:
+``tests/environment/fixtures/prepared``. It has six Sessions, none crossing a
+17:00 New York rollover, so the engine can step every Bar:
 
 - Sessions 1 to 3 hold ``SESSION_BARS`` Bars each (warm-up is ``WARM_UP`` Bars, so
   Bar ``WARM_UP`` is the first usable one);
 - Session 4 holds only ``SHORT_SESSION_BARS`` Bars, all in warm-up, so it has no
-  usable Bar.
+  usable Bar;
+- Sessions 5 and 6 hold ``FINAL_SESSION_BARS`` Bars each and end on the Session's
+  true final Bar (Friday 21:55 UTC), so Session-end force-flat applies. Sessions 1
+  to 3 stop short of the weekly close: their last Bar is not Session-final.
 
 The feature spec is a small custom one (log returns over 1, 3 and 6 Bars) so the
 warm-up is short. Later tickets that need Gaps, rollover or a closeout extend
@@ -42,9 +44,14 @@ from shadow_trader.preparation.spec import SPECS, FeatureSpec
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "prepared"
 INSTRUMENT = "EURUSD"
-SESSION_OPENS = tuple(
-    datetime(2024, 1, day, 22, 0, tzinfo=UTC) for day in (7, 14, 21, 28)
+SESSION_OPENS = (
+    *(datetime(2024, 1, day, 22, 0, tzinfo=UTC) for day in (7, 14, 21, 28)),
+    *(datetime(2024, 2, day, 22, 0, tzinfo=UTC) for day in (4, 11)),
 )
+# Sessions 5 and 6 run to the weekly close (Friday 21:55 UTC is their Session-final
+# Bar); their earlier Bars are not in the fixture, so they are short.
+FINAL_SESSION_BARS = 60
+FINAL_SESSIONS = (4, 5)
 SESSION_BARS = 280  # fewer than 288, the first rollover Bar of a Session
 SHORT_SESSION_BARS = 5
 WARM_UP = 6
@@ -57,7 +64,12 @@ def fixture_bars() -> list[Bar]:
     bars: list[Bar] = []
     price = 1.1
     for session, opened in enumerate(SESSION_OPENS):
-        count = SESSION_BARS if session < len(SESSION_OPENS) - 1 else SHORT_SESSION_BARS
+        if session in FINAL_SESSIONS:
+            count = FINAL_SESSION_BARS
+            first = opened + timedelta(days=5) - timedelta(minutes=5 * count)
+        else:
+            count = SESSION_BARS if session != 3 else SHORT_SESSION_BARS
+            first = opened
         for i in range(count):
             move = float(rng.normal(0.0, 3e-4))
             close = round(price * math.exp(move), 5)
@@ -65,7 +77,7 @@ def fixture_bars() -> list[Bar]:
             bars.append(
                 Bar(
                     instrument=INSTRUMENT,
-                    open_time=opened + timedelta(minutes=5 * i),
+                    open_time=first + timedelta(minutes=5 * i),
                     open=price,
                     high=round(max(price, close) + 0.0001, 5),
                     low=round(min(price, close) - 0.0001, 5),

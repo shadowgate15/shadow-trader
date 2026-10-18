@@ -146,12 +146,9 @@ def test_mismatched_instrument_count_raises() -> None:
 
 
 def test_unhandled_market_conditions_fail_loudly() -> None:
-    # fillable / session-final handling belongs to later tickets;
-    # until then the engine must not silently ignore them.
-    for market in (
-        Market(1.1, 0.0001, 1.1, 0.0001, fillable=False),
-        Market(1.1, 0.0001, 1.1, 0.0001, is_session_final=True),
-    ):
+    # unfillable handling belongs to a later ticket;
+    # until then the engine must not silently ignore it.
+    for market in (Market(1.1, 0.0001, 1.1, 0.0001, fillable=False),):
         with pytest.raises(NotImplementedError):
             step(initial_state(CONFIG), CONFIG, market, 1.0)
 

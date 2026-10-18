@@ -81,6 +81,7 @@ def test_steps_and_fills_tables_have_the_documented_columns() -> None:
         "slippage_cost",
         "clipped",
         "closeout",
+        "forced_flat",
     ]
     assert ledger.steps.height == 5
     assert ledger.steps["position_units"].to_list()[:3] == [

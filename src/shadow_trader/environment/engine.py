@@ -39,9 +39,13 @@ this Bar's close with normal spread and slippage (the env episode ends, so there
 no next open), flags the fill and resets the target to flat. ``StepEvents.used_margin``
 keeps the margin that triggered it.
 
-Not yet handled (later tickets): Session-end force-flat and unfillable Bars. ``step``
-raises ``NotImplementedError`` for a ``Market`` that needs them rather than
-silently ignoring it.
+Session-end force-flat: on a Bar with ``is_session_final`` the engine overrides the
+agent's target with flat, so any position is closed at that Bar's open with normal
+spread and slippage. The fill is flagged ``forced_flat`` and its cost lands in this
+(last) step; the target is left flat and a flat account is simply not traded.
+
+Not yet handled (a later ticket): unfillable Bars. ``step`` raises
+``NotImplementedError`` for one rather than silently ignoring it.
 """
 
 from __future__ import annotations
@@ -97,6 +101,7 @@ class Fill:
     slippage_cost: float
     clipped: bool = False  # the order was cut back by the margin limit
     closeout: bool = False  # the fill closes the position on margin closeout
+    forced_flat: bool = False  # the fill is the Session-end force-flat
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +154,7 @@ class StepEvents:
     clipped: bool = False  # some order was cut back by the margin limit
     shortfall: tuple[int, ...] = ()  # signed units still wanted, per Instrument
     closeout: bool = False  # the position was closed on margin closeout
+    forced_flat: bool = False  # a Session-end force-flat order was filled
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,12 +167,14 @@ class OrderPlan:
     shortfall: int  # target minus the post-fill position; 0 when nothing is clipped
 
 
-def initial_state(config: EngineConfig) -> EngineState:
-    """A flat account at the starting equity with every target flat."""
+def initial_state(config: EngineConfig, equity: float | None = None) -> EngineState:
+    """A flat account with every target flat, at ``equity`` (default: the config's
+    starting equity; an evaluation sweep passes the equity carried in)."""
     n = len(config.instruments)
+    start = config.starting_equity if equity is None else equity
     return EngineState(
-        cash=config.starting_equity,
-        equity=config.starting_equity,
+        cash=start,
+        equity=start,
         positions=(0,) * n,
         target_levels=(0.0,) * n,
         target_units=(0,) * n,
@@ -253,10 +261,8 @@ def step(
     for bar in markets:
         if bar.rollover_days not in (0, 1, 3):
             raise ValueError(f"rollover_days {bar.rollover_days} is not 0, 1 or 3")
-        if not bar.fillable or bar.is_session_final:
-            raise NotImplementedError(
-                "unfillable and Session-final Bars are not handled yet"
-            )
+        if not bar.fillable:
+            raise NotImplementedError("unfillable Bars are not handled yet")
 
     cap = config.effective_leverage_cap
     cash = state.cash
@@ -267,9 +273,14 @@ def step(
     closed_lots: list[ClosedLot] = []
     shortfall = [0] * n
     clipped = False
+    forced_flat = False
+    levels = [float(level) for level in targets]
     for i, spec in enumerate(config.instruments):
         bar = markets[i]
-        if targets[i] != state.target_levels[i]:  # a level change freezes new units
+        if bar.is_session_final:  # the engine overrides the target: be flat
+            levels[i] = 0.0
+            target_units[i] = 0
+        elif targets[i] != state.target_levels[i]:  # a level change freezes new units
             target_units[i] = level_to_units(
                 targets[i], state.equity, bar.open_bid, cap
             )
@@ -290,8 +301,18 @@ def step(
             spread_cost = 0.0
         cash -= delta * price
         positions[i] += delta
+        forced = bar.is_session_final
+        forced_flat = forced_flat or forced
         fills.append(
-            Fill(i, delta, price, spread_cost, abs(delta) * slippage, plan.clipped)
+            Fill(
+                i,
+                delta,
+                price,
+                spread_cost,
+                abs(delta) * slippage,
+                plan.clipped,
+                forced_flat=forced,
+            )
         )
         closed_lots.extend(_apply_fill(lots[i], i, delta, price))
 
@@ -323,7 +344,6 @@ def step(
 
     # Closeout: equity under the closeout fraction of used margin closes everything.
     closeout = used_margin > 0.0 and equity < config.closeout_fraction * used_margin
-    levels = [float(level) for level in targets]
     if closeout:
         for i, spec in enumerate(config.instruments):
             held = positions[i]
@@ -367,5 +387,6 @@ def step(
         clipped=clipped,
         shortfall=tuple(shortfall),
         closeout=closeout,
+        forced_flat=forced_flat,
     )
     return new_state, events
