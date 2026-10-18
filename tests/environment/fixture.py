@@ -1,8 +1,8 @@
 """The small checked-in fixture Dataset for the environment tests.
 
 A prepared Dataset (one Instrument, EURUSD, 5-minute Bars) plus its Scaler lives in
-``tests/environment/fixtures/prepared``. It has six Sessions, none crossing a
-17:00 New York rollover, so the engine can step every Bar:
+``tests/environment/fixtures/prepared``. It has nine Sessions; only the last crosses a
+17:00 New York rollover:
 
 - Sessions 1 to 3 hold ``SESSION_BARS`` Bars each (warm-up is ``WARM_UP`` Bars, so
   Bar ``WARM_UP`` is the first usable one);
@@ -16,7 +16,9 @@ A prepared Dataset (one Instrument, EURUSD, 5-minute Bars) plus its Scaler lives
   Bar at ``DISTRUSTED_SLOT``. The feature look-back keeps the Bars after each
   non-fillable one non-usable for a while, so there are several blind runs;
 - Session 8 (``TAIL_SESSION``) holds ``FINAL_SESSION_BARS`` Bars ending on the true
-  final Bar, the last ``TAIL_GAPS`` of them Gaps (an unfillable Session-final Bar).
+  final Bar, the last ``TAIL_GAPS`` of them Gaps (an unfillable Session-final Bar);
+- Session 9 (``ROLLOVER_SESSION``) holds ``ROLLOVER_BARS`` Bars, so it crosses the
+  Monday 17:00 New York rollover Bar at slot ``ROLLOVER_SLOT``.
 
 The feature spec is a small custom one (log returns over 1, 3 and 6 Bars) so the
 warm-up is short. Later tickets that need Gaps, rollover or a closeout extend
@@ -53,6 +55,7 @@ INSTRUMENT = "EURUSD"
 SESSION_OPENS = (
     *(datetime(2024, 1, day, 22, 0, tzinfo=UTC) for day in (7, 14, 21, 28)),
     *(datetime(2024, 2, day, 22, 0, tzinfo=UTC) for day in (4, 11, 18, 25)),
+    datetime(2024, 3, 3, 22, 0, tzinfo=UTC),
 )
 # Sessions 5 and 6 run to the weekly close (Friday 21:55 UTC is their Session-final
 # Bar); their earlier Bars are not in the fixture, so they are short.
@@ -64,6 +67,9 @@ OUTAGE_GAPS = range(30, 35)  # slots of the Gap rows in the outage Session
 DISTRUSTED_SLOT = 50  # a priced Bar carrying a distrusted quality flag
 TAIL_SESSION = 7
 TAIL_GAPS = 3  # trailing Gap rows, the last being the Session-final Bar
+ROLLOVER_SESSION = 8
+ROLLOVER_BARS = 300  # slot 288 is Monday 17:00 New York, a one-day rollover Bar
+ROLLOVER_SLOT = 288
 SESSION_BARS = 280  # fewer than 288, the first rollover Bar of a Session
 SHORT_SESSION_BARS = 5
 WARM_UP = 6
@@ -83,6 +89,8 @@ def fixture_bars() -> list[Bar]:
             count = SESSION_BARS if session != 3 else SHORT_SESSION_BARS
             if session == OUTAGE_SESSION:
                 count = OUTAGE_BARS
+            elif session == ROLLOVER_SESSION:
+                count = ROLLOVER_BARS
             first = opened
         for i in range(count):
             slot_time = first + timedelta(minutes=5 * i)
@@ -107,7 +115,7 @@ def fixture_bars() -> list[Bar]:
                     tick_count=20 + i % 7,
                     is_gap=False,
                     session_id=opened,
-                    is_rollover=False,
+                    is_rollover=session == ROLLOVER_SESSION and i == ROLLOVER_SLOT,
                     quality_flags=(
                         ("price_spike",)
                         if session == OUTAGE_SESSION and i == DISTRUSTED_SLOT

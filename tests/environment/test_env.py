@@ -157,7 +157,7 @@ def test_reward_is_scaled_log_equity_return(prepared) -> None:
     scale = 10_000.0
     env = build(prepared, reward=RewardConfig(reward_scale=scale))
 
-    rewards, _, _ = run(env, [2, 2, 0, 0, 1], seed=4)
+    rewards, _, _ = run(env, [2, 2, 0, 0, 1], seed=5)
     equity = [10_000.0, *env.ledger().steps["equity"].to_list()]
 
     expected = [

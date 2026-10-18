@@ -180,12 +180,12 @@ def test_a_sweep_runs_one_episode_per_session_in_order_and_chains(prepared) -> N
     assert isinstance(result, SweepResult)
     ledger = result.ledger
     verify_ledger(ledger)
-    assert result.sessions_run == [0, 1, 2, 4, 5, 6, 7]
+    assert result.sessions_run == [0, 1, 2, 4, 5, 6, 7, 8]
     assert result.skipped == [3]  # the Session with no usable Bar
     assert result.closeout is False
     episodes = ledger.episodes
-    assert episodes["session_id"].to_list() == [0, 1, 2, 4, 5, 6, 7]
-    assert episodes["chained"].to_list() == [False] + [True] * 6
+    assert episodes["session_id"].to_list() == [0, 1, 2, 4, 5, 6, 7, 8]
+    assert episodes["chained"].to_list() == [False] + [True] * 7
     ends, starts = episodes["end_equity"].to_list(), episodes["start_equity"].to_list()
     assert starts[1:] == ends[:-1]
     assert starts[0] == EngineConfig().starting_equity
@@ -197,6 +197,7 @@ def test_a_sweep_runs_one_episode_per_session_in_order_and_chains(prepared) -> N
         "session_end",
         "dataset_end",  # the outage Session stops short of the weekly close
         "session_end",  # the tail Session ends on an unfillable final Bar
+        "dataset_end",  # the rollover Session stops short of the weekly close
     ]
     # every Session-final episode ends flat
     final_rows = (
