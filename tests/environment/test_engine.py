@@ -146,12 +146,11 @@ def test_mismatched_instrument_count_raises() -> None:
 
 
 def test_unhandled_market_conditions_fail_loudly() -> None:
-    # fillable / session-final / rollover handling belongs to later tickets;
+    # fillable / session-final handling belongs to later tickets;
     # until then the engine must not silently ignore them.
     for market in (
         Market(1.1, 0.0001, 1.1, 0.0001, fillable=False),
         Market(1.1, 0.0001, 1.1, 0.0001, is_session_final=True),
-        Market(1.1, 0.0001, 1.1, 0.0001, rollover_days=1),
     ):
         with pytest.raises(NotImplementedError):
             step(initial_state(CONFIG), CONFIG, market, 1.0)
@@ -171,3 +170,83 @@ def test_two_instruments_share_one_pooled_equity() -> None:
     gbp_pnl = -76_923 * ((1.3010 + 0.0002) - (1.3000 - 1e-5))
     assert events.equity == pytest.approx(10_000 + eur + gbp_pnl, abs=1e-6)
     assert state.positions == events.positions
+
+
+ROLLOVER_CONFIG = EngineConfig(
+    instruments=(InstrumentSpec(rollover_long=0.0001, rollover_short=-0.00005),)
+)
+
+
+def rollover_market(days: int) -> Market:
+    return Market(
+        open_bid=1.1000,
+        open_spread=0.0001,
+        close_bid=1.1005,
+        close_spread=0.0001,
+        rollover_days=days,
+    )
+
+
+def test_rollover_day_0_charges_nothing() -> None:
+    _, events = step(
+        initial_state(ROLLOVER_CONFIG), ROLLOVER_CONFIG, rollover_market(0), 1.0
+    )
+    assert events.rollover_charge == 0.0
+    assert events.equity == pytest.approx(10_035.45451, abs=1e-6)
+
+
+def test_long_rollover_day_1_charges_rate_on_notional_at_the_close() -> None:
+    state, events = step(
+        initial_state(ROLLOVER_CONFIG), ROLLOVER_CONFIG, rollover_market(1), 1.0
+    )
+    # notional 90_909 * 1.1005 = 100_045.3545; charge = 0.0001 of it
+    assert events.rollover_charge == pytest.approx(10.00453545, abs=1e-8)
+    assert events.equity == pytest.approx(10_035.45451 - 10.00453545, abs=1e-6)
+    assert state.equity == events.equity
+    assert state.cash == pytest.approx(
+        10_000 - 90_909 * 1.10011 - 10.00453545, abs=1e-6
+    )
+
+
+def test_long_rollover_day_3_is_triple() -> None:
+    _, events = step(
+        initial_state(ROLLOVER_CONFIG), ROLLOVER_CONFIG, rollover_market(3), 1.0
+    )
+    assert events.rollover_charge == pytest.approx(30.01360635, abs=1e-8)
+    assert events.equity == pytest.approx(10_035.45451 - 30.01360635, abs=1e-6)
+
+
+def test_short_rollover_uses_the_short_rate_on_the_close_ask_notional() -> None:
+    # notional 90_909 * 1.1006 = 100_054.4454; rate -0.00005 is a credit
+    _, day1 = step(
+        initial_state(ROLLOVER_CONFIG), ROLLOVER_CONFIG, rollover_market(1), -1.0
+    )
+    assert day1.rollover_charge == pytest.approx(-5.00272227, abs=1e-8)
+    assert day1.equity == pytest.approx(9_944.54551 + 5.00272227, abs=1e-6)
+    _, day3 = step(
+        initial_state(ROLLOVER_CONFIG), ROLLOVER_CONFIG, rollover_market(3), -1.0
+    )
+    assert day3.rollover_charge == pytest.approx(-15.00816681, abs=1e-8)
+
+
+def test_a_positive_short_rate_is_a_charge() -> None:
+    config = EngineConfig(instruments=(InstrumentSpec(rollover_short=0.00005),))
+    _, events = step(initial_state(config), config, rollover_market(1), -1.0)
+    assert events.rollover_charge == pytest.approx(5.00272227, abs=1e-8)
+
+
+def test_flat_account_pays_no_rollover() -> None:
+    _, events = step(
+        initial_state(ROLLOVER_CONFIG), ROLLOVER_CONFIG, rollover_market(3), 0.0
+    )
+    assert events.rollover_charge == 0.0
+    assert events.equity == 10_000.0
+
+
+def test_a_position_closed_at_the_rollover_open_pays_nothing() -> None:
+    state, _ = step(
+        initial_state(ROLLOVER_CONFIG), ROLLOVER_CONFIG, rollover_market(0), 1.0
+    )
+    _, events = step(state, ROLLOVER_CONFIG, rollover_market(1), 0.0)
+    assert events.positions == (0,)
+    assert events.rollover_charge == 0.0

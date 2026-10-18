@@ -12,6 +12,7 @@ from hypothesis import strategies as st
 
 from shadow_trader.environment import (
     EngineConfig,
+    InstrumentSpec,
     Ledger,
     LedgerBuilder,
     LedgerError,
@@ -214,3 +215,20 @@ def test_all_flat_targets_give_no_fills_and_constant_equity(
     assert ledger.fills.height == 0
     assert set(ledger.steps["equity"].to_list()) == {CONFIG.starting_equity}
     verify_ledger(ledger)
+
+
+def test_equity_reconciliation_includes_rollover_and_catches_its_omission() -> None:
+    config = EngineConfig(instruments=(InstrumentSpec(rollover_long=0.0001),))
+    builder = LedgerBuilder(config)
+    state = initial_state(config)
+    for i, days in enumerate((0, 3, 0)):
+        mkt = Market(1.1, 0.0001, 1.1005, 0.0001, rollover_days=days)
+        state, events = step(state, config, mkt, 1.0)
+        builder.add_step(T0 + i * BAR, events)
+    ledger = builder.build()
+    assert ledger.steps["rollover_charge"].to_list()[1] > 0.0
+    verify_ledger(ledger)
+
+    zeroed = ledger.steps.with_columns(pl.lit(0.0).alias("rollover_charge"))
+    with pytest.raises(LedgerError, match="equity"):
+        verify_ledger(tampered(ledger, steps=zeroed))
