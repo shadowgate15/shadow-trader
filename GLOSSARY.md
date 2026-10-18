@@ -107,6 +107,10 @@ _Avoid_: Metrics, performance report
 One run of the trading environment from a reset to its end, always inside a single Session. It starts flat on a usable Bar and ends either by margin closeout (terminated) or by a time-based end: a fixed window length, the Session's end, or the end of the Dataset (truncated).
 _Avoid_: Game, rollout, run
 
+**Closeout**:
+The forced flattening of the whole position when margin cannot be held. The engine detects it at a Bar's close and flattens in the same step, at that same close, rather than at the next Bar's open (a recorded deviation from the Execution model's open-fill rule: there is no later Bar to wait for inside an Episode that ends on it). It is the only terminating Episode ending. A step's reward is floored numerically at a wiped-out account (equity at or below zero), a guard rather than shaping.
+_Avoid_: Liquidation, margin call
+
 **Decision Bar**:
 A usable Bar at whose close the agent is asked for an action. Every other Bar inside an Episode (a Gap, or a Bar made non-usable by a distrusted flag or a Gap in its lookback) is stepped through without consulting the agent, so one agent step can span several Bars.
 _Avoid_: Tick, turn

@@ -30,9 +30,10 @@ Gymnasium is imported here (and in nothing else of the package); the package
 
 from __future__ import annotations
 
-import logging
+from collections.abc import Iterable
 from dataclasses import replace
-from typing import Any
+from datetime import datetime
+from typing import Any, NamedTuple
 
 import gymnasium as gym
 import numpy as np
@@ -43,7 +44,9 @@ from shadow_trader.preparation.dataset import PreparedDataset
 from shadow_trader.preparation.scaler import Scaler
 
 from . import market_data
+from ._common import check_number
 from .config import ConfigError
+from .endings import CLOSEOUT, DATASET_END, SESSION_END, WINDOW_END
 from .engine import EngineState, initial_state, step
 from .env_config import EnvConfig
 from .ledger import Ledger, LedgerBuilder
@@ -54,13 +57,14 @@ from .reward import log_return_reward
 
 __all__ = ["TradingEnv", "make_env"]
 
-log = logging.getLogger(__name__)
-
-WINDOW_END = "window_end"
-SESSION_END = "session_end"
-DATASET_END = "dataset_end"
-CLOSEOUT = "closeout"
 _OPTION_KEYS = frozenset({"session", "start_bar", "equity", "chain"})
+
+
+class _Start(NamedTuple):
+    row: int
+    last_row: int
+    equity: float
+    chain: bool
 
 
 class TradingEnv(gym.Env):
@@ -75,13 +79,18 @@ class TradingEnv(gym.Env):
         *,
         seed: int | None = None,
         record_ledger: bool = False,
+        sessions: Iterable[int] | None = None,
     ) -> None:
         super().__init__()
         if len(config.engine.instruments) != 1:
             raise ConfigError("the env supports a single Instrument for now")
         self._data = data
         self._config = config
-        self._starts = market_data.eligible_starts(data, config.episode.window_bars)
+        #: Session ordinals this env may use (the split), or None for all.
+        self._sessions = None if sessions is None else frozenset(sessions)
+        self._starts = market_data.eligible_starts(
+            data, config.episode.window_bars, self._sessions
+        )
         if len(self._starts) == 0:
             raise ValueError(
                 f"no window of {config.episode.window_bars} usable Bars fits in a "
@@ -145,17 +154,16 @@ class TradingEnv(gym.Env):
     def sweep_sessions(self) -> list[int]:
         """Ordinals of the Sessions an evaluation sweep can run, chronologically.
 
-        A Session with no usable Bar is skipped and logged.
+        A Session with no usable Bar, or outside the split, is left out (the sweep
+        reports the former as skipped; the env emits no logging).
         """
         data = self._data
-        runnable = []
-        for k, opened in enumerate(data.session_open):
-            lo, hi = int(data.session_start[k]), int(data.session_end[k])
-            if data.usable[lo:hi].any():
-                runnable.append(k)
-            else:
-                log.warning("skipping Session %s: it has no usable Bars", opened)
-        return runnable
+        return [
+            k
+            for k in range(len(data.session_open))
+            if (self._sessions is None or k in self._sessions)
+            and data.usable[int(data.session_start[k]) : int(data.session_end[k])].any()
+        ]
 
     # -- Gymnasium API -------------------------------------------------------
 
@@ -214,7 +222,7 @@ class TradingEnv(gym.Env):
         data = self._data
         previous = self._state.equity
         level = self._levels[int(action)]
-        gap_bars = unfillable = blind = skipped = advanced = 0
+        gap_bars = unfillable = blind = longest_blind = advanced = fills = 0
         flags = {"clipped": False, "closeout": False, "forced_flat": False}
         unfilled_forced_flat = False
         events = None
@@ -227,7 +235,8 @@ class TradingEnv(gym.Env):
             advanced += 1
             decision = bool(data.usable[row])
             blind = 0 if decision else blind + 1  # the run so far, 0 on a decision
-            skipped += int(not decision)
+            longest_blind = max(longest_blind, blind)
+            fills += len(events.fills)
             gap_bars += int(data.is_gap[row])
             unfillable += int(not data.fillable[row])
             self._acc.add(events, is_decision=decision, blind_run=blind)
@@ -267,11 +276,11 @@ class TradingEnv(gym.Env):
                 self._builder.end_episode(ending)
         info = {
             "ending": ending,
-            "equity_delta": events.equity - previous,
             "bars_advanced": advanced,
             "gap_bars": gap_bars,
             "unfillable_bars": unfillable,
-            "blind_run": skipped,
+            "blind_run": longest_blind,
+            "fills": fills,
             "clipped": flags["clipped"],
             "closeout": flags["closeout"],
             "forced_flat": flags["forced_flat"],
@@ -296,8 +305,8 @@ class TradingEnv(gym.Env):
 
     # -- internals ---------------------------------------------------------------
 
-    def _explicit_start(self, options: dict[str, Any]) -> tuple[int, int, float, bool]:
-        """Validate ``reset`` options: (start row, last row, equity, chain)."""
+    def _explicit_start(self, options: dict[str, Any]) -> _Start:
+        """Validate ``reset`` options."""
         data = self._data
         unknown = sorted(set(options) - _OPTION_KEYS)
         if unknown:
@@ -311,6 +320,8 @@ class TradingEnv(gym.Env):
             or not 0 <= session < len(data.session_open)
         ):
             raise ValueError(f"session {session!r} is not a Session ordinal")
+        if self._sessions is not None and session not in self._sessions:
+            raise ValueError(f"Session {session} is outside this env's split")
         lo, hi = int(data.session_start[session]), int(data.session_end[session])
         usable = np.flatnonzero(data.usable[lo:hi])
         if len(usable) == 0:
@@ -322,15 +333,12 @@ class TradingEnv(gym.Env):
                 f"start_bar {offset} is not a usable Bar before the end of Session "
                 f"{session}"
             )
-        equity = options.get("equity", self._config.engine.starting_equity)
-        if (
-            isinstance(equity, bool)
-            or not isinstance(equity, int | float)
-            or not np.isfinite(equity)
-            or equity <= 0
-        ):
+        equity = check_number(
+            options.get("equity", self._config.engine.starting_equity), "equity"
+        )
+        if equity <= 0:
             raise ValueError(f"equity {equity!r} must be a positive number")
-        return start, hi - 1, float(equity), bool(options.get("chain", False))
+        return _Start(start, hi - 1, equity, bool(options.get("chain", False)))
 
     def _observation(self) -> dict[str, np.ndarray]:
         assert self._state is not None
@@ -362,22 +370,34 @@ def make_env(
     scaler: Scaler,
     config: EnvConfig,
     *,
-    seed: int | None = None,
+    seed: int,
     record_ledger: bool = False,
+    split_sessions: Iterable[datetime] | None = None,
 ) -> TradingEnv:
     """Build a ``TradingEnv`` from a prepared Dataset, its Scaler and a config.
 
     The Dataset is read and scaled once and converted to numpy. The Scaler must
     match the Dataset's feature spec (``ScalerError`` otherwise) and, when the
-    manifest names one, be that Scaler.
+    manifest names one, be that Scaler. ``split_sessions`` (Session opens) limits
+    training windows, explicit resets and sweeps to those Sessions.
     """
     data = market_data.from_prepared(
         dataset,
         scaler,
-        config.engine.instruments[0].symbol,
+        config.engine.instruments[0].name,
         config.observation.bar_minutes,
     )
-    env = TradingEnv(data, config, seed=seed, record_ledger=record_ledger)
+    ordinals = None
+    if split_sessions is not None:
+        split_sessions = list(split_sessions)
+        index = {opened: k for k, opened in enumerate(data.session_open)}
+        unknown = [opened for opened in split_sessions if opened not in index]
+        if unknown:
+            raise ValueError(f"Session(s) not in the Dataset: {unknown}")
+        ordinals = [index[opened] for opened in split_sessions]
+    env = TradingEnv(
+        data, config, seed=seed, record_ledger=record_ledger, sessions=ordinals
+    )
     env.provenance = {
         "dataset_id": dataset.dataset_id,
         "scaler_hash": scaler.scaler_id,

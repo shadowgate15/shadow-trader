@@ -62,6 +62,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .config import EngineConfig
+from .endings import CLOSEOUT, SESSION_END
 
 __all__ = [
     "AccountSnapshot",
@@ -273,7 +274,7 @@ def engine_state_from_snapshot(
     """
     n = len(config.instruments)
     if len(snapshot.positions) != n or (memo and len(memo.target_levels) != n):
-        raise ValueError(f"expected {n} position(s) for {config.symbols}")
+        raise ValueError(f"expected {n} position(s) for {config.names}")
     lots: list[tuple[Lot, ...]] = []
     for i, held in enumerate(snapshot.positions):
         if held == 0:
@@ -383,16 +384,16 @@ def plan_order(
     """
     if not -1.0 <= target <= 1.0:  # False for NaN as well
         raise ValueError(f"target {target} is outside [-1, 1]")
-    cap = config.effective_leverage_cap
+    cap = config.leverage_cap
     position = state.positions[instrument]
     override: str | None = None
     if market.is_session_final:
-        override = "session_end"
+        override = SESSION_END
     elif position != 0:
         markets = [market] * len(config.instruments)
         equity, used = _open_equity(state, config, markets)
         if used > 0.0 and equity < config.closeout_fraction * used:
-            override = "closeout"
+            override = CLOSEOUT
     if override is not None:
         level, units = 0.0, 0
     elif target != state.target_levels[instrument]:  # a level change freezes units
@@ -433,7 +434,7 @@ def step(
     targets = (target,) if isinstance(target, int | float) else tuple(target)
     n = len(config.instruments)
     if len(markets) != n or len(targets) != n or len(state.positions) != n:
-        raise ValueError(f"expected {n} market(s) and target(s) for {config.symbols}")
+        raise ValueError(f"expected {n} market(s) and target(s) for {config.names}")
     for level in targets:
         if not -1.0 <= level <= 1.0:  # False for NaN as well
             raise ValueError(f"target {level} is outside [-1, 1]")
@@ -511,9 +512,9 @@ def step(
             spread_cost = 0.0
         cash -= delta * price
         positions[i] += delta
-        forced = plan.override == "session_end"
+        forced = plan.override == SESSION_END
         forced_flat = forced_flat or forced
-        override_closeout = plan.override == "closeout"
+        override_closeout = plan.override == CLOSEOUT
         closed_at_open = closed_at_open or override_closeout
         fills.append(
             Fill(

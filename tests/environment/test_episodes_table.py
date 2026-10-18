@@ -18,6 +18,7 @@ from shadow_trader.environment import (
     step,
     verify_ledger,
 )
+from shadow_trader.environment.ledger import EPISODE_COUNTERS
 
 CONFIG = EngineConfig()
 T0 = datetime(2024, 1, 2, tzinfo=UTC)
@@ -83,6 +84,7 @@ def test_a_chained_sweep_verifies_and_records_one_row_per_episode() -> None:
         "ending",
         "bars",
         "chained",
+        *EPISODE_COUNTERS,
     ]
     assert episodes["bars"].to_list() == [2, 2]
     assert episodes["ending"].to_list() == ["session_end", "session_end"]

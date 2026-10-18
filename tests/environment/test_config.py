@@ -13,11 +13,11 @@ from shadow_trader.ingestion.config import ConfigError
 
 def test_defaults_are_valid_and_single_pair() -> None:
     config = EngineConfig()
-    assert [spec.symbol for spec in config.instruments] == ["EURUSD"]
+    assert [spec.name for spec in config.instruments] == ["EURUSD"]
     assert config.starting_equity == 10_000.0
     assert config.closeout_fraction == 0.5
     assert config.levels == (-1.0, 0.0, 1.0)
-    assert config.effective_leverage_cap <= config.instruments[0].regulatory_cap
+    assert config.leverage_cap <= config.instruments[0].regulatory_cap
 
 
 def test_effective_cap_above_regulatory_cap_is_rejected() -> None:
@@ -26,7 +26,7 @@ def test_effective_cap_above_regulatory_cap_is_rejected() -> None:
 
 
 def test_effective_cap_equal_to_regulatory_cap_is_accepted() -> None:
-    assert EngineConfig(leverage_cap=50.0).effective_leverage_cap == 50.0
+    assert EngineConfig(leverage_cap=50.0).leverage_cap == 50.0
 
 
 @pytest.mark.parametrize(
@@ -55,8 +55,8 @@ def test_invalid_account_settings_raise(kwargs: dict[str, Any]) -> None:
         {"slippage_pips": -0.1},
         {"regulatory_cap": 0.0},
         {"margin_rate": 0.01, "regulatory_cap": 50.0},  # 1/50 = 2% minimum
-        {"symbol": "USDJPY"},  # USD-base pairs are not supported yet
-        {"symbol": ""},
+        {"name": "USDJPY"},  # USD-base pairs are not supported yet
+        {"name": ""},
     ],
 )
 def test_invalid_instrument_spec_raises(kwargs: dict[str, Any]) -> None:
@@ -101,7 +101,7 @@ margin_rate = 0.02
     config = EngineConfig.from_toml(path)
     assert config.starting_equity == 25_000.0
     assert config.levels == (-1.0, -0.5, 0.0, 0.5, 1.0)
-    assert [spec.symbol for spec in config.instruments] == ["EURUSD", "GBPUSD"]
+    assert [spec.name for spec in config.instruments] == ["EURUSD", "GBPUSD"]
     assert config.instruments[0].slippage_pips == 0.2
     assert config.instruments[1].slippage_pips == InstrumentSpec().slippage_pips
     assert config.closeout_fraction == 0.5  # default kept

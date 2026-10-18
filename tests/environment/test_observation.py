@@ -16,7 +16,6 @@ import pytest
 
 from shadow_trader.environment import (
     EngineConfig,
-    Lot,
     Market,
     Observation,
     ObservationConfig,
@@ -25,6 +24,7 @@ from shadow_trader.environment import (
     step,
 )
 from shadow_trader.environment import observation as observation_module
+from shadow_trader.environment.engine import Lot
 
 CONFIG = EngineConfig()
 MARKET = Market(

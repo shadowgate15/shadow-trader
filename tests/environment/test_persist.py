@@ -183,7 +183,8 @@ def test_read_ledger_verifies_the_ledger(persisted) -> None:
 
 def test_training_episodes_write_no_ledger_by_default(prepared, tmp_path) -> None:
     dataset, scaler = prepared
-    env = make_env(dataset, scaler, EnvConfig(episode=EpisodeConfig(window_bars=20)))
+    config = EnvConfig(episode=EpisodeConfig(window_bars=20))
+    env = make_env(dataset, scaler, config, seed=0)
     env.reset()
     assert not env.records_ledger
     with pytest.raises(RuntimeError):

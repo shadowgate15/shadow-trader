@@ -96,7 +96,7 @@ def test_step_clip_equals_a_direct_clip_call_via_plan_order() -> None:
         state.target_units[0],
         state.equity,
         NEXT.open_bid,
-        CONFIG.effective_leverage_cap,
+        CONFIG.leverage_cap,
     )
     assert (plan.desired_delta, plan.allowed_delta) == (
         direct.desired_delta,

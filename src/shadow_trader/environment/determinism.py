@@ -150,8 +150,11 @@ class EnvFactory:
     dataset: PreparedDataset
     scaler: Scaler
     config: EnvConfig
-    seed: int | None = None
+    seed: int
     record_ledger: bool = False
+    #: The worker's index among ``make_env_fns``' factories (0 for a lone one);
+    #: name its Ledger directory with ``persist.write_worker_ledger``.
+    spawn_index: int = 0
 
     def __call__(self) -> TradingEnv:
         from .env import make_env
@@ -170,8 +173,9 @@ def make_env_fn(
     scaler: Scaler,
     config: EnvConfig,
     *,
-    seed: int | np.random.SeedSequence | None = None,
+    seed: int | np.random.SeedSequence,
     record_ledger: bool = False,
+    spawn_index: int = 0,
 ) -> EnvFactory:
     """A zero-argument callable that builds the env, for vector environments.
 
@@ -180,7 +184,7 @@ def make_env_fn(
     """
     if isinstance(seed, np.random.SeedSequence):
         seed = seed_int(seed)
-    return EnvFactory(dataset, scaler, config, seed, record_ledger)
+    return EnvFactory(dataset, scaler, config, seed, record_ledger, spawn_index)
 
 
 def make_env_fns(
@@ -204,6 +208,13 @@ def make_env_fns(
         else np.random.SeedSequence(seed)
     )
     return [
-        make_env_fn(dataset, scaler, config, seed=child, record_ledger=record_ledger)
-        for child in root.spawn(num_envs)
+        make_env_fn(
+            dataset,
+            scaler,
+            config,
+            seed=child,
+            record_ledger=record_ledger,
+            spawn_index=index,
+        )
+        for index, child in enumerate(root.spawn(num_envs))
     ]

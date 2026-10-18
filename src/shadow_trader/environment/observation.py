@@ -122,7 +122,7 @@ def build_observation(
             f"{window.shape} and {mask.shape}"
         )
     if len(markets) != n or len(engine_state.positions) != n:
-        raise ValueError(f"expected {n} market(s) for {config.symbols}")
+        raise ValueError(f"expected {n} market(s) for {config.names}")
 
     features, row_ok = window_inputs(window, observation_config)
     out_valid = mask & row_ok
@@ -133,13 +133,19 @@ def build_observation(
         bar = markets[i]
         units = engine_state.positions[i]
         mark = bar.close_bid + bar.close_spread if units < 0 else bar.close_bid
-        max_units = abs(
-            level_to_units(
-                1.0, engine_state.equity, mark, config.effective_leverage_cap
-            )
-        )
         clip = observation_config.position_clip
-        position[i, 0] = max(-clip, min(clip, units / max_units))
+        if engine_state.equity > 0:
+            max_units = abs(
+                level_to_units(1.0, engine_state.equity, mark, config.leverage_cap)
+            )
+        else:
+            max_units = 0  # a bust account has no room to hold anything
+        if units == 0:
+            position[i, 0] = 0.0
+        elif max_units == 0:
+            position[i, 0] = clip if units > 0 else -clip
+        else:
+            position[i, 0] = max(-clip, min(clip, units / max_units))
         position[i, 1] = engine_state.target_levels[i]
         entry = _average_entry(engine_state, i)
         if units != 0 and entry > 0:
@@ -149,7 +155,14 @@ def build_observation(
 
     nominal = slots_per_session(observation_config.bar_minutes) - 1
     progress = max(0.0, min(1.0, markets[0].bars_to_session_final / nominal))
-    account = np.array([used_margin / engine_state.equity, progress])
+    if used_margin == 0.0:
+        margin_ratio = 0.0
+    elif engine_state.equity > 0:
+        margin_ratio = used_margin / engine_state.equity
+    else:
+        margin_ratio = np.inf
+    margin_ratio = min(margin_ratio, observation_config.position_clip)
+    account = np.array([margin_ratio, progress])
 
     result = Observation(
         features=features,

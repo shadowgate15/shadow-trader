@@ -109,7 +109,7 @@ def test_builder_rejects_multi_instrument_configs_for_now() -> None:
     config = EngineConfig(
         instruments=(
             *CONFIG.instruments,
-            replace(CONFIG.instruments[0], symbol="GBPUSD"),
+            replace(CONFIG.instruments[0], name="GBPUSD"),
         )
     )
     with pytest.raises(NotImplementedError):

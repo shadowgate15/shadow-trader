@@ -5,40 +5,31 @@ is the only configuration the pure engine reads. Construction matches ingestion:
 frozen dataclasses, defaults in code, validation in ``__post_init__``, and a TOML
 file (``EngineConfig.from_toml``) that only overrides the code defaults.
 
-The TOML shape is top-level account keys plus one ``[instruments.<SYMBOL>]`` table
+The TOML shape is top-level account keys plus one ``[instruments.<NAME>]`` table
 per Instrument; omitted keys keep their code defaults and unknown keys are errors.
 """
 
 from __future__ import annotations
 
-import hashlib
-import math
 import tomllib
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 from shadow_trader.ingestion.config import ConfigError
-from shadow_trader.preparation._io import canonical_json
+
+from ._common import HashableConfig, check_number
 
 __all__ = ["ConfigError", "EngineConfig", "InstrumentSpec"]
 
 
-def _hash(value: Any) -> str:
-    return hashlib.sha256(canonical_json(value)).hexdigest()
-
-
 def _finite(value: float, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ConfigError(f"{name} must be a number")
-    if not math.isfinite(value):
-        raise ConfigError(f"{name} must be finite")
-    return float(value)
+    return check_number(value, name, ConfigError)
 
 
 @dataclass(frozen=True)
-class InstrumentSpec:
+class InstrumentSpec(HashableConfig):
     """Per-Instrument trading terms.
 
     ``rollover_long`` / ``rollover_short`` are fractions of notional charged per
@@ -46,7 +37,7 @@ class InstrumentSpec:
     v1 supports USD-quote pairs only, so P&L is already in the account currency.
     """
 
-    symbol: str = "EURUSD"
+    name: str = "EURUSD"
     pip_size: float = 0.0001
     margin_rate: float = 0.02
     rollover_long: float = 0.0
@@ -55,14 +46,14 @@ class InstrumentSpec:
     regulatory_cap: float = 50.0
 
     def __post_init__(self) -> None:
-        if not self.symbol:
-            raise ConfigError("instrument symbol must not be empty")
-        if not self.symbol.endswith("USD") or self.symbol.startswith("USD"):
+        if not self.name:
+            raise ConfigError("instrument name must not be empty")
+        if not self.name.endswith("USD") or self.name.startswith("USD"):
             raise ConfigError(
-                f"{self.symbol}: only USD-quote pairs are supported (USD-base and "
+                f"{self.name}: only USD-quote pairs are supported (USD-base and "
                 "cross pairs need conversion support)"
             )
-        for name in (
+        for field_name in (
             "pip_size",
             "margin_rate",
             "rollover_long",
@@ -70,18 +61,18 @@ class InstrumentSpec:
             "slippage_pips",
             "regulatory_cap",
         ):
-            _finite(getattr(self, name), f"{self.symbol}.{name}")
+            _finite(getattr(self, field_name), f"{self.name}.{field_name}")
         if self.pip_size <= 0:
-            raise ConfigError(f"{self.symbol}.pip_size must be positive")
+            raise ConfigError(f"{self.name}.pip_size must be positive")
         if not 0 < self.margin_rate <= 1:
-            raise ConfigError(f"{self.symbol}.margin_rate must be in (0, 1]")
+            raise ConfigError(f"{self.name}.margin_rate must be in (0, 1]")
         if self.slippage_pips < 0:
-            raise ConfigError(f"{self.symbol}.slippage_pips must not be negative")
+            raise ConfigError(f"{self.name}.slippage_pips must not be negative")
         if self.regulatory_cap <= 0:
-            raise ConfigError(f"{self.symbol}.regulatory_cap must be positive")
+            raise ConfigError(f"{self.name}.regulatory_cap must be positive")
         if self.margin_rate < 1.0 / self.regulatory_cap:
             raise ConfigError(
-                f"{self.symbol}.margin_rate {self.margin_rate} is below the "
+                f"{self.name}.margin_rate {self.margin_rate} is below the "
                 f"regulatory minimum 1/{self.regulatory_cap}"
             )
 
@@ -90,12 +81,9 @@ class InstrumentSpec:
         """Constant adverse slippage as a price amount."""
         return self.slippage_pips * self.pip_size
 
-    def config_hash(self) -> str:
-        return _hash(asdict(self))
-
 
 @dataclass(frozen=True)
-class EngineConfig:
+class EngineConfig(HashableConfig):
     """Account-level settings plus the Instrument table (order is significant).
 
     ``leverage_cap`` is the effective cap used for sizing; it may be lower than
@@ -113,9 +101,9 @@ class EngineConfig:
     def __post_init__(self) -> None:
         if not self.instruments:
             raise ConfigError("at least one instrument is required")
-        symbols = [spec.symbol for spec in self.instruments]
-        if len(set(symbols)) != len(symbols):
-            raise ConfigError(f"duplicate instruments: {symbols}")
+        names = [spec.name for spec in self.instruments]
+        if len(set(names)) != len(names):
+            raise ConfigError(f"duplicate instruments: {names}")
         if _finite(self.starting_equity, "starting_equity") <= 0:
             raise ConfigError("starting_equity must be positive")
         if not 0 < _finite(self.closeout_fraction, "closeout_fraction") <= 1:
@@ -126,7 +114,7 @@ class EngineConfig:
             if self.leverage_cap > spec.regulatory_cap:
                 raise ConfigError(
                     f"effective leverage cap {self.leverage_cap} exceeds the "
-                    f"regulatory cap {spec.regulatory_cap} for {spec.symbol}"
+                    f"regulatory cap {spec.regulatory_cap} for {spec.name}"
                 )
         if not self.levels:
             raise ConfigError("levels must not be empty")
@@ -137,19 +125,9 @@ class EngineConfig:
             raise ConfigError("levels must be distinct")
 
     @property
-    def effective_leverage_cap(self) -> float:
-        return self.leverage_cap
-
-    @property
-    def symbols(self) -> tuple[str, ...]:
-        return tuple(spec.symbol for spec in self.instruments)
-
-    def canonical_json(self) -> bytes:
-        """Key-sorted compact JSON of the full config (hash input, manifest)."""
-        return canonical_json(asdict(self))
-
-    def config_hash(self) -> str:
-        return hashlib.sha256(self.canonical_json()).hexdigest()
+    def names(self) -> tuple[str, ...]:
+        """The Instruments' names, in table order."""
+        return tuple(spec.name for spec in self.instruments)
 
     @classmethod
     def from_toml(cls, path: Path) -> EngineConfig:
@@ -183,16 +161,16 @@ class EngineConfig:
 
 def _instruments(value: Any) -> tuple[InstrumentSpec, ...]:
     if not isinstance(value, dict):
-        raise ConfigError("[instruments] must be a table of [instruments.SYMBOL]")
-    allowed = {f.name for f in fields(InstrumentSpec)} - {"symbol"}
+        raise ConfigError("[instruments] must be a table of [instruments.NAME]")
+    allowed = {f.name for f in fields(InstrumentSpec)} - {"name"}
     specs = []
-    for symbol, table in value.items():
+    for name, table in value.items():
         if not isinstance(table, dict):
-            raise ConfigError(f"[instruments.{symbol}] must be a table")
+            raise ConfigError(f"[instruments.{name}] must be a table")
         unknown = sorted(set(table) - allowed)
         if unknown:
             raise ConfigError(
-                f"unknown key(s) in [instruments.{symbol}]: {', '.join(unknown)}"
+                f"unknown key(s) in [instruments.{name}]: {', '.join(unknown)}"
             )
-        specs.append(InstrumentSpec(symbol=symbol, **table))
+        specs.append(InstrumentSpec(name=name, **table))
     return tuple(specs)

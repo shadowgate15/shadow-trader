@@ -29,20 +29,29 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 import polars as pl
 
 from .config import EngineConfig
+from .endings import CLOSEOUT, HALT, SESSION_END, STOPPED
 from .engine import StepEvents
 
 __all__ = [
     "CLOSED_LOTS_SCHEMA",
+    "CLOSEOUT",
     "EPISODES_SCHEMA",
+    "EPISODE_COUNTERS",
     "FILLS_SCHEMA",
+    "HALT",
+    "SESSION_END",
     "STEPS_SCHEMA",
+    "STOPPED",
     "Ledger",
     "LedgerBuilder",
     "LedgerError",
+    "episode_counters",
+    "read_ledger",  # noqa: F822 (loaded lazily from persist)
     "verify_ledger",
 ]
 
@@ -89,11 +98,18 @@ EPISODES_SCHEMA: dict[str, pl.DataType] = {
     "ending": pl.String(),  # null while the episode is still open
     "bars": pl.Int64(),
     "chained": pl.Boolean(),  # start equity carried in from the previous episode
+    # per-episode counters, always recomputable from steps, fills and closed_lots
+    "decisions": pl.Int64(),  # Bars that were Decision Bars
+    "fills": pl.Int64(),
+    "clips": pl.Int64(),  # steps whose order the margin limit cut back
+    "closeouts": pl.Int64(),
+    "forced_flats": pl.Int64(),  # Session-end force-flat fills
+    "synthetic_liquidations": pl.Int64(),  # forced flats on an unfillable Bar
+    "gap_spans": pl.Int64(),  # maximal runs of carried-mark Bars
+    "closed_lots": pl.Int64(),
+    "longest_blind_run": pl.Int64(),
 }
-SESSION_END = "session_end"
-CLOSEOUT = "closeout"
-HALT = "halt"  # live only: the operator or watchdog halted the run
-STOPPED = "stopped"  # live only: the run was stopped
+EPISODE_COUNTERS = tuple(list(EPISODES_SCHEMA)[8:])
 
 CLOSED_LOTS_SCHEMA: dict[str, pl.DataType] = {
     "step": pl.Int64(),
@@ -106,6 +122,15 @@ CLOSED_LOTS_SCHEMA: dict[str, pl.DataType] = {
 }
 
 RECONCILIATION_RTOL = 1e-9
+
+
+def __getattr__(name: str) -> Any:
+    """``read_ledger`` is public here but lives in ``persist`` (loaded on demand)."""
+    if name == "read_ledger":
+        from .persist import read_ledger
+
+        return read_ledger
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class LedgerError(Exception):
@@ -140,7 +165,7 @@ class LedgerBuilder:
         if len(config.instruments) != 1:
             raise NotImplementedError("ledger supports a single Instrument for now")
         self._config = config
-        self._symbol = config.instruments[0].symbol
+        self._name = config.instruments[0].name
         self._steps: list[tuple[object, ...]] = []
         self._fills: list[tuple[object, ...]] = []
         self._closed: list[tuple[object, ...]] = []
@@ -209,7 +234,7 @@ class LedgerBuilder:
                 (
                     index,
                     open_time,
-                    self._symbol,
+                    self._name,
                     fill.units,
                     fill.price,
                     fill.spread_cost,
@@ -227,7 +252,7 @@ class LedgerBuilder:
                 (
                     index,
                     open_time,
-                    self._symbol,
+                    self._name,
                     lot.units,
                     lot.open_price,
                     lot.close_price,
@@ -235,8 +260,12 @@ class LedgerBuilder:
                 )
             )
 
-    def _episodes_frame(self) -> pl.DataFrame:
-        """Episode rows with end equity and Bar count taken from their steps."""
+    def _episodes_frame(
+        self, steps: pl.DataFrame, fills: pl.DataFrame, closed: pl.DataFrame
+    ) -> pl.DataFrame:
+        """Episode rows with end equity, Bar count and counters from the tables."""
+        counters = episode_counters(steps, fills, closed)
+        none = dict.fromkeys(EPISODE_COUNTERS, 0)
         rows = []
         for episode in self._episodes:
             mine = [s for s in self._steps if s[2] == episode["episode_id"]]
@@ -245,21 +274,72 @@ class LedgerBuilder:
                     **episode,
                     "end_equity": mine[-1][4] if mine else episode["start_equity"],
                     "bars": len(mine),
+                    **counters.get(episode["episode_id"], none),
                 }
             )
         return pl.DataFrame(rows, schema=EPISODES_SCHEMA)
 
     def build(self) -> Ledger:
+        steps = pl.DataFrame(self._steps, schema=STEPS_SCHEMA, orient="row")
+        fills = pl.DataFrame(self._fills, schema=FILLS_SCHEMA, orient="row")
+        closed = pl.DataFrame(self._closed, schema=CLOSED_LOTS_SCHEMA, orient="row")
         return Ledger(
-            steps=pl.DataFrame(self._steps, schema=STEPS_SCHEMA, orient="row"),
-            fills=pl.DataFrame(self._fills, schema=FILLS_SCHEMA, orient="row"),
+            steps=steps,
+            fills=fills,
             starting_equity=self._config.starting_equity,
-            closed_lots=pl.DataFrame(
-                self._closed, schema=CLOSED_LOTS_SCHEMA, orient="row"
-            ),
-            leverage_cap=self._config.effective_leverage_cap,
-            episodes=self._episodes_frame(),
+            closed_lots=closed,
+            leverage_cap=self._config.leverage_cap,
+            episodes=self._episodes_frame(steps, fills, closed),
         )
+
+
+def episode_counters(
+    steps: pl.DataFrame, fills: pl.DataFrame, closed: pl.DataFrame
+) -> dict[int, dict[str, int]]:
+    """Each episode's counters (``EPISODE_COUNTERS``), recomputed from the tables.
+
+    Episodes with no steps are absent. ``gap_spans`` counts maximal runs of
+    consecutive carried-mark Bars within an episode.
+    """
+    if steps.height == 0:
+        return {}
+    owner = steps.select("step", "episode_id")
+    flagged = steps.with_columns(
+        gap_start=pl.col("carried_mark")
+        & ~pl.col("carried_mark").shift(1).over("episode_id").fill_null(False)
+    )
+    per_step = flagged.group_by("episode_id").agg(
+        decisions=pl.col("is_decision").sum(),
+        clips=pl.col("clipped").sum(),
+        closeouts=pl.col("closeout").sum(),
+        gap_spans=pl.col("gap_start").sum(),
+        longest_blind_run=pl.col("blind_run").max(),
+    )
+    per_fill = (
+        fills.join(owner, on="step", how="left")
+        .group_by("episode_id")
+        .agg(
+            fills=pl.len(),
+            forced_flats=pl.col("forced_flat").sum(),
+            synthetic_liquidations=pl.col("unfilled_forced_flat").sum(),
+        )
+    )
+    per_lot = (
+        closed.join(owner, on="step", how="left")
+        .group_by("episode_id")
+        .agg(closed_lots=pl.len())
+    )
+    found: dict[int, dict[str, int]] = {}
+    for frame in (per_step, per_fill, per_lot):
+        for row in frame.iter_rows(named=True):
+            episode = row.pop("episode_id")
+            found.setdefault(episode, {}).update(
+                {name: int(value) for name, value in row.items()}
+            )
+    return {
+        episode: {name: counts.get(name, 0) for name in EPISODE_COUNTERS}
+        for episode, counts in found.items()
+    }
 
 
 def verify_ledger(ledger: Ledger) -> None:
@@ -423,6 +503,8 @@ def _check_episodes(ledger: Ledger) -> list[str]:
         return []
     steps = ledger.steps
     problems: list[str] = []
+    expected = episode_counters(steps, ledger.fills, ledger.closed_lots)
+    no_counters = dict.fromkeys(EPISODE_COUNTERS, 0)
     ids = table["episode_id"].to_list()
     if len(set(ids)) != len(ids):
         return ["episodes has duplicate episode ids"]
@@ -446,6 +528,11 @@ def _check_episodes(ledger: Ledger) -> list[str]:
                 f"{label} end equity {row['end_equity']!r} is not its last "
                 f"steps row {last!r}"
             )
+        for name, want in expected.get(row["episode_id"], no_counters).items():
+            if row[name] != want:
+                problems.append(
+                    f"{label} records {name} {row[name]} but its rows give {want}"
+                )
         if row["ending"] == SESSION_END and mine.height and mine["position_units"][-1]:
             problems.append(f"{label} ends at Session end but is not flat")
         if row["ending"] == CLOSEOUT and not (mine.height and mine["closeout"][-1]):
