@@ -94,3 +94,7 @@ _Avoid_: Normalizer, preprocessor
 **Tail**:
 The most recent run of live Bars, long enough to cover the longest lookback plus Warm-up, from which live features for the latest Bar are computed with the same definitions as a batch build. A short Tail yields null features, not errors.
 _Avoid_: Window, buffer
+
+**Episode**:
+One run of the trading environment from a reset to its end, always inside a single Session. It starts flat on a usable Bar and ends either by margin closeout (terminated) or by a time-based end: a fixed window length, the Session's end, or the end of the Dataset (truncated).
+_Avoid_: Game, rollout, run
