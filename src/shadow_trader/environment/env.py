@@ -3,7 +3,8 @@
 The env adds actions, episodes, reward and ``info`` on top of the pure engine,
 observation assembler and ledger. This is the skeleton: one agent step is exactly
 one Bar, and a training episode is a random window of ``EpisodeConfig.window_bars``
-Bars inside one Session whose Bars are all usable. Closeout, Session-end
+Bars inside one Session whose Bars are all usable. A margin closeout ends the
+episode as ``terminated``; window end is ``truncated``. Session-end
 force-flat, Gap stepping and evaluation sweeps arrive with later tickets.
 
 Gymnasium is imported here (and in nothing else of the package); the package
@@ -34,6 +35,7 @@ from .reward import log_return_reward
 __all__ = ["TradingEnv", "make_env"]
 
 WINDOW_END = "window_end"
+CLOSEOUT = "closeout"
 
 
 class TradingEnv(gym.Env):
@@ -82,6 +84,7 @@ class TradingEnv(gym.Env):
         self._row = 0
         self._end = 0
         self._episode = -1
+        self._done = True
         self._builder: LedgerBuilder | None = None
 
     # -- Gymnasium API -------------------------------------------------------
@@ -98,6 +101,7 @@ class TradingEnv(gym.Env):
         self._row = start
         self._end = start + self._config.episode.window_bars
         self._state = initial_state(self._config.engine)
+        self._done = False
         self._episode += 1
         self._builder = LedgerBuilder(self._config.engine) if self._record else None
         session = int(data.session_index[start])
@@ -112,7 +116,7 @@ class TradingEnv(gym.Env):
     def step(
         self, action: Any
     ) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
-        if self._state is None or self._row >= self._end:
+        if self._state is None or self._done:
             raise RuntimeError("call reset() before step(): the episode is over")
         data = self._data
         previous = self._state.equity
@@ -131,14 +135,19 @@ class TradingEnv(gym.Env):
                 episode_id=self._episode,
                 session_id=int(data.session_index[row]),
             )
-        truncated = row >= self._end
+        terminated = events.closeout
+        truncated = row >= self._end and not terminated
+        self._done = terminated or truncated
+        ending = CLOSEOUT if terminated else WINDOW_END if truncated else None
         info = {
-            "ending": WINDOW_END if truncated else None,
+            "ending": ending,
             "equity_delta": events.equity - previous,
             "bars_advanced": 1,
+            "clipped": events.clipped,
+            "closeout": events.closeout,
         }
         reward = log_return_reward(previous, events.equity, self._config.reward)
-        return self._observation(), reward, False, truncated, info
+        return self._observation(), reward, terminated, truncated, info
 
     # -- Ledger ----------------------------------------------------------------
 

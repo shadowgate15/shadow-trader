@@ -48,6 +48,8 @@ def run(script: list[tuple[Market, float]], config: EngineConfig = CONFIG):
         state, events = step(state, config, market, target)
         builder.add_step(T0 + timedelta(minutes=5 * i), events)
         all_events.append(events)
+        if events.closeout:  # a closeout ends the episode
+            break
     return state, all_events, builder.build()
 
 
