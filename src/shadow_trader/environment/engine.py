@@ -58,6 +58,7 @@ class Market:
     fillable: bool = True
     is_session_final: bool = False
     rollover_days: int = 0
+    bars_to_session_final: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +82,7 @@ class EngineState:
     positions: tuple[int, ...]
     target_levels: tuple[float, ...]
     target_units: tuple[int, ...]
+    entry_prices: tuple[float, ...] = ()  # average fill price of the open position
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +106,7 @@ def initial_state(config: EngineConfig) -> EngineState:
         positions=(0,) * n,
         target_levels=(0.0,) * n,
         target_units=(0,) * n,
+        entry_prices=(0.0,) * n,
     )
 
 
@@ -114,6 +117,17 @@ def level_to_units(level: float, equity: float, price: float, cap: float) -> int
         return 0
     units = max(1, math.floor(abs(level) * equity * cap / price))
     return units if level > 0 else -units
+
+
+def _entry_price(position: int, entry: float, delta: int, price: float) -> float:
+    """Average entry price after a fill: weighted when adding, unchanged when
+    reducing, the fill price when flipping through zero, 0 when flat."""
+    new = position + delta
+    if new == 0:
+        return 0.0
+    if position == 0 or (position > 0) == (delta > 0):
+        return (entry * abs(position) + price * abs(delta)) / abs(new)
+    return entry if (new > 0) == (position > 0) else price
 
 
 def step(
@@ -141,6 +155,7 @@ def step(
     cash = state.cash
     positions = list(state.positions)
     target_units = list(state.target_units)
+    entry_prices = list(state.entry_prices or (0.0,) * n)
     fills: list[Fill] = []
     for i, spec in enumerate(config.instruments):
         bar = markets[i]
@@ -159,6 +174,7 @@ def step(
             price = bar.open_bid - slippage
             spread_cost = 0.0
         cash -= delta * price
+        entry_prices[i] = _entry_price(positions[i], entry_prices[i], delta, price)
         positions[i] += delta
         fills.append(Fill(i, delta, price, spread_cost, abs(delta) * slippage))
 
@@ -178,6 +194,7 @@ def step(
         positions=tuple(positions),
         target_levels=tuple(float(level) for level in targets),
         target_units=tuple(target_units),
+        entry_prices=tuple(entry_prices),
     )
     events = StepEvents(
         fills=tuple(fills),
