@@ -13,23 +13,21 @@ N = 24
 
 
 def test_metrics_net_return_in_pips_and_percent_of_notional():
-    m = evaluation.compute_metrics([np.array([1e-4, -3e-4]), np.array([5e-4])], 1.25)
+    m = evaluation.compute_metrics([np.array([1.0, -3.0]), np.array([5.0])], 1.25)
     assert m.net_pips == pytest.approx(3.0)
-    assert m.net_pct == pytest.approx(3e-4 / 1.25 * 100)
+    assert m.net_pct == pytest.approx(3 * PIP / 1.25 * 100)
     assert m.bars == 3
     assert m.segments == 2
 
 
 def test_sharpe_is_per_bar_with_ddof_one_and_ignores_segment_seams():
-    a, b = np.array([1.0, 2.0]) * PIP, np.array([3.0, 6.0]) * PIP
+    a, b = np.array([1.0, 2.0]), np.array([3.0, 6.0])
     m = evaluation.compute_metrics([a, b], 1.0)
     pips = np.array([1.0, 2.0, 3.0, 6.0])
     assert m.sharpe == pytest.approx(pips.mean() / pips.std(ddof=1))
 
 
-@pytest.mark.parametrize(
-    "rewards", [[np.zeros(5)], [np.full(5, 0.3e-4)], [np.zeros(1)]]
-)
+@pytest.mark.parametrize("rewards", [[np.zeros(5)], [np.full(5, 0.3)], [np.zeros(1)]])
 def test_zero_variance_sharpe_is_zero_not_nan(rewards):
     assert evaluation.compute_metrics(rewards, 1.0).sharpe == 0.0
 
@@ -46,15 +44,21 @@ def test_no_segments_gives_zeroed_metrics():
 
 
 def test_drawdown_runs_from_a_zero_peak():
-    losing = evaluation.compute_metrics([np.array([-2.0, -1.0]) * PIP], 1.0)
+    losing = evaluation.compute_metrics([np.array([-2.0, -1.0])], 1.0)
     assert losing.max_drawdown_pips == pytest.approx(3.0)
+    assert losing.max_drawdown_pct == pytest.approx(3 * PIP / 1.0 * 100)
+
+
+def test_notional_is_the_first_scored_bar_mid_close_of_the_first_scored_segment():
+    env = env_for([(0, 10), (50, 150), (160, 260)])  # first Segment is skipped
+    s = evaluation.buy_and_hold(env)
+    notional = env.mid[50 + N, 3]
+    assert s.metrics.net_pct == pytest.approx(s.metrics.net_pips * PIP / notional * 100)
 
 
 def test_equity_is_continuous_across_segments_for_drawdown():
     # +5 then segment two starts where one ended: peak 5, trough 5-4-3 = -2
-    m = evaluation.compute_metrics(
-        [np.array([5.0]) * PIP, np.array([-4.0, -3.0, 1.0]) * PIP], 1.0
-    )
+    m = evaluation.compute_metrics([np.array([5.0]), np.array([-4.0, -3.0, 1.0])], 1.0)
     assert m.max_drawdown_pips == pytest.approx(7.0)
 
 
@@ -84,7 +88,7 @@ def test_flat_policy_earns_nothing_and_never_changes_position():
 def test_long_policy_is_flattened_at_each_segment_end_and_pays_spread_both_ways():
     env = env_for([(0, 100), (120, 220)])
     s = evaluation.score(env, always(2))
-    p = env.prices[:, 3]
+    p = env.mid[:, 3]
     gross = (p[99] - p[N]) + (p[219] - p[120 + N])
     assert s.metrics.net_pips == pytest.approx(gross / PIP - 4 * 0.5)
     assert s.position_changes == (2, 2)
@@ -117,10 +121,14 @@ def test_cli_evaluate_prints_the_metrics_for_the_test_period(
     cli.main(["evaluate"])
     out = capsys.readouterr().out
     for label in (
-        "pips",
-        "% of notional",
+        "net (pips)",
+        "% notional",
         "sharpe",
-        "max drawdown",
+        "max DD (pips)",
+        "max DD (%)",
+        "Agent",
+        "loading",
+        "random Baseline: draw",
         "bars:",
         "segments:",
     ):
@@ -153,7 +161,7 @@ def test_turnover_plan_for_zero_changes_stays_flat():
 def test_buy_and_hold_is_long_from_each_segment_start_and_flat_at_the_end():
     env = env_for([(0, 100), (120, 220)])
     s = evaluation.buy_and_hold(env)
-    p = env.prices[:, 3]
+    p = env.mid[:, 3]
     gross = (p[99] - p[N]) + (p[219] - p[120 + N])
     assert s.position_changes == (2, 2)  # enter once, flatten once, per Segment
     assert s.metrics.net_pips == pytest.approx(gross / PIP - 4 * 0.5)

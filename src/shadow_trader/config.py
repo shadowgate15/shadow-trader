@@ -27,8 +27,9 @@ SPLIT = (0.70, 0.15, 0.15)
 
 SPREAD_PIPS = 1.0
 
+BAR_INTERVAL = timedelta(minutes=5)
 GAP_THRESHOLD = timedelta(hours=4)
-GAP_THRESHOLD_BARS = 48  # 4 hours of M5 Bars
+GAP_THRESHOLD_BARS = GAP_THRESHOLD // BAR_INTERVAL  # 48 M5 Bars
 
 WINDOW_SIZE = 24  # N
 EPISODE_LENGTH = 288  # Bars

@@ -41,9 +41,9 @@ def weights(model: PPO) -> list[torch.Tensor]:
 
 def test_load_market_gives_mid_prices_and_structure(stored_bars):
     market = training.load_market()
-    assert market.prices.shape == (COUNT, 4)
+    assert market.mid.shape == (COUNT, 4)
     assert market.structure.bar_count == COUNT
-    np.testing.assert_allclose(market.prices[:, 3], stored_bars)
+    np.testing.assert_allclose(market.mid[:, 3], stored_bars)
 
 
 def test_same_config_and_seed_gives_the_same_model(stored_bars):

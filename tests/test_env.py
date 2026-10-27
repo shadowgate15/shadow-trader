@@ -83,16 +83,16 @@ def test_reward_is_pnl_on_position_held_minus_half_spread_per_unit():
     env = TradingEnv(prices, [(0, 400)])
     env.reset(options={"segment": 0})
     t = N
-    half = 1.0 * 1e-4 / 2
+    half = 1.0 / 2  # pips
     # Go long at t: held into t+1, pays half a spread to open.
     _, r, *_ = env.step(2)
-    assert r == pytest.approx((prices[t + 1, 3] - prices[t, 3]) - half)
+    assert r == pytest.approx((prices[t + 1, 3] - prices[t, 3]) / 1e-4 - half)
     # Hold: no cost.
     _, r, *_ = env.step(2)
-    assert r == pytest.approx(prices[t + 2, 3] - prices[t + 1, 3])
+    assert r == pytest.approx((prices[t + 2, 3] - prices[t + 1, 3]) / 1e-4)
     # Reverse long -> short: pays a full spread.
     _, r, *_ = env.step(0)
-    assert r == pytest.approx(-(prices[t + 3, 3] - prices[t + 2, 3]) - 2 * half)
+    assert r == pytest.approx(-(prices[t + 3, 3] - prices[t + 2, 3]) / 1e-4 - 2 * half)
     # Flat: closing costs half, earns nothing.
     _, r, *_ = env.step(1)
     assert r == pytest.approx(-half)
@@ -106,7 +106,7 @@ def test_spread_pips_is_configurable():
     env = TradingEnv(prices, [(0, 400)], spread_pips=2.0)
     env.reset(options={"segment": 0})
     _, r, *_ = env.step(2)
-    assert r == pytest.approx(prices[N + 1, 3] - prices[N, 3] - 1e-4)
+    assert r == pytest.approx((prices[N + 1, 3] - prices[N, 3]) / 1e-4 - 1.0)
 
 
 def test_episode_is_288_steps_and_truncates():

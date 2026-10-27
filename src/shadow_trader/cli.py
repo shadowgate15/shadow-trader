@@ -1,14 +1,26 @@
 """Command-line entry point. Subcommands take no flags: config lives in `config`."""
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from shadow_trader import bars, evaluation, fetch, training
 
 SUBCOMMANDS = {
     "fetch-data": "Fetch and prepare the EUR/USD M5 history.",
-    "train": "Train the PPO agent.",
-    "evaluate": "Evaluate the trained agent against the baselines.",
+    "train": "Train the PPO Agent.",
+    "evaluate": "Evaluate the trained Agent against the baselines.",
+}
+
+
+def _fetch_data() -> None:
+    result = fetch.run()
+    bars.ingest(result.weeks, bars.bars_path())
+
+
+HANDLERS: dict[str, Callable[[], None]] = {
+    "fetch-data": _fetch_data,
+    "train": training.run,
+    "evaluate": evaluation.run,
 }
 
 
@@ -22,14 +34,4 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    if args.command == "fetch-data":
-        result = fetch.run()
-        bars.ingest(result.weeks, bars.bars_path())
-        return
-    if args.command == "train":
-        training.run()
-        return
-    if args.command == "evaluate":
-        evaluation.run()
-        return
-    print(f"shadow-trader {args.command}: not yet implemented")
+    HANDLERS[args.command]()
