@@ -3,6 +3,8 @@
 import argparse
 from collections.abc import Sequence
 
+from shadow_trader import fetch
+
 SUBCOMMANDS = {
     "fetch-data": "Fetch and prepare the EUR/USD M5 history.",
     "train": "Train the PPO agent.",
@@ -20,4 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.command == "fetch-data":
+        fetch.run()
+        return
     print(f"shadow-trader {args.command}: not yet implemented")
