@@ -5,6 +5,11 @@ The 1e4 observation scaling is a stated constant elsewhere, not a key here.
 """
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+# Root for everything written to disk: raw/ (vendor files verbatim), later
+# derived datasets, models and metrics.
+DATA_DIR = Path("data")
 
 HISTORY_START = datetime(2016, 1, 4, tzinfo=UTC)
 HISTORY_END = datetime(2024, 8, 23, tzinfo=UTC)
