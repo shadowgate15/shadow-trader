@@ -9,7 +9,7 @@ Every item below is a **scope boundary**, settled deliberately. None is a bug to
 1. **Marked to Mid, no fill simulation.** The Agent trades at Mid; there is no order book, latency or partial fill.
 2. **A fixed notional Spread cost, not the observed Spread.** The Spread in History is indicative and frequently zero, so it is not treated as a cost. Spread cost is a constant set deliberately wider than the Spread seen in History.
 3. **One pair.** EUR/USD only.
-4. **One source.** The FXCM free candle repository, never spliced with another vendor. The vendor's own crossed and zero-Spread rows are kept unaltered; no cross-side check or clamping is applied.
+4. **One source.** The FXCM free repository of weekly m1 files, never spliced with another vendor. The vendor's own crossed and zero-Spread rows are kept unaltered; no cross-side check or clamping is applied.
 5. **A single pinned date range.** History is pinned to 2016-01-04 to 2024-08-23 UTC, so the Split is stable and results are comparable to each other.
 6. **One fixed Position size.** Short, flat or long, always one unit. No sizing and no leverage.
 7. **No clock or calendar feature of any kind.** The Observation is Mid movement over a Window plus the current Position. Nothing else.
