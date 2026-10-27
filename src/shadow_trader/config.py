@@ -14,6 +14,14 @@ DATA_DIR = Path("data")
 HISTORY_START = datetime(2016, 1, 4, tzinfo=UTC)
 HISTORY_END = datetime(2024, 8, 23, tzinfo=UTC)
 
+# Weeks inside History the vendor does not publish: (first, last) moment the
+# week would cover. FXCM serves a header-only placeholder for 2023 file 27, so
+# the week of 2023-07-02 to 07-07 is a Gap, not a failure. Any other missing
+# week still aborts ingest. This is not patched from a second vendor.
+KNOWN_MISSING_WEEKS = (
+    (datetime(2023, 7, 2, 22, tzinfo=UTC), datetime(2023, 7, 7, 21, 59, tzinfo=UTC)),
+)
+
 # Chronological train / validation / test fractions.
 SPLIT = (0.70, 0.15, 0.15)
 

@@ -162,8 +162,20 @@ def fetch_history(
         key=lambda w: w.first,
     )
     check_complete(weeks, start, end)
-    progress(f"history: {len(weeks)} weekly files, no week missing")
+    progress(
+        f"history: {len(weeks)} weekly files, no week missing beyond known vendor gaps"
+    )
     return FetchResult(weeks)
+
+
+def is_known_missing_week(before_last: datetime, after_first: datetime) -> bool:
+    """True if the break is exactly one configured vendor-unpublished week."""
+    return any(
+        before_last < opens
+        and after_first > closes
+        and after_first - before_last <= MAX_BREAK_BETWEEN_WEEKS + timedelta(days=7)
+        for opens, closes in config.KNOWN_MISSING_WEEKS
+    )
 
 
 def check_complete(weeks: list[Week], start: datetime, end: datetime) -> None:
@@ -177,6 +189,7 @@ def check_complete(weeks: list[Week], start: datetime, end: datetime) -> None:
         f"{before.last:%Y-%m-%d %H:%M} to {after.first:%Y-%m-%d %H:%M}"
         for before, after in pairwise(weeks)
         if after.first - before.last > MAX_BREAK_BETWEEN_WEEKS
+        and not is_known_missing_week(before.last, after.first)
     ]
     if breaks:
         raise HistoryError("week missing between " + "; ".join(breaks))

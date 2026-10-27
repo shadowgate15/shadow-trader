@@ -150,3 +150,25 @@ def test_vendor_placeholder_for_an_unpublished_week_counts_as_missing(tmp_path):
     files[(2016, 2)] = gzip.compress((HEADER + "\n\n").encode())
     with pytest.raises(fetch.HistoryError, match="missing"):
         run_fetch(FakeSource(files), tmp_path)
+
+
+def test_known_vendor_unpublished_week_is_a_gap_not_a_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "KNOWN_MISSING_WEEKS",
+        ((sunday(2016, 1, 10), sunday(2016, 1, 10) + timedelta(days=4, hours=23)),),
+    )
+    result = run_fetch(FakeSource(weeks({1: 1, 3: 3})), tmp_path)
+    assert len(result.weeks) == 2
+
+
+def test_a_different_missing_week_still_aborts_despite_a_known_exception(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        config,
+        "KNOWN_MISSING_WEEKS",
+        ((sunday(2016, 1, 3), sunday(2016, 1, 3) + timedelta(days=4, hours=23)),),
+    )
+    with pytest.raises(fetch.HistoryError, match="missing"):
+        run_fetch(FakeSource(weeks({1: 1, 3: 3})), tmp_path)
