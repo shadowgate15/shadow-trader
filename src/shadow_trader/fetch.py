@@ -195,8 +195,8 @@ def check_complete(weeks: list[Week], start: datetime, end: datetime) -> None:
         raise HistoryError("week missing between " + "; ".join(breaks))
 
 
-def run() -> None:
-    fetch_history(
+def run() -> FetchResult:
+    return fetch_history(
         default_source(),
         config.DATA_DIR / "raw",
         start=config.HISTORY_START,

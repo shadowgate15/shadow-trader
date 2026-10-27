@@ -3,7 +3,7 @@
 import argparse
 from collections.abc import Sequence
 
-from shadow_trader import fetch
+from shadow_trader import bars, fetch
 
 SUBCOMMANDS = {
     "fetch-data": "Fetch and prepare the EUR/USD M5 history.",
@@ -23,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "fetch-data":
-        fetch.run()
+        result = fetch.run()
+        bars.ingest(result.weeks, bars.bars_path())
         return
     print(f"shadow-trader {args.command}: not yet implemented")

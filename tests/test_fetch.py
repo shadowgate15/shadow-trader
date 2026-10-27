@@ -2,6 +2,7 @@ import gzip
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pyarrow.parquet as pq
 import pytest
 
 from shadow_trader import cli, config, fetch
@@ -15,7 +16,8 @@ def week_bytes(opens: datetime) -> bytes:
     """A gzipped vendor file from Sunday's open to Friday's last minute."""
     rows = [HEADER]
     close = opens + timedelta(days=4, hours=23, minutes=59)
-    for moment in (opens, opens + timedelta(minutes=1), close):
+    minutes_open = int((close - opens).total_seconds() // 60) + 1
+    for moment in (opens + timedelta(minutes=i) for i in range(minutes_open)):
         ts = moment.strftime("%m/%d/%Y %H:%M:%S.000")
         rows.append(f"{ts},1.1,1.1,1.1,1.1,1.1,1.1,1.1,1.1")
     return gzip.compress(("\n".join(rows) + "\n").encode())
@@ -143,6 +145,23 @@ def test_cli_fetch_data_runs_the_fetch_and_prints_progress(
     cli.main(["fetch-data"])
     assert "2016/1" in capsys.readouterr().out
     assert (tmp_path / "raw" / "m1" / "EURUSD" / "2016" / "1.csv.gz").exists()
+
+
+def test_cli_fetch_data_then_writes_bars_parquet_and_prints_the_summary(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "HISTORY_START", START)
+    monkeypatch.setattr(config, "HISTORY_END", END)
+    monkeypatch.setattr(
+        fetch, "default_source", lambda: FakeSource(weeks({1: 1, 2: 2, 3: 3}))
+    )
+    cli.main(["fetch-data"])
+    out = capsys.readouterr().out
+    assert out.index("2016/1") < out.index("aggregating") < out.index("bars: ")
+    table = pq.read_table(tmp_path / "bars" / "EURUSD_M5.parquet")
+    times = table["time"].to_pylist()
+    assert times and min(times) >= START and max(times) < END  # clipped to range
 
 
 def test_vendor_placeholder_for_an_unpublished_week_counts_as_missing(tmp_path):
