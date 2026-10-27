@@ -53,7 +53,7 @@ One fixed-length contiguous stretch of Bars the Agent trades through during trai
 _Avoid_: Run, session
 
 **Split**:
-The chronological division of History into train, validation, and test periods. The test period is evaluated once.
+The chronological division of History into train, validation, and test periods. The test period is evaluated once per configuration, and never used to choose one.
 _Avoid_: Fold, partition
 
 **Baseline**:
