@@ -1,2 +1,3 @@
-def main() -> None:
-    print("Hello from shadow-trader!")
+from shadow_trader.cli import main
+
+__all__ = ["main"]
