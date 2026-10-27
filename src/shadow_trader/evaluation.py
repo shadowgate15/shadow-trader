@@ -13,7 +13,13 @@ one Position change. A Segment is entered flat, so no Position crosses a Gap.
 Segments with fewer than ``window_size + 2`` Bars are skipped entirely: 25 Bars
 give one Observation but no Reward, so there is nothing to score.
 
-Equity is one continuous additive-pip curve across Segments (Segment two starts
+Notional. Percentages are of one unit at the first evaluated Mid: the Mid close
+of the first scored Bar (index ``first + window_size``, where the first Action
+falls) of the first scored Segment. Buy-and-hold's % thus reads close to the
+pair's price change over the test Period.
+
+Rewards come from the environment already in pips. Equity is one continuous
+ additive-pip curve across Segments (Segment two starts
 where one ended). Sharpe is computed over the per-Bar Rewards of each Segment
 joined together; each Segment's Rewards are its own, so no cross-Gap return is
 ever in the series.
@@ -54,20 +60,9 @@ class Metrics:
     net_pct: float  # percentage of notional
     sharpe: float  # per-Bar, un-annualised, ddof=1; 0.0 on zero variance
     max_drawdown_pips: float  # from a zero starting peak
+    max_drawdown_pct: float  # percentage of notional
     bars: int  # rewarded Bars
     segments: int
-
-    def render(self) -> str:
-        return "\n".join(
-            [
-                f"net return: {self.net_pips:.2f} pips",
-                f"net return: {self.net_pct:.4f} % of notional",
-                f"sharpe (per-Bar, un-annualised): {self.sharpe:.4f}",
-                f"max drawdown: {self.max_drawdown_pips:.2f} pips",
-                f"bars: {self.bars}",
-                f"segments: {self.segments}",
-            ]
-        )
 
 
 @dataclass(frozen=True)
@@ -77,28 +72,28 @@ class Score:
 
 
 def compute_metrics(rewards: Sequence[np.ndarray], notional: float) -> Metrics:
-    """Metrics from per-Segment Rewards in price units, one array per Segment.
+    """Metrics from per-Segment Rewards in pips, one array per Segment.
 
-    ``notional`` is the price level net return is expressed against.
+    ``notional`` is the Mid level net return and drawdown are expressed against.
     """
-    if not rewards:
-        return Metrics(0.0, 0.0, 0.0, 0.0, 0, 0)
-    pips = np.concatenate([np.asarray(r, dtype=np.float64) for r in rewards]) / PIP
+    pips = np.concatenate([np.asarray(r, dtype=np.float64) for r in rewards] or [[]])
     if len(pips) == 0:
-        return Metrics(0.0, 0.0, 0.0, 0.0, 0, len(rewards))
+        return Metrics(0.0, 0.0, 0.0, 0.0, 0.0, 0, len(rewards))
     equity = np.cumsum(pips)
     peak = np.maximum(np.maximum.accumulate(equity), 0.0)
     drawdown = float(np.max(peak - equity))
     net = float(equity[-1])
     sd = float(np.std(pips, ddof=1)) if len(pips) > 1 else 0.0
     sharpe = float(pips.mean()) / sd if sd > 1e-12 else 0.0
-    pct = net * PIP / notional * 100
-    return Metrics(net, pct, sharpe, drawdown, len(pips), len(rewards))
+    to_pct = PIP / notional * 100
+    return Metrics(
+        net, net * to_pct, sharpe, drawdown, drawdown * to_pct, len(pips), len(rewards)
+    )
 
 
 def score(env: TradingEnv, policy: Policy) -> Score:
     """Roll ``policy`` through each scoreable Segment of ``env`` and measure it."""
-    rewards, changes, closes = [], [], []
+    rewards, changes, notional = [], [], None
     for i, (first, stop) in enumerate(env.segments):
         if stop - first < env.window_size + 2:
             continue
@@ -109,13 +104,13 @@ def score(env: TradingEnv, policy: Policy) -> Score:
             obs, reward, _, truncated, _ = env.step(action)
             rs.append(reward)
             held.append(POSITIONS[action])
-        rs[-1] -= env.spread / 2 * abs(held[-1])  # the final flatten
+        rs[-1] -= env.spread_pips / 2 * abs(held[-1])  # the final flatten
         held.append(0.0)
         rewards.append(np.array(rs))
         changes.append(int(np.count_nonzero(np.diff(held))))
-        closes.append(env.prices[first + env.window_size : stop, 3])
-    notional = float(np.concatenate(closes).mean()) if closes else 1.0
-    return Score(compute_metrics(rewards, notional), tuple(changes))
+        if notional is None:
+            notional = float(env.mid[first + env.window_size, 3])
+    return Score(compute_metrics(rewards, notional or 1.0), tuple(changes))
 
 
 def _scored_lengths(env: TradingEnv) -> list[int]:
@@ -163,10 +158,12 @@ def random_baseline(
     agent_changes: Sequence[int],
     draws: int = config.N_BASELINE_DRAWS,
     seed: int = config.SEED,
+    progress: Callable[[int, int], None] | None = None,
 ) -> list[Score]:
     """Score ``draws`` seeded random policies matching ``agent_changes`` per Segment.
 
     ``agent_changes`` is the Agent's :attr:`Score.position_changes` on ``env``.
+    ``progress(done, total)`` is called after each draw.
     """
     lengths = _scored_lengths(env)
     scores = []
@@ -180,6 +177,8 @@ def random_baseline(
         )
         actions = iter(plan)
         scores.append(score(env, lambda obs, a=actions: int(next(a))))
+        if progress:
+            progress(d + 1, draws)
     return scores
 
 
@@ -222,57 +221,85 @@ def verdict(
     return Verdict(not reasons, tuple(reasons))
 
 
+def _mean_metrics(scores: Sequence[Score]) -> Metrics:
+    ms = [s.metrics for s in scores]
+
+    def mean(field: str) -> float:
+        return float(np.mean([getattr(m, field) for m in ms]))
+
+    return Metrics(
+        mean("net_pips"),
+        mean("net_pct"),
+        mean("sharpe"),
+        mean("max_drawdown_pips"),
+        mean("max_drawdown_pct"),
+        ms[0].bars,
+        ms[0].segments,
+    )
+
+
+def _say(text: str = "") -> None:
+    print(text, flush=True)
+
+
 def run() -> None:
+    _say("loading Bars and the trained Agent")
     market = training.load_market()
-    model = PPO.load(training.model_path(), device="cpu")
+    model = PPO.load(training.model_path(), device=config.DEVICE)
 
     def policy(obs: np.ndarray) -> int:
         action, _ = model.predict(obs, deterministic=True)
         return int(action)
 
     env = market.make_env(market.structure.split.test)
+    _say("scoring the Agent on the test Period")
     agent = score(env, policy)
+    _say("scoring buy-and-hold")
     hold = buy_and_hold(env)
-    draws = random_baseline(env, agent.position_changes)
 
-    rand_net = float(np.mean([d.metrics.net_pips for d in draws]))
-    rand_pct = float(np.mean([d.metrics.net_pct for d in draws]))
-    rand_sharpe = float(np.mean([d.metrics.sharpe for d in draws]))
-    beat_net = float(
-        np.mean([agent.metrics.net_pips > d.metrics.net_pips for d in draws])
-    )
-    beat_sharpe = float(
-        np.mean([agent.metrics.sharpe > d.metrics.sharpe for d in draws])
-    )
+    def progress(done: int, total: int) -> None:
+        if done % 5 == 0 or done == total:
+            _say(f"scoring random Baseline: draw {done}/{total}")
+
+    draws = random_baseline(env, agent.position_changes, progress=progress)
+    rand = _mean_metrics(draws)
+    am, hm = agent.metrics, hold.metrics
+    beat_net = float(np.mean([am.net_pips > d.metrics.net_pips for d in draws]))
+    beat_sharpe = float(np.mean([am.sharpe > d.metrics.sharpe for d in draws]))
     changes = sum(agent.position_changes)
 
-    print(agent.metrics.render())
-    print(f"position changes: {changes}")
-    print()
-    print(f"{'':14}{'net (pips)':>12}{'net (%)':>10}{'sharpe':>10}")
-    am, hm = agent.metrics, hold.metrics
-    rows = (
-        ("agent", am.net_pips, am.net_pct, am.sharpe),
-        ("buy-and-hold", hm.net_pips, hm.net_pct, hm.sharpe),
-        ("random (mean)", rand_net, rand_pct, rand_sharpe),
-    )
-    for name, pips, pct, sharpe in rows:
-        print(f"{name:14}{pips:12.2f}{pct:10.4f}{sharpe:10.4f}")
-    print()
-    print(
+    _say()
+    _say(f"bars: {am.bars}")
+    _say(f"segments: {am.segments}")
+    _say(f"Agent position changes: {changes}")
+    _say()
+    header = ("net (pips)", "net (% notional)", "sharpe", "max DD (pips)", "max DD (%)")
+    _say(f"{'':14}" + "".join(f"{h:>18}" for h in header))
+    for name, m in (("Agent", am), ("buy-and-hold", hm), ("random (mean)", rand)):
+        cells = (
+            m.net_pips,
+            m.net_pct,
+            m.sharpe,
+            m.max_drawdown_pips,
+            m.max_drawdown_pct,
+        )
+        _say(f"{name:14}" + "".join(f"{c:18.4f}" for c in cells))
+    _say("sharpe is per-Bar, un-annualised; max drawdown is from a zero starting peak")
+    _say()
+    _say(
         f"random Baseline: {len(draws)} seeded draws, turnover matched per Segment; "
         f"Agent beats {beat_net:.0%} of draws on net return, "
         f"{beat_sharpe:.0%} on Sharpe"
     )
-    print()
-    print(
+    _say()
+    _say(
         verdict(
             agent_net=am.net_pips,
             agent_sharpe=am.sharpe,
             hold_net=hm.net_pips,
             hold_sharpe=hm.sharpe,
-            random_net=rand_net,
-            random_sharpe=rand_sharpe,
+            random_net=rand.net_pips,
+            random_sharpe=rand.sharpe,
             agent_changes=changes,
         ).render()
     )

@@ -1,6 +1,6 @@
 """Fit the PPO policy on the train Period and save it.
 
-:func:`load_market` is the one shared "stored Bars -> Mid prices + Structure"
+:func:`load_market` is the one shared "stored Bars -> Mid OHLC + Structure"
 step; ``evaluate`` calls it too and builds its environment with
 :meth:`Market.make_env`, so both commands see identical data and settings.
 """
@@ -20,13 +20,13 @@ from shadow_trader.env import TradingEnv
 
 @dataclass(frozen=True)
 class Market:
-    prices: np.ndarray  # (n, 4) Mid open/high/low/close, indexed by global Bar
+    mid: np.ndarray  # (n, 4) Mid open/high/low/close, indexed by global Bar
     structure: segments.Structure
 
     def make_env(self, period: segments.Period) -> TradingEnv:
         """The environment for one Period, with the configured settings."""
         return TradingEnv(
-            self.prices,
+            self.mid,
             self.structure.segments_within(period),
             window_size=config.WINDOW_SIZE,
             episode_length=config.EPISODE_LENGTH,
@@ -36,8 +36,8 @@ class Market:
 
 def load_market() -> Market:
     mid = bars.mid(pq.read_table(bars.bars_path()))
-    prices = np.column_stack([mid[f"mid_{f}"] for f in bars.FIELDS])
-    return Market(prices, segments.load())
+    mid_ohlc = np.column_stack([mid[f"mid_{f}"] for f in bars.FIELDS])
+    return Market(mid_ohlc, segments.load())
 
 
 def model_path() -> Path:
@@ -66,4 +66,4 @@ def run() -> None:
     path = model_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     model.save(path)
-    print(f"saved model to {path}")
+    print(f"saved Agent to {path}")

@@ -3,7 +3,8 @@
 Timing. At Bar ``t`` the Agent sees the Observation built from Bars up to and
 including ``t`` and picks a target Position. That Position is held into Bar
 ``t+1``: the Reward is ``position * (Mid[t+1] - Mid[t])`` minus the Spread cost
-of the change just made, so an Action cannot earn the move that prompted it.
+of the change just made, both in pips (unscaled, commensurate with the
+Spread cost), so an Action cannot earn the move that prompted it.
 Everything is marked to Mid; no fill is simulated at bid or ask.
 
 Warm-up. N log-return vectors need N+1 Bars, so the first Action of a Segment
@@ -17,9 +18,8 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-WINDOW_SIZE = 24
-EPISODE_LENGTH = 288
-SPREAD_PIPS = 1.0
+from shadow_trader import config
+
 RETURN_SCALE = 1e4  # brings log returns onto a network-friendly scale; no clipping
 PIP = 1e-4
 POSITIONS = (-1.0, 0.0, 1.0)  # Action 0 = short, 1 = flat, 2 = long
@@ -28,7 +28,7 @@ POSITIONS = (-1.0, 0.0, 1.0)  # Action 0 = short, 1 = flat, 2 = long
 class TradingEnv(gym.Env):
     """Trade one fixed-size Position over Mid OHLC Bars.
 
-    ``prices`` is an ``(n, 4)`` array of Mid open, high, low, close, indexed by
+    ``mid`` is an ``(n, 4)`` array of Mid open, high, low, close, indexed by
     Bar. ``segments`` are half-open ``[first, stop)`` Bar-index ranges for one
     Period, as ``(first, stop)`` pairs or objects with ``.first``/``.stop``
     (``segments.Segment``). Segments should come from ``segments_within`` so
@@ -44,19 +44,19 @@ class TradingEnv(gym.Env):
 
     def __init__(
         self,
-        prices: np.ndarray,
+        mid: np.ndarray,
         segments: Sequence[Any],
         *,
-        window_size: int = WINDOW_SIZE,
-        episode_length: int = EPISODE_LENGTH,
-        spread_pips: float = SPREAD_PIPS,
+        window_size: int = config.WINDOW_SIZE,
+        episode_length: int = config.EPISODE_LENGTH,
+        spread_pips: float = config.SPREAD_PIPS,
     ) -> None:
         super().__init__()
-        self.prices = np.asarray(prices, dtype=np.float64)
+        self.mid = np.asarray(mid, dtype=np.float64)
         self.segments = [_range(s) for s in segments]
         self.window_size = window_size
         self.episode_length = episode_length
-        self.spread = spread_pips * PIP
+        self.spread_pips = spread_pips
         n = window_size
         self.observation_space = spaces.Box(-np.inf, np.inf, (3 * n + 1,), np.float32)
         self.action_space = spaces.Discrete(3)
@@ -64,9 +64,9 @@ class TradingEnv(gym.Env):
         # High, Low, Close as log returns against the PREVIOUS Bar's Mid Close.
         # One shared base, so the vector reads as where this Bar went relative
         # to where the last one closed. Row 0 has no previous Bar; never used.
-        base = self.prices[:-1, 3:4]
-        returns = np.zeros((len(self.prices), 3))
-        returns[1:] = RETURN_SCALE * np.log(self.prices[1:, 1:4] / base)
+        base = self.mid[:-1, 3:4]
+        returns = np.zeros((len(self.mid), 3))
+        returns[1:] = RETURN_SCALE * np.log(self.mid[1:, 1:4] / base)
         self._returns = returns
 
         self._bar = 0
@@ -116,9 +116,10 @@ class TradingEnv(gym.Env):
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         target = POSITIONS[int(action)]
-        cost = self.spread / 2 * abs(target - self._position)
+        cost = self.spread_pips / 2 * abs(target - self._position)
         t = self._bar
-        reward = target * (self.prices[t + 1, 3] - self.prices[t, 3]) - cost
+        move = (self.mid[t + 1, 3] - self.mid[t, 3]) / PIP
+        reward = target * move - cost
         self._position = target
         self._bar = t + 1
         truncated = self._bar >= self._last

@@ -36,7 +36,7 @@ import pyarrow.parquet as pq
 from shadow_trader import config
 from shadow_trader.fetch import TIMESTAMP_FORMAT, Week
 
-BAR_INTERVAL = timedelta(minutes=5)
+BAR_INTERVAL = config.BAR_INTERVAL
 # Longest closure tolerated anywhere. A plain weekend is ~48-49h, but the
 # vendor's Christmas / New Year closures in the pinned range run to 79h (and the
 # early closes around them leave a few 4h-36h Gaps), so the ceiling is set just
