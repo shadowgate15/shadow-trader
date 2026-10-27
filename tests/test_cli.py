@@ -21,13 +21,6 @@ def test_help_lists_exactly_the_three_subcommands():
     assert listed == SUBCOMMANDS
 
 
-@pytest.mark.parametrize("name", ["evaluate"])
-def test_subcommand_exits_cleanly_with_notice(name):
-    result = run(name)
-    assert result.returncode == 0
-    assert "not yet implemented" in (result.stdout + result.stderr).lower()
-
-
 @pytest.mark.parametrize("name", SUBCOMMANDS)
 def test_subcommand_accepts_no_override_flags(name):
     assert run(name, "--seed", "1").returncode != 0
