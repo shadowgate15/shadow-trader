@@ -1,11 +1,13 @@
+from typing import Any
+
 import numpy as np
 import pytest
 from stable_baselines3 import PPO
 from test_env import make_prices
 from test_training import TINY_PPO, stored_bars  # noqa: F401
 
-from shadow_trader import cli, evaluation, training
-from shadow_trader.env import PIP, TradingEnv
+from shadow_trader import cli, config, evaluation, training
+from shadow_trader.env import PIP, POSITIONS, TradingEnv
 
 N = 24
 
@@ -123,3 +125,117 @@ def test_cli_evaluate_prints_the_metrics_for_the_test_period(
         "segments:",
     ):
         assert label in out
+
+
+# --- Baselines and verdict (#150) ---------------------------------------------
+
+
+def held_changes(plan):
+    return int(np.count_nonzero(np.diff([0.0, *(POSITIONS[a] for a in plan), 0.0])))
+
+
+@pytest.mark.parametrize("changes", [0, 2, 3, 4, 7, 20])
+def test_turnover_plan_reproduces_the_position_change_count_with_final_flatten(
+    changes,
+):
+    for seed in range(25):
+        rng = np.random.default_rng(seed)
+        plan = evaluation.turnover_matched_plan(rng, 60, changes)
+        assert len(plan) == 60
+        assert held_changes(plan) == changes
+
+
+def test_turnover_plan_for_zero_changes_stays_flat():
+    plan = evaluation.turnover_matched_plan(np.random.default_rng(0), 30, 0)
+    assert set(plan) == {1}
+
+
+def test_buy_and_hold_is_long_from_each_segment_start_and_flat_at_the_end():
+    env = env_for([(0, 100), (120, 220)])
+    s = evaluation.buy_and_hold(env)
+    p = env.prices[:, 3]
+    gross = (p[99] - p[N]) + (p[219] - p[120 + N])
+    assert s.position_changes == (2, 2)  # enter once, flatten once, per Segment
+    assert s.metrics.net_pips == pytest.approx(gross / PIP - 4 * 0.5)
+
+
+def test_random_baseline_matches_the_agent_turnover_per_segment_not_pooled():
+    env = env_for([(0, 100), (120, 220), (240, 340)], count=400)
+    agent = (0, 6, 2)
+    draws = evaluation.random_baseline(env, agent)
+    assert len(draws) == config.N_BASELINE_DRAWS == 20
+    assert all(d.position_changes == agent for d in draws)
+
+
+def test_random_baseline_is_reproducible_and_draws_differ():
+    env = env_for([(0, 200)])
+    a = evaluation.random_baseline(env, (8,))
+    b = evaluation.random_baseline(env, (8,))
+    assert [d.metrics for d in a] == [d.metrics for d in b]
+    assert len({d.metrics.net_pips for d in a}) > 1
+
+
+def test_random_baseline_skips_short_segments_like_score_does():
+    env = env_for([(0, 10), (50, 150)])
+    draws = evaluation.random_baseline(env, (4,))
+    assert all(d.position_changes == (4,) for d in draws)
+
+
+GOOD: dict[str, Any] = {
+    "agent_net": 10.0,
+    "agent_sharpe": 0.2,
+    "hold_net": -5.0,
+    "hold_sharpe": -0.1,
+    "random_net": -8.0,
+    "random_sharpe": -0.2,
+    "agent_changes": 12,
+}
+
+
+def test_verdict_passes_when_strictly_greater_everywhere_and_trading():
+    v = evaluation.verdict(**GOOD)
+    assert v.passed
+    assert v.reasons == ()
+
+
+@pytest.mark.parametrize(
+    "field", ["hold_net", "hold_sharpe", "random_net", "random_sharpe"]
+)
+def test_verdict_fails_on_a_tie_with_any_single_bar(field):
+    args = {**GOOD, field: GOOD["agent_net" if "net" in field else "agent_sharpe"]}
+    v = evaluation.verdict(**args)
+    assert not v.passed
+    assert len(v.reasons) == 1
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("hold_net", 11.0), ("hold_sharpe", 0.5), ("random_net", 99.0)],
+)
+def test_verdict_fails_when_a_baseline_is_ahead(field, value):
+    assert not evaluation.verdict(**{**GOOD, field: value}).passed
+
+
+def test_permanently_flat_agent_fails_even_when_it_outscores_both_baselines():
+    flat = {**GOOD, "agent_net": 0.0, "agent_sharpe": 0.0, "agent_changes": 0}
+    v = evaluation.verdict(**flat)
+    assert not v.passed
+    assert any("Position change" in r for r in v.reasons)
+
+
+def test_cli_evaluate_prints_baselines_and_an_explicit_verdict(
+    stored_bars,  # noqa: F811
+    capsys,
+):
+    market = training.load_market()
+    model = training.fit(market, total_timesteps=64, ppo=TINY_PPO)
+    path = training.model_path()
+    path.parent.mkdir(parents=True)
+    model.save(path)
+    capsys.readouterr()
+    cli.main(["evaluate"])
+    out = capsys.readouterr().out
+    assert "buy-and-hold" in out
+    assert "random" in out
+    assert "draws" in out
+    assert "VERDICT: PASS" in out or "VERDICT: FAIL" in out
