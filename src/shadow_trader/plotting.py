@@ -19,8 +19,8 @@ def plot_learning_curve(checkpoints: Sequence[Any], path: Path) -> None:
         xs = [c.timestep for c in checkpoints]
         ys = [c.metrics.net_pips for c in checkpoints]
         ax.plot(xs, ys, color="tab:blue", linewidth=1.2, zorder=1)
-        eligible = [c for c in checkpoints if c.position_changes > 0]
-        ineligible = [c for c in checkpoints if c.position_changes == 0]
+        eligible = [c for c in checkpoints if c.eligible]
+        ineligible = [c for c in checkpoints if not c.eligible]
         ax.scatter(
             [c.timestep for c in eligible],
             [c.metrics.net_pips for c in eligible],
