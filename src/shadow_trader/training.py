@@ -8,7 +8,7 @@ step; ``evaluate`` calls it too and builds its environment with
 import csv
 import math
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +47,10 @@ def model_path() -> Path:
     return config.DATA_DIR / "model" / "ppo_eurusd.zip"
 
 
+def best_model_path() -> Path:
+    return config.DATA_DIR / "model" / "ppo_eurusd_best.zip"
+
+
 def learning_curve_path() -> Path:
     return config.DATA_DIR / "model" / "learning_curve.csv"
 
@@ -74,9 +78,17 @@ class _CheckpointCallback(BaseCallback):
     training's RNG stream, and hence the weights, are untouched.
     """
 
-    def __init__(self, env: TradingEnv, every: int, total_rollouts: int) -> None:
+    def __init__(
+        self,
+        env: TradingEnv,
+        every: int,
+        total_rollouts: int,
+        best_path: Path | None = None,
+    ) -> None:
         super().__init__()
         self._env = env
+        self._best_path = best_path
+        self.best_index: int | None = None
         self._every = every
         self._rollouts = 0
         self._last = total_rollouts  # scored after its update, at training end
@@ -107,9 +119,21 @@ class _CheckpointCallback(BaseCallback):
         m = result.metrics
         changes = sum(result.position_changes)
         self.checkpoints.append(Checkpoint(timestep, m, changes))
+        # Never-trading Checkpoints are ineligible; strictly greater replaces,
+        # so ties keep the earliest.
+        is_best = changes > 0 and (
+            self.best_index is None
+            or m.net_pips > self.checkpoints[self.best_index].metrics.net_pips
+        )
+        if is_best:
+            self.best_index = len(self.checkpoints) - 1
+            if self._best_path is not None:
+                self._best_path.parent.mkdir(parents=True, exist_ok=True)
+                self.model.save(self._best_path)
         _say(
             f"checkpoint {len(self.checkpoints)}/{self._total} @ {timestep:,}: "
             f"net {m.net_pips:.1f} pips, sharpe {m.sharpe:.4f}, changes {changes:,}"
+            + (" *" if is_best else "")
         )
 
 
@@ -128,10 +152,13 @@ def fit(
     total_timesteps: int | None = None,
     ppo: Mapping[str, Any] | None = None,
     checkpoint_every: int | None = _FROM_CONFIG,
+    best_path: Path | None = None,
 ) -> Fit:
     """Train on the train Period; defaults come from config, never from SB3.
 
     ``checkpoint_every`` is a rollout count; ``None`` turns scoring off.
+    The best Checkpoint's model is saved to ``best_path`` (if given) as it
+    appears, and its row comes back with ``selected`` set.
     """
     params = dict(config.PPO if ppo is None else ppo)
     steps = config.TOTAL_TIMESTEPS if total_timesteps is None else total_timesteps
@@ -147,10 +174,16 @@ def fit(
     if every is not None:
         rollouts = math.ceil(steps / model.n_steps)
         val_env = market.make_env(market.structure.split.validation)
-        callback = _CheckpointCallback(val_env, every, rollouts)
+        callback = _CheckpointCallback(val_env, every, rollouts, best_path)
     # verbose=1 prints a progress table after every rollout.
     model.learn(total_timesteps=steps, callback=callback)
-    return Fit(model, callback.checkpoints if callback else [])
+    if callback is None:
+        return Fit(model, [])
+    checkpoints = [
+        replace(c, selected=i == callback.best_index)
+        for i, c in enumerate(callback.checkpoints)
+    ]
+    return Fit(model, checkpoints)
 
 
 def write_learning_curve(checkpoints: list[Checkpoint], path: Path) -> None:
@@ -174,10 +207,18 @@ def write_learning_curve(checkpoints: list[Checkpoint], path: Path) -> None:
 
 
 def run() -> None:
-    result = fit(load_market())
+    best_path = best_model_path()
+    best_path.unlink(missing_ok=True)
+    result = fit(load_market(), best_path=best_path)
     path = model_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     result.model.save(path)
     print(f"saved Agent to {path}")
     write_learning_curve(result.checkpoints, learning_curve_path())
     print(f"saved learning curve to {learning_curve_path()}")
+    selected = next((c for c in result.checkpoints if c.selected), None)
+    if selected is None:
+        print("no checkpoint had a Position change: no best model saved")
+    else:
+        print(f"selected checkpoint @ {selected.timestep:,}")
+        print(f"saved best Agent to {best_path}")

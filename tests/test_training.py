@@ -1,5 +1,6 @@
 import csv
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -113,7 +114,7 @@ def test_cli_train_writes_the_learning_curve_and_prints_a_line_per_checkpoint(
         assert reader.fieldnames == COLUMNS
         rows = list(reader)
     assert [r["timestep"] for r in rows] == ["128", "256", "320"]
-    assert {r["selected"] for r in rows} == {"False"}
+    assert sum(r["selected"] == "True" for r in rows) <= 1
     lines = [ln for ln in out.splitlines() if ln.startswith("checkpoint ")]
     assert len(lines) == 3
     assert lines[0].startswith("checkpoint 1/3 @ 128: net ")
@@ -123,7 +124,7 @@ def test_cli_train_writes_the_learning_curve_and_prints_a_line_per_checkpoint(
 
 def test_the_callback_leaves_the_final_weights_byte_identical(stored_bars):
     market = training.load_market()
-    kwargs = {"total_timesteps": 320, "ppo": TINY_PPO}
+    kwargs: dict[str, Any] = {"total_timesteps": 320, "ppo": TINY_PPO}
     plain = training.fit(market, checkpoint_every=None, **kwargs)
     scored = training.fit(market, checkpoint_every=2, **kwargs)
     assert plain.checkpoints == []
@@ -139,3 +140,85 @@ def test_the_final_rollout_is_scored_once_when_it_falls_on_the_cadence(stored_ba
     market = training.load_market()
     result = training.fit(market, total_timesteps=256, ppo=TINY_PPO, checkpoint_every=2)
     assert [c.timestep for c in result.checkpoints] == [128, 256]
+
+
+def fake_scores(monkeypatch, plan):
+    """Make successive Checkpoints score (net_pips, position_changes) from plan."""
+    from shadow_trader import evaluation
+
+    it = iter(plan)
+
+    def score(env, policy):
+        net, changes = next(it)
+        return evaluation.Score(
+            evaluation.Metrics(net, 0.0, 0.0, 0.0, 0.0, 10, 1), (changes,)
+        )
+
+    monkeypatch.setattr(evaluation, "score", score)
+
+
+def run_train(monkeypatch, capsys):
+    monkeypatch.setattr(config, "TOTAL_TIMESTEPS", 320)
+    monkeypatch.setattr(config, "PPO", TINY_PPO)
+    monkeypatch.setattr(config, "CHECKPOINT_EVERY_ROLLOUTS", 2)
+    cli.main(["train"])
+    out = capsys.readouterr().out
+    with training.learning_curve_path().open() as f:
+        return out, list(csv.DictReader(f))
+
+
+def test_cli_train_saves_the_best_checkpoint_and_marks_it(
+    stored_bars, monkeypatch, capsys
+):
+    # Checkpoints at 128, 256, 320; the 50-pip one never trades so cannot win.
+    fake_scores(monkeypatch, [(5.0, 3), (50.0, 0), (9.0, 4)])
+    out, rows = run_train(monkeypatch, capsys)
+    assert [r["selected"] for r in rows] == ["False", "False", "True"]
+    best = training.best_model_path()
+    assert best == config.DATA_DIR / "model" / "ppo_eurusd_best.zip"
+    assert PPO.load(best, device="cpu").num_timesteps == 320
+    lines = [ln for ln in out.splitlines() if ln.startswith("checkpoint ")]
+    assert lines[0].endswith(" *") and not lines[1].endswith(" *")
+    assert lines[2].endswith(" *")
+    assert "selected checkpoint @ 320" in out
+    assert str(best) in out and str(training.model_path()) in out
+
+
+def test_a_never_trading_checkpoint_cannot_be_selected(
+    stored_bars, monkeypatch, capsys
+):
+    fake_scores(monkeypatch, [(5.0, 0), (50.0, 0), (9.0, 0)])
+    out, rows = run_train(monkeypatch, capsys)
+    assert {r["selected"] for r in rows} == {"False"}
+    assert not training.best_model_path().exists()
+    assert "no checkpoint" in out.lower()
+    assert training.model_path().exists()
+
+
+def test_ties_keep_the_earliest_checkpoint(stored_bars, monkeypatch, capsys):
+    fake_scores(monkeypatch, [(7.0, 1), (7.0, 2), (3.0, 1)])
+    _, rows = run_train(monkeypatch, capsys)
+    assert [r["selected"] for r in rows] == ["True", "False", "False"]
+    assert PPO.load(training.best_model_path(), device="cpu").num_timesteps == 128
+
+
+def test_a_stale_best_file_is_removed_at_train_start(stored_bars, monkeypatch, capsys):
+    stale = training.best_model_path()
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"stale")
+    fake_scores(monkeypatch, [(1.0, 0), (1.0, 0), (1.0, 0)])
+    run_train(monkeypatch, capsys)
+    assert not stale.exists()
+
+
+def test_saving_the_best_leaves_final_weights_byte_identical(stored_bars, tmp_path):
+    market = training.load_market()
+    kwargs: dict[str, Any] = {"total_timesteps": 320, "ppo": TINY_PPO}
+    plain = training.fit(market, checkpoint_every=None, **kwargs)
+    best = tmp_path / "best.zip"
+    saved = training.fit(market, checkpoint_every=2, best_path=best, **kwargs)
+    assert any(c.selected for c in saved.checkpoints) == best.exists()
+    assert all(
+        torch.equal(x, y)
+        for x, y in zip(weights(plain.model), weights(saved.model), strict=True)
+    )
