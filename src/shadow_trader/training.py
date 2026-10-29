@@ -68,9 +68,16 @@ class Checkpoint:
     position_changes: int
     selected: bool = False
 
+    @property
+    def eligible(self) -> bool:
+        """Never-trading Checkpoints are ineligible for selection."""
+        return self.position_changes > 0
 
-def _say(text: str) -> None:
-    print(text, flush=True)
+
+def _checkpoint_count(total_rollouts: int, every: int) -> int:
+    """Checkpoints a run scores: every ``every``-th rollout end before the
+    last, plus the final one at training end."""
+    return len({r for r in range(1, total_rollouts) if r % every == 0}) + 1
 
 
 class _CheckpointCallback(BaseCallback):
@@ -96,7 +103,7 @@ class _CheckpointCallback(BaseCallback):
         self._every = every
         self._rollouts = 0
         self._last = total_rollouts  # scored after its update, at training end
-        self._total = len({r for r in range(1, total_rollouts) if r % every == 0}) + 1
+        self._total = _checkpoint_count(total_rollouts, every)
         self.checkpoints: list[Checkpoint] = []
 
     def _on_step(self) -> bool:
@@ -122,10 +129,10 @@ class _CheckpointCallback(BaseCallback):
         result = evaluation.score(self._env, policy)
         m = result.metrics
         changes = sum(result.position_changes)
-        self.checkpoints.append(Checkpoint(timestep, m, changes))
-        # Never-trading Checkpoints are ineligible; strictly greater replaces,
-        # so ties keep the earliest.
-        is_best = changes > 0 and (
+        checkpoint = Checkpoint(timestep, m, changes)
+        self.checkpoints.append(checkpoint)
+        # Strictly greater replaces, so ties keep the earliest.
+        is_best = checkpoint.eligible and (
             self.best_index is None
             or m.net_pips > self.checkpoints[self.best_index].metrics.net_pips
         )
@@ -134,7 +141,7 @@ class _CheckpointCallback(BaseCallback):
             if self._best_path is not None:
                 self._best_path.parent.mkdir(parents=True, exist_ok=True)
                 self.model.save(self._best_path)
-        _say(
+        evaluation._say(
             f"checkpoint {len(self.checkpoints)}/{self._total} @ {timestep:,}: "
             f"net {m.net_pips:.1f} pips, sharpe {m.sharpe:.4f}, changes {changes:,}"
             + (" *" if is_best else "")
@@ -147,6 +154,8 @@ class Fit:
     checkpoints: list[Checkpoint]
 
 
+# Distinguishes "argument omitted, use config" from an explicit ``None``
+# (scoring off), which a plain ``None`` default could not.
 _FROM_CONFIG: Any = object()
 
 
