@@ -5,14 +5,17 @@ step; ``evaluate`` calls it too and builds its environment with
 :meth:`Market.make_env`, so both commands see identical data and settings.
 """
 
+import csv
+import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pyarrow.parquet as pq
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
 
 from shadow_trader import bars, config, segments
 from shadow_trader.env import TradingEnv
@@ -44,26 +47,137 @@ def model_path() -> Path:
     return config.DATA_DIR / "model" / "ppo_eurusd.zip"
 
 
+def learning_curve_path() -> Path:
+    return config.DATA_DIR / "model" / "learning_curve.csv"
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    """The deterministic Agent scored on the validation Period mid-training."""
+
+    timestep: int
+    metrics: Any  # evaluation.Metrics
+    position_changes: int
+    selected: bool = False
+
+
+def _say(text: str) -> None:
+    print(text, flush=True)
+
+
+class _CheckpointCallback(BaseCallback):
+    """Score validation every ``every`` rollouts and once when training ends.
+
+    Rollout-end checkpoints score the policy that collected that rollout; the
+    final one runs after the last update, so it scores the model that is saved.
+    Validation has its own environment and prediction is deterministic, so
+    training's RNG stream, and hence the weights, are untouched.
+    """
+
+    def __init__(self, env: TradingEnv, every: int, total_rollouts: int) -> None:
+        super().__init__()
+        self._env = env
+        self._every = every
+        self._rollouts = 0
+        self._last = total_rollouts  # scored after its update, at training end
+        self._total = len({r for r in range(1, total_rollouts) if r % every == 0}) + 1
+        self.checkpoints: list[Checkpoint] = []
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        self._rollouts += 1
+        if self._rollouts % self._every == 0 and self._rollouts < self._last:
+            self._score()
+
+    def _on_training_end(self) -> None:
+        self._score()
+
+    def _score(self) -> None:
+        from shadow_trader import evaluation
+
+        timestep = int(self.model.num_timesteps)
+
+        def policy(obs: np.ndarray) -> int:
+            action, _ = self.model.predict(obs, deterministic=True)
+            return int(action)
+
+        result = evaluation.score(self._env, policy)
+        m = result.metrics
+        changes = sum(result.position_changes)
+        self.checkpoints.append(Checkpoint(timestep, m, changes))
+        _say(
+            f"checkpoint {len(self.checkpoints)}/{self._total} @ {timestep:,}: "
+            f"net {m.net_pips:.1f} pips, sharpe {m.sharpe:.4f}, changes {changes:,}"
+        )
+
+
+@dataclass(frozen=True)
+class Fit:
+    model: PPO
+    checkpoints: list[Checkpoint]
+
+
+_FROM_CONFIG: Any = object()
+
+
 def fit(
     market: Market,
     *,
     total_timesteps: int | None = None,
     ppo: Mapping[str, Any] | None = None,
-) -> PPO:
-    """Train on the train Period; defaults come from config, never from SB3."""
+    checkpoint_every: int | None = _FROM_CONFIG,
+) -> Fit:
+    """Train on the train Period; defaults come from config, never from SB3.
+
+    ``checkpoint_every`` is a rollout count; ``None`` turns scoring off.
+    """
     params = dict(config.PPO if ppo is None else ppo)
     steps = config.TOTAL_TIMESTEPS if total_timesteps is None else total_timesteps
+    every = (
+        config.CHECKPOINT_EVERY_ROLLOUTS
+        if checkpoint_every is _FROM_CONFIG
+        else checkpoint_every
+    )
     env = market.make_env(market.structure.split.train)
     # Hyperparameters are an untyped config mapping; SB3 validates them itself.
     model = PPO(params.pop("policy"), env, verbose=1, **params)  # ty: ignore[invalid-argument-type]
+    callback = None
+    if every is not None:
+        rollouts = math.ceil(steps / model.n_steps)
+        val_env = market.make_env(market.structure.split.validation)
+        callback = _CheckpointCallback(val_env, every, rollouts)
     # verbose=1 prints a progress table after every rollout.
-    model.learn(total_timesteps=steps)
-    return model
+    model.learn(total_timesteps=steps, callback=callback)
+    return Fit(model, callback.checkpoints if callback else [])
+
+
+def write_learning_curve(checkpoints: list[Checkpoint], path: Path) -> None:
+    from shadow_trader import evaluation
+
+    metric_cols = [f.name for f in fields(evaluation.Metrics)]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestep", *metric_cols, "position_changes", "selected"])
+        for c in checkpoints:
+            m = asdict(c.metrics)
+            writer.writerow(
+                [
+                    c.timestep,
+                    *(m[k] for k in metric_cols),
+                    c.position_changes,
+                    c.selected,
+                ]
+            )
 
 
 def run() -> None:
-    model = fit(load_market())
+    result = fit(load_market())
     path = model_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    model.save(path)
+    result.model.save(path)
     print(f"saved Agent to {path}")
+    write_learning_curve(result.checkpoints, learning_curve_path())
+    print(f"saved learning curve to {learning_curve_path()}")

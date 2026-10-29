@@ -112,7 +112,7 @@ def test_cli_evaluate_prints_the_metrics_for_the_test_period(
     capsys,
 ):
     market = training.load_market()
-    model = training.fit(market, total_timesteps=64, ppo=TINY_PPO)
+    model = training.fit(market, total_timesteps=64, ppo=TINY_PPO).model
     path = training.model_path()
     path.parent.mkdir(parents=True)
     model.save(path)
@@ -236,7 +236,7 @@ def test_cli_evaluate_prints_baselines_and_an_explicit_verdict(
     capsys,
 ):
     market = training.load_market()
-    model = training.fit(market, total_timesteps=64, ppo=TINY_PPO)
+    model = training.fit(market, total_timesteps=64, ppo=TINY_PPO).model
     path = training.model_path()
     path.parent.mkdir(parents=True)
     model.save(path)

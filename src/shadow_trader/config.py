@@ -35,6 +35,9 @@ WINDOW_SIZE = 24  # N
 EPISODE_LENGTH = 288  # Bars
 
 TOTAL_TIMESTEPS = 1_000_000
+# Validation is scored every this many PPO rollouts (a count, so it never
+# misaligns with update boundaries), plus once at the final rollout.
+CHECKPOINT_EVERY_ROLLOUTS = 25
 SEED = 42
 N_BASELINE_DRAWS = 20
 DEVICE = "cpu"  # pinned, never automatic selection

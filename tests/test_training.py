@@ -1,3 +1,4 @@
+import csv
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -48,15 +49,15 @@ def test_load_market_gives_mid_prices_and_structure(stored_bars):
 
 def test_same_config_and_seed_gives_the_same_model(stored_bars):
     market = training.load_market()
-    a = training.fit(market, total_timesteps=256, ppo=TINY_PPO)
-    b = training.fit(market, total_timesteps=256, ppo=TINY_PPO)
+    a = training.fit(market, total_timesteps=256, ppo=TINY_PPO).model
+    b = training.fit(market, total_timesteps=256, ppo=TINY_PPO).model
     assert all(torch.equal(x, y) for x, y in zip(weights(a), weights(b), strict=True))
 
 
 def test_a_different_seed_gives_a_different_model(stored_bars):
     market = training.load_market()
-    a = training.fit(market, total_timesteps=256, ppo=TINY_PPO)
-    b = training.fit(market, total_timesteps=256, ppo={**TINY_PPO, "seed": 7})
+    a = training.fit(market, total_timesteps=256, ppo=TINY_PPO).model
+    b = training.fit(market, total_timesteps=256, ppo={**TINY_PPO, "seed": 7}).model
     assert not all(
         torch.equal(x, y) for x, y in zip(weights(a), weights(b), strict=True)
     )
@@ -80,3 +81,61 @@ def test_config_pins_the_requested_run():
     assert config.TOTAL_TIMESTEPS == 1_000_000
     assert config.PPO["device"] == "cpu"
     assert config.PPO["seed"] == 42
+    assert config.CHECKPOINT_EVERY_ROLLOUTS == 25
+
+
+COLUMNS = [
+    "timestep",
+    "net_pips",
+    "net_pct",
+    "sharpe",
+    "max_drawdown_pips",
+    "max_drawdown_pct",
+    "bars",
+    "segments",
+    "position_changes",
+    "selected",
+]
+
+
+def test_cli_train_writes_the_learning_curve_and_prints_a_line_per_checkpoint(
+    stored_bars, monkeypatch, capsys
+):
+    # 320 steps at n_steps 64 = 5 rollouts; every 2nd plus the last = 2, 4, 5.
+    monkeypatch.setattr(config, "TOTAL_TIMESTEPS", 320)
+    monkeypatch.setattr(config, "PPO", TINY_PPO)
+    monkeypatch.setattr(config, "CHECKPOINT_EVERY_ROLLOUTS", 2)
+    cli.main(["train"])
+    out = capsys.readouterr().out
+    path = config.DATA_DIR / "model" / "learning_curve.csv"
+    with path.open() as f:
+        reader = csv.DictReader(f)
+        assert reader.fieldnames == COLUMNS
+        rows = list(reader)
+    assert [r["timestep"] for r in rows] == ["128", "256", "320"]
+    assert {r["selected"] for r in rows} == {"False"}
+    lines = [ln for ln in out.splitlines() if ln.startswith("checkpoint ")]
+    assert len(lines) == 3
+    assert lines[0].startswith("checkpoint 1/3 @ 128: net ")
+    assert lines[2].startswith("checkpoint 3/3 @ 320: net ")
+    assert "sharpe " in lines[0] and ", changes " in lines[0]
+
+
+def test_the_callback_leaves_the_final_weights_byte_identical(stored_bars):
+    market = training.load_market()
+    kwargs = {"total_timesteps": 320, "ppo": TINY_PPO}
+    plain = training.fit(market, checkpoint_every=None, **kwargs)
+    scored = training.fit(market, checkpoint_every=2, **kwargs)
+    assert plain.checkpoints == []
+    assert len(scored.checkpoints) == 3
+    assert all(
+        torch.equal(x, y)
+        for x, y in zip(weights(plain.model), weights(scored.model), strict=True)
+    )
+
+
+def test_the_final_rollout_is_scored_once_when_it_falls_on_the_cadence(stored_bars):
+    # 4 rollouts, every 2nd: Checkpoints at rollouts 2 and 4, not a third.
+    market = training.load_market()
+    result = training.fit(market, total_timesteps=256, ppo=TINY_PPO, checkpoint_every=2)
+    assert [c.timestep for c in result.checkpoints] == [128, 256]
