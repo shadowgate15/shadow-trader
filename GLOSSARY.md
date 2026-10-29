@@ -56,6 +56,10 @@ _Avoid_: Run, session
 The chronological division of History into train, validation, and test periods. The test period is evaluated once per configuration, and never used to choose one.
 _Avoid_: Fold, partition
 
+**Checkpoint**:
+A point during training at which the deterministic Agent is scored on the validation period. The best-scoring Checkpoint that has changed Position at least once is the Agent that `evaluate` loads.
+_Avoid_: Snapshot, save point
+
 **Baseline**:
 A simple policy the Agent must beat on the test period under the same Spread cost. There are two: buy-and-hold, which holds a long Position through each Segment and is flat over weekends; and random, which makes Actions at random while matching the Agent's own trading frequency, so the comparison is about timing rather than how often each trades.
 _Avoid_: Benchmark
