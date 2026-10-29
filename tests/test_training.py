@@ -222,3 +222,46 @@ def test_saving_the_best_leaves_final_weights_byte_identical(stored_bars, tmp_pa
         torch.equal(x, y)
         for x, y in zip(weights(plain.model), weights(saved.model), strict=True)
     )
+
+
+def _rows():
+    from shadow_trader import evaluation
+
+    def cp(t, net, changes, selected=False):
+        m = evaluation.Metrics(net, 0.0, 0.0, 0.0, 0.0, 10, 1)
+        return training.Checkpoint(t, m, changes, selected)
+
+    return [cp(100, 5.0, 3), cp(200, 40.0, 0), cp(300, 9.0, 4, True)]
+
+
+def test_plot_writes_a_non_empty_png(tmp_path):
+    from shadow_trader import plotting
+
+    out = tmp_path / "learning_curve.png"
+    plotting.plot_learning_curve(_rows(), out)
+    assert out.stat().st_size > 0
+    assert out.read_bytes().startswith(b"\x89PNG")
+
+
+def test_cli_train_writes_the_png_and_prints_its_path(stored_bars, monkeypatch, capsys):
+    fake_scores(monkeypatch, [(5.0, 3), (50.0, 0), (9.0, 4)])
+    out, _ = run_train(monkeypatch, capsys)
+    png = training.learning_curve_path().with_suffix(".png")
+    assert png.name == "learning_curve.png" and png.stat().st_size > 0
+    assert str(png) in out
+
+
+def test_a_plotting_failure_warns_and_train_still_succeeds(
+    stored_bars, monkeypatch, capsys
+):
+    from shadow_trader import plotting
+
+    def boom(*a, **k):
+        raise RuntimeError("no fonts")
+
+    monkeypatch.setattr(plotting, "plot_learning_curve", boom)
+    fake_scores(monkeypatch, [(5.0, 3), (50.0, 0), (9.0, 4)])
+    out, rows = run_train(monkeypatch, capsys)  # cli.main must not raise/exit
+    assert "warning" in out.lower() and "no fonts" in out
+    assert len(rows) == 3
+    assert training.model_path().exists() and training.best_model_path().exists()
