@@ -17,7 +17,7 @@ import pyarrow.parquet as pq
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 
-from shadow_trader import bars, config, segments
+from shadow_trader import bars, config, plotting, segments
 from shadow_trader.env import TradingEnv
 
 
@@ -53,6 +53,10 @@ def best_model_path() -> Path:
 
 def learning_curve_path() -> Path:
     return config.DATA_DIR / "model" / "learning_curve.csv"
+
+
+def learning_curve_plot_path() -> Path:
+    return learning_curve_path().with_suffix(".png")
 
 
 @dataclass(frozen=True)
@@ -216,9 +220,18 @@ def run() -> None:
     print(f"saved Agent to {path}")
     write_learning_curve(result.checkpoints, learning_curve_path())
     print(f"saved learning curve to {learning_curve_path()}")
+    png = learning_curve_plot_path()
+    try:
+        plotting.plot_learning_curve(result.checkpoints, png)
+        plotted = True
+    except Exception as e:  # cosmetic: never lose the run over a plot
+        plotted = False
+        print(f"warning: learning-curve plot failed: {type(e).__name__}: {e}")
     selected = next((c for c in result.checkpoints if c.selected), None)
     if selected is None:
         print("no checkpoint had a Position change: no best model saved")
     else:
         print(f"selected checkpoint @ {selected.timestep:,}")
         print(f"saved best Agent to {best_path}")
+    if plotted:
+        print(f"saved learning-curve plot to {png}")
