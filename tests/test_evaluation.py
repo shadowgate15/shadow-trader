@@ -112,7 +112,7 @@ def test_cli_evaluate_prints_the_metrics_for_the_test_period(
     capsys,
 ):
     market = training.load_market()
-    model = training.fit(market, total_timesteps=64, ppo=TINY_PPO)
+    model = training.fit(market, total_timesteps=64, ppo=TINY_PPO).model
     path = training.model_path()
     path.parent.mkdir(parents=True)
     model.save(path)
@@ -133,6 +133,10 @@ def test_cli_evaluate_prints_the_metrics_for_the_test_period(
         "segments:",
     ):
         assert label in out
+    assert (
+        "checkpoint: final @ 64 steps (ppo_eurusd_best.zip not found: "
+        "no checkpoint had a Position change)"
+    ) in out
 
 
 # --- Baselines and verdict (#150) ---------------------------------------------
@@ -236,7 +240,7 @@ def test_cli_evaluate_prints_baselines_and_an_explicit_verdict(
     capsys,
 ):
     market = training.load_market()
-    model = training.fit(market, total_timesteps=64, ppo=TINY_PPO)
+    model = training.fit(market, total_timesteps=64, ppo=TINY_PPO).model
     path = training.model_path()
     path.parent.mkdir(parents=True)
     model.save(path)
@@ -247,3 +251,25 @@ def test_cli_evaluate_prints_baselines_and_an_explicit_verdict(
     assert "random" in out
     assert "draws" in out
     assert "VERDICT: PASS" in out or "VERDICT: FAIL" in out
+    assert "checkpoint: final @ 64 steps" in out
+
+
+def test_cli_evaluate_prefers_the_best_model_and_reports_its_timestep(
+    stored_bars,  # noqa: F811
+    capsys,
+):
+    market = training.load_market()
+    final = training.fit(market, total_timesteps=64, ppo=TINY_PPO).model
+    best = training.fit(market, total_timesteps=128, ppo=TINY_PPO).model
+    training.model_path().parent.mkdir(parents=True)
+    final.save(training.model_path())
+    best.save(training.best_model_path())
+    capsys.readouterr()
+    cli.main(["evaluate"])
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert "checkpoint: best @ 128 steps (ppo_eurusd_best.zip)" in lines
+    assert "checkpoint: final" not in out
+    assert lines.index("checkpoint: best @ 128 steps (ppo_eurusd_best.zip)") < next(
+        i for i, ln in enumerate(lines) if "net (pips)" in ln
+    )

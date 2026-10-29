@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "gymnasium>=1.4.0",
+    "matplotlib>=3.11.2",
     "pyarrow>=26.0.0",
     "stable-baselines3>=2.9.2",
 ]

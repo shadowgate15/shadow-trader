@@ -245,7 +245,16 @@ def _say(text: str = "") -> None:
 def run() -> None:
     _say("loading Bars and the trained Agent")
     market = training.load_market()
-    model = PPO.load(training.model_path(), device=config.DEVICE)
+    best_path = training.best_model_path()
+    if best_path.exists():
+        model = PPO.load(best_path, device=config.DEVICE)
+        _say(f"checkpoint: best @ {model.num_timesteps:,} steps ({best_path.name})")
+    else:
+        model = PPO.load(training.model_path(), device=config.DEVICE)
+        _say(
+            f"checkpoint: final @ {model.num_timesteps:,} steps "
+            f"({best_path.name} not found: no checkpoint had a Position change)"
+        )
 
     def policy(obs: np.ndarray) -> int:
         action, _ = model.predict(obs, deterministic=True)
