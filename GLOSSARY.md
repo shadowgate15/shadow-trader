@@ -1,96 +1,73 @@
 # Shadow Trader
 
-A reinforcement-learning system that learns to trade forex on short intraday bars, trained and evaluated offline first, then promoted to paper and eventually real-money trading.
+A reinforcement-learning forex trading bot. The MVP learns a trading policy from historical prices and is judged offline against simple baselines.
 
 ## Language
 
 **Bar**:
-One fixed-length time interval of price data for an instrument, aligned to the UTC clock and identified by its open time. Length is configurable; 5 minutes is the default and 15 minutes the fallback. Prices are bid-side, with the spread carried alongside so the ask is always derivable.
-_Avoid_: Candle, tick
+One time-bucketed price record for the traded pair, holding an open, high, low and close for the bid side and for the ask side. The MVP uses five-minute bars.
+_Avoid_: Candle, tick, row
 
-**Instrument**:
-A single tradable forex pair, such as EUR/USD.
-_Avoid_: Symbol, ticker, asset
+**Mid**:
+The price midway between a Bar's bid and ask. The single price series the Agent observes.
+_Avoid_: Price, close, mid-market
 
-**Session**:
-One continuous open-market stretch, from the weekly open (Sunday ~17:00 New York) to the weekly close (Friday ~17:00 New York). The daily 17:00 New York rollover is a marker inside a Session, not a boundary. Forex has no holiday calendar; the weekly closure is the only expected closure.
-_Avoid_: Trading day, market hours
+**Spread**:
+The ask minus the bid on a Bar. An indicative quantity rather than a price anyone could trade at: in History it is frequently zero and sometimes negative. Nothing in the MVP treats it as a cost; see Spread cost.
+_Avoid_: Bid-ask, gap
+
+**History**:
+The fixed series of Bars the MVP trains on and is judged against: one pair, one source, one pinned date range.
+_Avoid_: Dataset, data, prices, feed
+
+**Agent**:
+The learned policy that chooses an Action at each Bar.
+_Avoid_: Bot, model, strategy
+
+**Observation**:
+Everything the Agent sees at a Bar: how Mid moved over a Window, together with its own current Position. Nothing else — no indicators, no clock, and no view of the Spread.
+_Avoid_: State, features, input
+
+**Window**:
+The fixed-length run of consecutive Bars ending at the current Bar whose Mid movement the Observation carries. Never spans a large Gap.
+_Avoid_: Lookback, buffer, context
+
+**Action**:
+The Agent's choice at a Bar: go short, go flat, or go long.
+_Avoid_: Signal, order
+
+**Position**:
+The Agent's current exposure: short, flat, or long, always one fixed size.
+_Avoid_: Trade, holding
+
+**Spread cost**:
+The cost charged whenever the Position changes: a fixed notional spread, not the Spread observed on the Bar. Half of it is charged for each unit of Position crossed, so a round trip and a direct reversal each pay one full spread. Set deliberately wider than the Spread seen in History, which is an indicative quote rather than a price anyone could trade at.
+_Avoid_: Fee, commission, slippage
+
+**Reward**:
+The net profit or loss of one Bar after Spread cost, with no shaping.
+_Avoid_: Score, return
+
+**Episode**:
+One fixed-length contiguous stretch of Bars the Agent trades through during training, starting at a random Bar and lying entirely within a single Segment.
+_Avoid_: Run, session
+
+**Split**:
+The chronological division of History into train, validation, and test periods. The test period is evaluated once per configuration, and never used to choose one.
+_Avoid_: Fold, partition
+
+**Baseline**:
+A simple policy the Agent must beat on the test period under the same Spread cost. There are two: buy-and-hold, which holds a long Position through each Segment and is flat over weekends; and random, which makes Actions at random while matching the Agent's own trading frequency, so the comparison is about timing rather than how often each trades.
+_Avoid_: Benchmark
 
 **Gap**:
-A Bar missing from inside an open Session because no quotes arrived. Never filled at ingestion and always flagged. The weekly closure between Sessions is not a Gap.
-_Avoid_: Missing data, hole
+A break in the Bar series, such as a weekend or missing data. Windows, Episodes and Segments never span a large Gap.
+_Avoid_: Hole, missing data
 
-**Subsystem**:
-A deployable piece of the system with its own charter and its own wayfinder map: market data ingestion, dataset preparation, trading environment, agent and training, evaluation, broker integration, live orchestration.
-_Avoid_: Module, component, service
-
-**Charter**:
-A subsystem's statement of what it owns, what it explicitly does not, and its inputs and outputs.
-
-**Execution model**:
-The shared rules for spread, slippage, leverage, margin and position handling that both the simulated trading environment and live trading obey.
-_Avoid_: Fill model, broker model
-
-**Promotion path**:
-The ordered stages an agent moves through, and the evidence required to pass each gate: backtest, paper trading, real money at minimum size, then real money at scaled-up size. Every stage change needs a human sign-off.
-_Avoid_: Deployment pipeline, rollout
-
-**Stage**:
-One step on the Promotion path: backtest, paper, real money (minimum size), or real money (scaled up).
-_Avoid_: Phase, environment
-
-**Gate**:
-The evidence and human sign-off required to move a Candidate from one Stage to the next.
-_Avoid_: Checkpoint, approval step
-
-**Candidate**:
-One frozen agent, identified by its model artefact, training configuration, seeds, code revision and the exact Dataset it saw. Any change produces a new Candidate that restarts at the first Stage.
-_Avoid_: Model version, build
-
-**Halt**:
-An automatic flatten-and-stop of a Candidate when a safety limit is breached. Resuming needs human sign-off after a written post-mortem.
-_Avoid_: Pause, crash
-
-**Demotion**:
-A human decision to return a Candidate to an earlier Stage after sustained underperformance or divergence from the simulation.
-_Avoid_: Rollback
-
-**Dataset**:
-An immutable, versioned collection of Bars (and, once prepared, features) for one or more Instruments at one bar size, described by a manifest recording its source, time range and lineage. A change to the data produces a new Dataset, never an edit. A trained model can always name the exact Dataset it saw.
-_Avoid_: Data dump, table
-
-**Seed cohort**:
-A Candidate together with sibling runs that share its training configuration and Dataset but differ in seed. Evaluated together at the backtest Gate to show consistency across seeds. Siblings are evidence only and are never promoted.
-_Avoid_: Ensemble, seed sweep
-
-**Revision**:
-A numbered version of one emitted live Bar. A late or catch-up quote inside the repair window produces the next Revision of the same Bar; earlier Revisions are kept, never overwritten. The as-seen view is the Revision current at a given moment; the latest view is the highest Revision.
-_Avoid_: Correction, patch
-
-**Repair window**:
-The period after a live Bar closes during which late or catch-up quotes may still produce a new Revision. Once it passes, the Bar is sealed and later quotes are dropped and counted.
-_Avoid_: Grace period, lookback
-
-**Feature spec**:
-The versioned definition of every `feat_*` column a prepared Dataset carries: what each is computed from and over how many Bars it looks back. Each feature value for a Bar depends only on that Bar and earlier ones. A change to any definition produces a new version, never an edit. The volatility family is the sample std of 1-Bar returns over horizons 3 and up (a std of one return is undefined, so there is no 1-Bar volatility column) plus ATR over close from spec v4.
-_Avoid_: Feature config, indicator list
+**Segment**:
+One contiguous stretch of Bars between large Gaps, in practice a trading week. Evaluation runs Segment by Segment, and every policy starts and ends flat in each. Distinct from an Episode, which is a training stretch starting at a random Bar.
+_Avoid_: Session, week, run
 
 **Warm-up**:
-The stretch at the start of a Session, or of a Dataset, during which a history-dependent feature has not yet seen a full lookback inside it. Features are null throughout; a window never crosses a Session boundary. In live use, the extra Bars a recursive feature needs beyond its lookback before a Tail's last value matches the full-history value.
-_Avoid_: Burn-in, priming
-
-**Usable Bar**:
-A prepared Bar that is priced, carries no distrusted quality flag, and has every history-dependent feature present. Everything else is unusable, and a Bar records why; a feature left null by a missing input (such as `tick_count`) is reported as `window_contains_gap`. Raw rows are never changed to express this.
-_Avoid_: Valid Bar, clean Bar
-
-**Embargo**:
-The stretch of Bars cut from the end of an earlier split so that nothing used for training or selection on it can reach into the next split. Sized to the longest feature lookback plus the episode length, in Bars; the cut Bars are absent from that split's Dataset.
-_Avoid_: Purge, gap
-
-**Scaler**:
-The train-only statistics that rescale features into model inputs, stored as one immutable artifact per build and cited by spec, policy and training Dataset. Prepared Datasets always hold unscaled features; scaling happens at use.
-_Avoid_: Normalizer, preprocessor
-
-**Tail**:
-The most recent run of live Bars, long enough to cover the longest lookback plus Warm-up, from which live features for the latest Bar are computed with the same definitions as a batch build. A short Tail yields null features, not errors.
-_Avoid_: Window, buffer
+The Bars at the start of a Segment before a full Window exists. The Agent takes no Action there and no Reward accrues, so they are not judged.
+_Avoid_: Burn-in, priming, ramp

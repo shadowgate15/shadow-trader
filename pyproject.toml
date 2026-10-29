@@ -8,9 +8,9 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "polars>=2",
+    "gymnasium>=1.4.0",
     "pyarrow>=26.0.0",
-    "rich>=15.0.0",
+    "stable-baselines3>=2.9.2",
 ]
 
 [project.scripts]
@@ -22,14 +22,9 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "hypothesis>=6.169.0",
     "pytest>=9.1.1",
     "ruff>=0.17.0",
     "ty>=0.0.86",
-]
-oracle = [
-    "numpy>=2.5.4",
-    "ta-lib>=0.8.2",
 ]
 
 [tool.ruff]
@@ -41,11 +36,3 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 
 [tool.ty.environment]
 python-version = "3.13"
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-m 'not slow'"
-markers = [
-    "slow: full-month runs against the real raw cache; opt in with -m slow",
-    "oracle: needs the optional TA-Lib dev group; skipped when absent",
-]

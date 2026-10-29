@@ -9,8 +9,5 @@ wheels/
 # Virtual environments
 .venv
 
-# Local ingestion data (raw cache, Datasets, reports)
-/data/
-
-# claude
 .claude/worktrees
+data/
