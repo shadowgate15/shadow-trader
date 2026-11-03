@@ -49,6 +49,9 @@ RETURN_FEATURE_SCALES = tuple(
     RETURN_SCALE / math.sqrt(h) for h in config.RETURN_HORIZONS
 )
 
+# Volatility Features: RETURN_SCALE * stdev only, no horizon adjustment.
+VOLATILITY_FEATURE_SCALES = tuple(RETURN_SCALE for _ in config.VOLATILITY_HORIZONS)
+
 
 def _return_series(mid: np.ndarray, horizon: int, scale: float) -> np.ndarray:
     """``scale * log(c_t / c_{t-h})`` per Bar; NaN where fewer than h Bars precede."""
@@ -56,6 +59,26 @@ def _return_series(mid: np.ndarray, horizon: int, scale: float) -> np.ndarray:
     out = np.full(len(close), np.nan)
     if len(close) > horizon:
         out[horizon:] = scale * np.log(close[horizon:] / close[:-horizon])
+    return out
+
+
+def _volatility_series(mid: np.ndarray, horizon: int, scale: float) -> np.ndarray:
+    """``scale * stdev`` (ddof=1) of the ``horizon`` one-Bar close log returns
+    ending at each Bar; NaN where fewer than ``horizon + 1`` closes are available.
+
+    A one-Bar return across a Gap includes the Gap's jump; nothing neutralises it.
+    """
+    close = mid[:, 3]
+    out = np.full(len(close), np.nan)
+    if len(close) > horizon:
+        windows = np.lib.stride_tricks.sliding_window_view(
+            np.diff(np.log(close)), horizon
+        )
+        # Chunked so the temporaries stay small on a long History.
+        for i in range(0, len(windows), 8192):
+            out[horizon + i : horizon + i + 8192] = scale * np.std(
+                windows[i : i + 8192], axis=1, ddof=1
+            )
     return out
 
 
@@ -77,6 +100,12 @@ class FeatureFamily:
 FAMILIES: tuple[FeatureFamily, ...] = (
     FeatureFamily(
         config.RETURN_HORIZONS, RETURN_FEATURE_SCALES, lambda h: h, _return_series
+    ),
+    FeatureFamily(
+        config.VOLATILITY_HORIZONS,
+        VOLATILITY_FEATURE_SCALES,
+        lambda n: n,
+        _volatility_series,
     ),
 )
 FEATURE_COUNT = sum(len(f.horizons) for f in FAMILIES)

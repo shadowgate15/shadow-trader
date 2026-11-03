@@ -5,7 +5,8 @@ import pytest
 from gymnasium import spaces
 from gymnasium.utils.env_checker import check_env
 
-from shadow_trader.env import TradingEnv
+from shadow_trader import config
+from shadow_trader.env import FAMILIES, FEATURE_COUNT, TradingEnv
 from shadow_trader.segments import Segment
 
 N = 24
@@ -41,7 +42,7 @@ def run_to_end(env: TradingEnv, action: int = 1):
 def test_spaces():
     env = env_for()
     assert env.observation_space == spaces.Box(
-        -np.inf, np.inf, (1 + 3 * N + 3 * N,), np.float32
+        -np.inf, np.inf, (1 + (3 + FEATURE_COUNT) * N,), np.float32
     )
     assert env.action_space == spaces.Discrete(3)
 
@@ -257,3 +258,75 @@ def test_a_shock_gives_large_unclipped_return_features():
     prices[LEAD + 6 :] *= 1.5  # permanent 50% jump at Bar LEAD + 6
     obs, _ = obs_after(prices, [(LEAD, LEAD + 400)], 3)
     assert return_blocks(obs)[0].max() > 500  # 1e4 * ln(1.5) / sqrt(48) = 585
+
+
+# --- Volatility Features (#185) -----------------------------------------------
+
+
+def volatility_blocks(obs):
+    """The volatility Feature blocks, located via FAMILIES so other families
+    may sit before or after them."""
+    k = 0
+    for family in FAMILIES:
+        if family.precompute.__name__ == "_volatility_series":
+            base = 1 + 3 * N + k * N
+            return [
+                obs[base + i * N : base + (i + 1) * N]
+                for i in range(len(family.horizons))
+            ]
+        k += len(family.horizons)
+    raise AssertionError("no volatility family")
+
+
+def ref_volatility_block(prices, t, n):
+    """Independent reference: scaled sample stdev (ddof=1) of the n one-Bar
+    close log returns ending at each of the 24 Bars to t."""
+    logc = np.log(prices[:, 3])
+    return [
+        SCALE * np.std(np.diff(logc[b - n : b + 1]), ddof=1)
+        for b in range(t - N + 1, t + 1)
+    ]
+
+
+def test_volatility_blocks_match_the_reference_at_all_positions():
+    prices = make_prices(LEAD + 400)
+    obs, t = obs_after(prices, [(LEAD, LEAD + 400)], 5)
+    for block, n in zip(
+        volatility_blocks(obs), config.VOLATILITY_HORIZONS, strict=True
+    ):
+        np.testing.assert_allclose(
+            block, ref_volatility_block(prices, t, n), rtol=1e-4, atol=1e-6
+        )
+
+
+def test_constant_price_gives_zero_finite_volatility():
+    prices = np.full((LEAD + 400, 4), 1.1)
+    obs, _ = obs_after(prices, [(LEAD, LEAD + 400)], 3)
+    for block in volatility_blocks(obs):
+        assert np.all(np.isfinite(block))
+        assert np.all(block == 0)
+
+
+def test_volatility_looks_back_across_a_gap_and_includes_its_jump():
+    prices = make_prices(900)
+    prices[560:] *= 1.02  # the Gap's price jump, inside every lookback window
+    env = TradingEnv(prices, [(0, 500), (600, 900)])
+    obs, info = env.reset(options={"segment": 0})
+    t = info["bar"]
+    for block, n in zip(
+        volatility_blocks(obs), config.VOLATILITY_HORIZONS, strict=True
+    ):
+        np.testing.assert_allclose(
+            block, ref_volatility_block(prices, t, n), rtol=1e-4, atol=1e-6
+        )
+    assert volatility_blocks(obs)[1].min() > 5  # 1e4 * ln(1.02) / sqrt(288) = 11.7 vs ~1 without the jump
+
+
+def test_volatility_at_t_ignores_later_bars():
+    prices = make_prices(LEAD + 400)
+    segs = [(LEAD, LEAD + 400)]
+    obs, t = obs_after(prices, segs, 3)
+    later = prices.copy()
+    later[t + 1 :] *= 1.3
+    obs2, _ = obs_after(later, segs, 3)
+    assert obs.tobytes() == obs2.tobytes()
