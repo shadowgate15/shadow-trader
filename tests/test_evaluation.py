@@ -10,6 +10,7 @@ from shadow_trader import cli, config, evaluation, training
 from shadow_trader.env import PIP, POSITIONS, TradingEnv
 
 N = 24
+LEAD = 300  # leading history so no Segment is dropped for lack of Feature lookback
 
 
 def test_metrics_net_return_in_pips_and_percent_of_notional():
@@ -52,7 +53,7 @@ def test_drawdown_runs_from_a_zero_peak():
 def test_notional_is_the_first_scored_bar_mid_close_of_the_first_scored_segment():
     env = env_for([(0, 10), (50, 150), (160, 260)])  # first Segment is skipped
     s = evaluation.buy_and_hold(env)
-    notional = env.mid[50 + N, 3]
+    notional = env.mid[LEAD + 50 + N, 3]
     assert s.metrics.net_pct == pytest.approx(s.metrics.net_pips * PIP / notional * 100)
 
 
@@ -67,7 +68,9 @@ def always(action):
 
 
 def env_for(segs, count=400):
-    return TradingEnv(make_prices(count), segs)
+    """Segments and indices are relative to the end of ``LEAD`` leading Bars."""
+    shifted = [(first + LEAD, stop + LEAD) for first, stop in segs]
+    return TradingEnv(make_prices(LEAD + count), shifted)
 
 
 def test_segments_shorter_than_the_window_plus_a_step_are_skipped_entirely():
@@ -88,7 +91,7 @@ def test_flat_policy_earns_nothing_and_never_changes_position():
 def test_long_policy_is_flattened_at_each_segment_end_and_pays_spread_both_ways():
     env = env_for([(0, 100), (120, 220)])
     s = evaluation.score(env, always(2))
-    p = env.mid[:, 3]
+    p = env.mid[LEAD:, 3]
     gross = (p[99] - p[N]) + (p[219] - p[120 + N])
     assert s.metrics.net_pips == pytest.approx(gross / PIP - 4 * 0.5)
     assert s.position_changes == (2, 2)
@@ -165,7 +168,7 @@ def test_turnover_plan_for_zero_changes_stays_flat():
 def test_buy_and_hold_is_long_from_each_segment_start_and_flat_at_the_end():
     env = env_for([(0, 100), (120, 220)])
     s = evaluation.buy_and_hold(env)
-    p = env.mid[:, 3]
+    p = env.mid[LEAD:, 3]
     gross = (p[99] - p[N]) + (p[219] - p[120 + N])
     assert s.position_changes == (2, 2)  # enter once, flatten once, per Segment
     assert s.metrics.net_pips == pytest.approx(gross / PIP - 4 * 0.5)
