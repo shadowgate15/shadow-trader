@@ -6,12 +6,18 @@ from gymnasium import spaces
 from gymnasium.utils.env_checker import check_env
 
 from shadow_trader import config
-from shadow_trader.env import FAMILIES, FEATURE_COUNT, TradingEnv, _volatility_series
+from shadow_trader.env import (
+    FAMILIES,
+    FEATURE_COUNT,
+    LOOKBACK,
+    TradingEnv,
+    _volatility_series,
+)
 from shadow_trader.segments import Segment
 
 N = 24
 SCALE = 1e4
-LEAD = 300  # leading history: more than the 288-Bar lookback a Segment needs
+LEAD = LOOKBACK + 12  # leading history: more than the lookback a Segment needs
 RETURN_HORIZONS = (48, 144, 288)
 SMA_SPANS = (48, 288)
 RANGE_HORIZONS = (48, 288)
@@ -443,3 +449,40 @@ def test_range_blocks_ignore_later_bars_but_not_earlier_ones():
     obs3, _ = obs_after(earlier, segs, 3)
     assert not np.array_equal(range_blocks(obs)[1], range_blocks(obs3)[1])
     assert np.array_equal(range_blocks(obs)[0], range_blocks(obs3)[0])
+
+
+def test_lookback_continues_through_a_previous_segment_shorter_than_the_horizon():
+    prices = make_prices(900)
+    segs = [(0, 200), (210, 310), (320, 900)]  # middle one is far shorter than 288
+    env = TradingEnv(prices, segs)
+    assert env.segments == [(320, 900)]
+    obs, info = env.reset(options={"segment": 0})
+    t = info["bar"]
+    assert t - 288 < 200  # reaches past the short Segment into the earlier one
+    for block, h in zip(return_blocks(obs), RETURN_HORIZONS, strict=True):
+        np.testing.assert_allclose(
+            block, ref_return_block(prices, t, h), rtol=1e-4, atol=1e-6
+        )
+
+
+def test_observation_width_is_pinned_and_float32():
+    env = env_for()
+    assert env.observation_space.shape == (289,)
+    assert env.observation_space.dtype == np.float32
+    check_env(env, skip_render_check=True)
+    obs, _ = env.reset(options={"segment": 0})
+    assert obs.shape == (289,)
+    assert obs.dtype == np.float32
+
+
+def test_every_feature_value_is_finite_at_every_usable_segment_start():
+    prices = make_prices(2000)
+    segs = [(LEAD, 900), (1000, 2000)]
+    env = TradingEnv(prices, segs)
+    assert len(env.segments) == 2
+    for i in range(len(env.segments)):
+        obs, _ = env.reset(options={"segment": i})
+        assert np.isfinite(obs).all()
+        for _ in range(5):
+            obs, *_ = env.step(1)
+            assert np.isfinite(obs).all()
