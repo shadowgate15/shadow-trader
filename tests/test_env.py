@@ -42,7 +42,10 @@ def run_to_end(env: TradingEnv, action: int = 1):
 def test_spaces():
     env = env_for()
     assert env.observation_space == spaces.Box(
-        -np.inf, np.inf, (1 + 3 * N + 3 * N,), np.float32
+        -np.inf,
+        np.inf,
+        (1 + 3 * N + (len(RETURN_HORIZONS) + len(SMA_SPANS)) * N,),
+        np.float32,
     )
     assert env.action_space == spaces.Discrete(3)
 
