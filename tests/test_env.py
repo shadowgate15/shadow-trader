@@ -6,7 +6,7 @@ from gymnasium import spaces
 from gymnasium.utils.env_checker import check_env
 
 from shadow_trader import config
-from shadow_trader.env import FAMILIES, FEATURE_COUNT, TradingEnv
+from shadow_trader.env import FAMILIES, FEATURE_COUNT, TradingEnv, _volatility_series
 from shadow_trader.segments import Segment
 
 N = 24
@@ -269,7 +269,7 @@ def volatility_blocks(obs):
     may sit before or after them."""
     k = 0
     for family in FAMILIES:
-        if family.precompute.__name__ == "_volatility_series":
+        if family.precompute is _volatility_series:
             base = 1 + 3 * N + k * N
             return [
                 obs[base + i * N : base + (i + 1) * N]
@@ -382,7 +382,6 @@ def test_range_blocks_look_back_across_a_gap():
 
 
 def test_range_blocks_ignore_later_bars_but_not_earlier_ones():
->>>>>>> spec-181-features
     prices = make_prices(LEAD + 400)
     segs = [(LEAD, LEAD + 400)]
     obs, t = obs_after(prices, segs, 3)
