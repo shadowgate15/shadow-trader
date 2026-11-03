@@ -13,13 +13,19 @@ from shadow_trader import bars, cli, config, training
 
 T0 = datetime(2016, 1, 4, tzinfo=UTC)
 M5 = timedelta(minutes=5)
-COUNT = 3000
+LEAD = 400  # leading Bars before the first Gap: lookback for the run after it
+RUN = 3000
+COUNT = LEAD + RUN
 TINY_PPO = {**config.PPO, "n_steps": 64, "batch_size": 32, "n_epochs": 2}
 
 
 @pytest.fixture
 def stored_bars(tmp_path, monkeypatch):
-    """Synthetic Bars on disk: one contiguous run, enough for a train Episode."""
+    """Synthetic Bars on disk: a short leading run, a Gap, then one long run.
+
+    The leading run is the first Segment of History, so it is dropped as unusable
+    and only serves as Feature lookback for the long run.
+    """
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     rng = np.random.default_rng(1)
     close = 1.1 + np.cumsum(rng.normal(0, 1e-4, COUNT))
@@ -30,7 +36,8 @@ def stored_bars(tmp_path, monkeypatch):
     for field, values in zip(bars.FIELDS, (open_, high, low, close), strict=True):
         cols[f"bid_{field}"] = list(values - 5e-5)
         cols[f"ask_{field}"] = list(values + 5e-5)
-    times = [T0 + i * M5 for i in range(COUNT)]
+    gap = timedelta(hours=6)  # a large Gap: at least GAP_THRESHOLD
+    times = [T0 + i * M5 + (gap if i >= LEAD else timedelta(0)) for i in range(COUNT)]
     path = bars.bars_path()
     path.parent.mkdir(parents=True)
     pq.write_table(pa.table({"time": times, **cols}, schema=bars.SCHEMA), path)
@@ -75,7 +82,7 @@ def test_cli_train_saves_a_loadable_model_and_prints_progress(
     assert path == config.DATA_DIR / "model" / "ppo_eurusd.zip"
     model = PPO.load(path, device="cpu")
     assert model.seed == 42
-    assert model.policy.observation_space.shape == (73,)
+    assert model.policy.observation_space.shape == (145,)
 
 
 def test_config_pins_the_requested_run():

@@ -34,6 +34,10 @@ GAP_THRESHOLD_BARS = GAP_THRESHOLD // BAR_INTERVAL  # 48 M5 Bars
 WINDOW_SIZE = 24  # N
 EPISODE_LENGTH = 288  # Bars
 
+# Feature horizons in Bars, one tuple per family (M5: 48 = 4 h, 144 = 12 h,
+# 288 = 1 day). The Feature count and the required lookback derive from these.
+RETURN_HORIZONS = (48, 144, 288)
+
 TOTAL_TIMESTEPS = 1_000_000
 # Validation is scored every this many PPO rollouts (a count, so it never
 # misaligns with update boundaries), plus once at the final rollout.

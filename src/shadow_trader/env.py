@@ -9,9 +9,28 @@ Everything is marked to Mid; no fill is simulated at bid or ask.
 
 Warm-up. N log-return vectors need N+1 Bars, so the first Action of a Segment
 falls on its Bar N+1 (index ``first + N``) and no Reward accrues before it.
+
+Observation, float32, ``1 + 3N + F*N`` values (N = window size, F = Feature
+count): ``[Position, high log returns (N), low log returns (N), close log
+returns (N), then F Feature blocks of N]``. Every block runs oldest Bar to
+newest. Feature ``k`` at Window position ``j`` is that Feature evaluated at Bar
+``t - N + 1 + j``, so raw and Feature blocks line up Bar for Bar. Feature
+blocks follow ``FAMILIES`` order, ascending horizon within a family.
+
+Features. Each is derived only from Mid up to and including its Bar, precomputed
+once over the whole History's Mid (global Bar index) and sliced per step. They
+look back by Bar count across Gaps and Period boundaries; the raw Window does
+not. A Segment whose oldest Window Bar lacks the longest Feature lookback
+behind it is not usable and is dropped from ``segments``; its Bars still serve
+as lookback for later Segments.
+
+Adding a Feature family: add a horizon tuple to ``config``, a precompute
+function here, and one ``FeatureFamily`` entry in ``FAMILIES``.
 """
 
-from collections.abc import Mapping, Sequence
+import math
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import gymnasium as gym
@@ -23,6 +42,45 @@ from shadow_trader import config
 RETURN_SCALE = 1e4  # brings log returns onto a network-friendly scale; no clipping
 PIP = 1e-4
 POSITIONS = (-1.0, 0.0, 1.0)  # Action 0 = short, 1 = flat, 2 = long
+
+# Multi-horizon return Features: RETURN_SCALE / sqrt(h) lands every horizon at
+# comparable variance. Fixed constants, no clipping, no running statistics.
+RETURN_FEATURE_SCALES = tuple(
+    RETURN_SCALE / math.sqrt(h) for h in config.RETURN_HORIZONS
+)
+
+
+def _return_series(mid: np.ndarray, horizon: int, scale: float) -> np.ndarray:
+    """``scale * log(c_t / c_{t-h})`` per Bar; NaN where fewer than h Bars precede."""
+    close = mid[:, 3]
+    out = np.full(len(close), np.nan)
+    if len(close) > horizon:
+        out[horizon:] = scale * np.log(close[horizon:] / close[:-horizon])
+    return out
+
+
+@dataclass(frozen=True)
+class FeatureFamily:
+    """One family of Feature series, one per horizon, in ascending horizon order.
+
+    ``reach(h)``: how many Bars before Bar ``t`` a series of horizon ``h`` reads.
+    ``precompute(mid, h, scale)``: the whole-History series, NaN where lacking
+    history. ``scales`` has one entry per horizon.
+    """
+
+    horizons: tuple[int, ...]
+    scales: tuple[float, ...]
+    reach: Callable[[int], int]
+    precompute: Callable[[np.ndarray, int, float], np.ndarray]
+
+
+FAMILIES: tuple[FeatureFamily, ...] = (
+    FeatureFamily(
+        config.RETURN_HORIZONS, RETURN_FEATURE_SCALES, lambda h: h, _return_series
+    ),
+)
+FEATURE_COUNT = sum(len(f.horizons) for f in FAMILIES)
+LOOKBACK = max(f.reach(h) for f in FAMILIES for h in f.horizons)  # Bars
 
 
 class TradingEnv(gym.Env):
@@ -53,12 +111,14 @@ class TradingEnv(gym.Env):
     ) -> None:
         super().__init__()
         self.mid = np.asarray(mid, dtype=np.float64)
-        self.segments = [_range(s) for s in segments]
         self.window_size = window_size
+        self.segments = [r for r in map(_range, segments) if self._usable(r[0])]
         self.episode_length = episode_length
         self.spread_pips = spread_pips
         n = window_size
-        self.observation_space = spaces.Box(-np.inf, np.inf, (3 * n + 1,), np.float32)
+        self.observation_space = spaces.Box(
+            -np.inf, np.inf, (1 + (3 + FEATURE_COUNT) * n,), np.float32
+        )
         self.action_space = spaces.Discrete(3)
 
         # High, Low, Close as log returns against the PREVIOUS Bar's Mid Close.
@@ -68,10 +128,22 @@ class TradingEnv(gym.Env):
         returns = np.zeros((len(self.mid), 3))
         returns[1:] = RETURN_SCALE * np.log(self.mid[1:, 1:4] / base)
         self._returns = returns
+        self._features = np.column_stack(
+            [
+                family.precompute(self.mid, h, scale)
+                for family in FAMILIES
+                for h, scale in zip(family.horizons, family.scales, strict=True)
+            ]
+        )
 
         self._bar = 0
         self._last = 0  # last Bar of the current run
         self._position = 0.0
+
+    def _usable(self, first: int) -> bool:
+        # The oldest Window Bar is first + 1; the Feature needing the most
+        # history there reaches LOOKBACK Bars back (and the raw return one).
+        return first + 1 - max(LOOKBACK, 1) >= 0
 
     def _observation(self) -> np.ndarray:
         # Deliberately NOT in the vector:
@@ -82,10 +154,14 @@ class TradingEnv(gym.Env):
         # - No clock or calendar feature (hour, day of week, session marker).
         #   The MVP asks whether price movement alone carries signal; a clock
         #   answers a different question.
-        # Layout: Position first, then the high, low, close blocks (channel-major).
+        # Layout: Position, the high, low, close blocks (channel-major), then
+        # the Feature blocks in FAMILIES order.
         t, n = self._bar, self.window_size
         window = self._returns[t - n + 1 : t + 1]  # (n, 3): high, low, close
-        return np.concatenate([[self._position], window.T.ravel()]).astype(np.float32)
+        features = self._features[t - n + 1 : t + 1]  # (n, F)
+        return np.concatenate(
+            [[self._position], window.T.ravel(), features.T.ravel()]
+        ).astype(np.float32)
 
     def reset(
         self,
