@@ -25,8 +25,12 @@ The learned policy that chooses an Action at each Bar.
 _Avoid_: Bot, model, strategy
 
 **Observation**:
-Everything the Agent sees at a Bar: how Mid moved over a Window, together with its own current Position. Nothing else — no indicators, no clock, and no view of the Spread.
-_Avoid_: State, features, input
+Everything the Agent sees at a Bar: how Mid moved over a Window, Features derived from Mid, and its own current Position. Nothing else: no clock, no volume, and no view of the Spread.
+_Avoid_: State, input
+
+**Feature**:
+A quantity derived only from Mid up to and including a Bar, with one value per Bar across the Window, carried alongside the raw Window.
+_Avoid_: Indicator, signal, input
 
 **Window**:
 The fixed-length run of consecutive Bars ending at the current Bar whose Mid movement the Observation carries. Never spans a large Gap.
@@ -65,7 +69,7 @@ A simple policy the Agent must beat on the test period under the same Spread cos
 _Avoid_: Benchmark
 
 **Gap**:
-A break in the Bar series, such as a weekend or missing data. Windows, Episodes and Segments never span a large Gap.
+A break in the Bar series, such as a weekend or missing data. Windows, Episodes and Segments never span a large Gap; Features are the exception and look back across it by Bar count.
 _Avoid_: Hole, missing data
 
 **Segment**:
@@ -73,5 +77,5 @@ One contiguous stretch of Bars between large Gaps, in practice a trading week. E
 _Avoid_: Session, week, run
 
 **Warm-up**:
-The Bars at the start of a Segment before a full Window exists. The Agent takes no Action there and no Reward accrues, so they are not judged.
+The Bars at the start of a Segment before a full Window of 24 Bars exists. The Agent takes no Action there and no Reward accrues, so they are not judged.
 _Avoid_: Burn-in, priming, ramp
