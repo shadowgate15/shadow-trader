@@ -12,6 +12,7 @@ N = 24
 SCALE = 1e4
 LEAD = 300  # leading history: more than the 288-Bar lookback a Segment needs
 RETURN_HORIZONS = (48, 144, 288)
+SMA_SPANS = (48, 288)
 
 
 def make_prices(count: int, seed: int = 0) -> np.ndarray:
@@ -257,3 +258,51 @@ def test_a_shock_gives_large_unclipped_return_features():
     prices[LEAD + 6 :] *= 1.5  # permanent 50% jump at Bar LEAD + 6
     obs, _ = obs_after(prices, [(LEAD, LEAD + 400)], 3)
     assert return_blocks(obs)[0].max() > 500  # 1e4 * ln(1.5) / sqrt(48) = 585
+
+
+# --- SMA distance Features (#184) ---------------------------------------------
+
+
+def ref_sma_block(prices, t, n):
+    """Independent reference: scaled log(c_b / mean(c[b-n+1..b])) for 24 Bars to t."""
+    c = prices[:, 3]
+    return [
+        SCALE / math.sqrt(n) * math.log(c[b] / (sum(c[b - n + 1 : b + 1]) / n))
+        for b in range(t - N + 1, t + 1)
+    ]
+
+
+def sma_blocks(obs):
+    base = 1 + 3 * N + len(RETURN_HORIZONS) * N
+    return [obs[base + k * N : base + (k + 1) * N] for k in range(len(SMA_SPANS))]
+
+
+def test_sma_blocks_follow_the_return_blocks_and_match_the_reference():
+    prices = make_prices(LEAD + 400)
+    obs, t = obs_after(prices, [(LEAD, LEAD + 400)], 5)
+    for block, n in zip(sma_blocks(obs), SMA_SPANS, strict=True):
+        np.testing.assert_allclose(
+            block, ref_sma_block(prices, t, n), rtol=1e-3, atol=1e-5
+        )
+
+
+def test_sma_features_look_back_across_a_gap_and_ignore_the_future():
+    prices = make_prices(900)
+    env = TradingEnv(prices, [(0, 500), (600, 900)])
+    obs, info = env.reset(options={"segment": 0})
+    t = info["bar"]
+    for block, n in zip(sma_blocks(obs), SMA_SPANS, strict=True):
+        np.testing.assert_allclose(
+            block, ref_sma_block(prices, t, n), rtol=1e-3, atol=1e-5
+        )
+    later = prices.copy()
+    later[t + 1 :] *= 1.3
+    obs2, _ = TradingEnv(later, [(0, 500), (600, 900)]).reset(options={"segment": 0})
+    assert obs.tobytes() == obs2.tobytes()
+
+
+def test_observation_width_counts_the_sma_blocks():
+    env = env_for()
+    expected = 1 + 3 * N + (len(RETURN_HORIZONS) + len(SMA_SPANS)) * N
+    assert env.observation_space.shape == (expected,)
+    check_env(env, skip_render_check=True)

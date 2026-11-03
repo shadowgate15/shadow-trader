@@ -9,7 +9,7 @@ import pytest
 import torch
 from stable_baselines3 import PPO
 
-from shadow_trader import bars, cli, config, training
+from shadow_trader import bars, cli, config, env, training
 
 T0 = datetime(2016, 1, 4, tzinfo=UTC)
 M5 = timedelta(minutes=5)
@@ -82,7 +82,9 @@ def test_cli_train_saves_a_loadable_model_and_prints_progress(
     assert path == config.DATA_DIR / "model" / "ppo_eurusd.zip"
     model = PPO.load(path, device="cpu")
     assert model.seed == 42
-    assert model.policy.observation_space.shape == (145,)
+    assert model.policy.observation_space.shape == (
+        env.FEATURE_COUNT * config.WINDOW_SIZE + 1 + 3 * config.WINDOW_SIZE,
+    )
 
 
 def test_config_pins_the_requested_run():

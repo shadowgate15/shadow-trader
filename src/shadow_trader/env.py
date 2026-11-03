@@ -49,6 +49,8 @@ RETURN_FEATURE_SCALES = tuple(
     RETURN_SCALE / math.sqrt(h) for h in config.RETURN_HORIZONS
 )
 
+SMA_FEATURE_SCALES = tuple(RETURN_SCALE / math.sqrt(n) for n in config.SMA_SPANS)
+
 
 def _return_series(mid: np.ndarray, horizon: int, scale: float) -> np.ndarray:
     """``scale * log(c_t / c_{t-h})`` per Bar; NaN where fewer than h Bars precede."""
@@ -56,6 +58,17 @@ def _return_series(mid: np.ndarray, horizon: int, scale: float) -> np.ndarray:
     out = np.full(len(close), np.nan)
     if len(close) > horizon:
         out[horizon:] = scale * np.log(close[horizon:] / close[:-horizon])
+    return out
+
+
+def _sma_series(mid: np.ndarray, span: int, scale: float) -> np.ndarray:
+    """``scale * log(c_t / SMA_n)`` per Bar; NaN where fewer than n-1 Bars precede."""
+    close = mid[:, 3]
+    out = np.full(len(close), np.nan)
+    if len(close) >= span:
+        csum = np.concatenate([[0.0], np.cumsum(close)])
+        sma = (csum[span:] - csum[:-span]) / span
+        out[span - 1 :] = scale * np.log(close[span - 1 :] / sma)
     return out
 
 
@@ -78,6 +91,7 @@ FAMILIES: tuple[FeatureFamily, ...] = (
     FeatureFamily(
         config.RETURN_HORIZONS, RETURN_FEATURE_SCALES, lambda h: h, _return_series
     ),
+    FeatureFamily(config.SMA_SPANS, SMA_FEATURE_SCALES, lambda n: n - 1, _sma_series),
 )
 FEATURE_COUNT = sum(len(f.horizons) for f in FAMILIES)
 LOOKBACK = max(f.reach(h) for f in FAMILIES for h in f.horizons)  # Bars
