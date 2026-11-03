@@ -82,9 +82,10 @@ class TradingEnv(gym.Env):
         # - No clock or calendar feature (hour, day of week, session marker).
         #   The MVP asks whether price movement alone carries signal; a clock
         #   answers a different question.
+        # Layout: Position first, then the high, low, close blocks (channel-major).
         t, n = self._bar, self.window_size
         window = self._returns[t - n + 1 : t + 1]  # (n, 3): high, low, close
-        return np.concatenate([window.T.ravel(), [self._position]]).astype(np.float32)
+        return np.concatenate([[self._position], window.T.ravel()]).astype(np.float32)
 
     def reset(
         self,

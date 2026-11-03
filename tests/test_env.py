@@ -55,8 +55,10 @@ def test_observation_holds_scaled_log_returns_against_previous_close():
     bars = range(t - N + 1, t + 1)
     for ch, col in enumerate((1, 2, 3)):  # high, low, close
         expected = [SCALE * math.log(prices[b, col] / prices[b - 1, 3]) for b in bars]
-        np.testing.assert_allclose(obs[ch * N : (ch + 1) * N], expected, rtol=1e-4)
-    assert obs[-1] == 0.0
+        np.testing.assert_allclose(
+            obs[1 + ch * N : 1 + (ch + 1) * N], expected, rtol=1e-4
+        )
+    assert obs[0] == 0.0
     assert obs.dtype == np.float32
 
 
@@ -67,15 +69,15 @@ def test_observation_is_not_clipped():
     env.reset(options={"segment": 0})
     for _ in range(6):
         obs, *_ = env.step(1)
-    assert obs[:N].max() > 3000
+    assert obs[1 : 1 + N].max() > 3000
 
 
-def test_position_is_last_observation_element_and_target_not_increment():
+def test_position_is_first_observation_element_and_target_not_increment():
     env = env_for()
     env.reset(seed=0, options={"segment": 0})
     for action, pos in [(2, 1.0), (2, 1.0), (0, -1.0), (1, 0.0)]:
         obs, *_ = env.step(action)
-        assert obs[-1] == pos
+        assert obs[0] == pos
 
 
 def test_reward_is_pnl_on_position_held_minus_half_spread_per_unit():
