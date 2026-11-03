@@ -11,11 +11,12 @@ Warm-up. N log-return vectors need N+1 Bars, so the first Action of a Segment
 falls on its Bar N+1 (index ``first + N``) and no Reward accrues before it.
 
 Observation, float32, ``1 + 3N + F*N`` values (N = window size, F = Feature
-count): ``[Position, high log returns (N), low log returns (N), close log
-returns (N), then F Feature blocks of N]``. Every block runs oldest Bar to
-newest. Feature ``k`` at Window position ``j`` is that Feature evaluated at Bar
-``t - N + 1 + j``, so raw and Feature blocks line up Bar for Bar. Feature
-blocks follow ``FAMILIES`` order, ascending horizon within a family.
+count; 289 for N = 24, F = 9): ``[Position, high log returns (N), low log
+returns (N), close log returns (N), then F Feature blocks of N]``. Every block
+runs oldest Bar to newest. Feature ``k`` at Window position ``j`` is that
+Feature evaluated at Bar ``t - N + 1 + j``, so raw and Feature blocks line up
+Bar for Bar. Feature blocks follow ``FAMILIES`` order, ascending horizon within
+a family.
 
 Features. Each is derived only from Mid up to and including its Bar, precomputed
 once over the whole History's Mid (global Bar index) and sliced per step. They
@@ -221,7 +222,9 @@ class TradingEnv(gym.Env):
         #   the network a constant and waste a quarter of the width.
         # - No clock or calendar feature (hour, day of week, session marker).
         #   The MVP asks whether price movement alone carries signal; a clock
-        #   answers a different question.
+        #   answers a different question. Features are Mid-derived price
+        #   context only; no clock, volume, Spread, other-pair or Position
+        #   history Feature either.
         # Layout: Position, the high, low, close blocks (channel-major), then
         # the Feature blocks in FAMILIES order.
         t, n = self._bar, self.window_size

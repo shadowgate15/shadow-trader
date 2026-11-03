@@ -12,7 +12,8 @@ Every item below is a **scope boundary**, settled deliberately. None is a bug to
 4. **One source.** The FXCM free repository of weekly m1 files, never spliced with another vendor. The vendor's own crossed and zero-Spread rows are kept unaltered; no cross-side check or clamping is applied.
 5. **A single pinned date range.** History is pinned to 2016-01-04 to 2024-08-23 UTC, so the Split is stable and results are comparable to each other.
 6. **One fixed Position size.** Short, flat or long, always one unit. No sizing and no leverage.
-7. **No clock or calendar feature of any kind.** The Observation is Mid movement over a Window plus the current Position. Nothing else.
+7. **No clock or calendar feature of any kind.** The Observation is Mid movement over a Window, plus Features derived from Mid, plus the current Position. Nothing else.
+   Features include the weekend jump: they look back across Gaps by Bar count, so early-week values reflect the prior week. The first Segment of History is used only as lookback and is dropped from training and evaluation.
 8. **A single seeded configuration, not a swept one.** One seed, one configuration.
 
 ## Known limitations of the design
