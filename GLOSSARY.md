@@ -77,5 +77,5 @@ One contiguous stretch of Bars between large Gaps, in practice a trading week. E
 _Avoid_: Session, week, run
 
 **Warm-up**:
-The Bars at the start of a Segment before a full Window of 24 Bars exists. The Agent takes no Action there and no Reward accrues, so they are not judged.
+The Bars at the start of a Segment before a full Window exists. The Agent takes no Action there and no Reward accrues, so they are not judged.
 _Avoid_: Burn-in, priming, ramp

@@ -7,10 +7,12 @@ from test_env import make_prices
 from test_training import TINY_PPO, stored_bars  # noqa: F401
 
 from shadow_trader import cli, config, evaluation, training
-from shadow_trader.env import PIP, POSITIONS, TradingEnv
+from shadow_trader.env import LOOKBACK, PIP, POSITIONS, TradingEnv
 
 N = 24
-LEAD = 300  # leading history so no Segment is dropped for lack of Feature lookback
+LEAD = (
+    LOOKBACK + 12
+)  # leading history so no Segment is dropped for lack of Feature lookback
 
 
 def test_metrics_net_return_in_pips_and_percent_of_notional():

@@ -11,7 +11,7 @@ Warm-up. N log-return vectors need N+1 Bars, so the first Action of a Segment
 falls on its Bar N+1 (index ``first + N``) and no Reward accrues before it.
 
 Observation, float32, ``1 + 3N + F*N`` values (N = window size, F = Feature
-count; 289 for N = 24, F = 9): ``[Position, high log returns (N), low log
+count): ``[Position, high log returns (N), low log
 returns (N), close log returns (N), then F Feature blocks of N]``. Every block
 runs oldest Bar to newest. Feature ``k`` at Window position ``j`` is that
 Feature evaluated at Bar ``t - N + 1 + j``, so raw and Feature blocks line up
@@ -20,7 +20,7 @@ a family.
 
 Features. Each is derived only from Mid up to and including its Bar, precomputed
 once over the whole History's Mid (global Bar index) and sliced per step. They
-look back by Bar count across Gaps and Period boundaries; the raw Window does
+look back by Bar count across Gaps and Segment boundaries; the raw Window does
 not. A Segment whose oldest Window Bar lacks the longest Feature lookback
 behind it is not usable and is dropped from ``segments``; its Bars still serve
 as lookback for later Segments.
@@ -54,6 +54,9 @@ SMA_FEATURE_SCALES = tuple(RETURN_SCALE / math.sqrt(n) for n in config.SMA_SPANS
 
 # Volatility Features: RETURN_SCALE * stdev only, no horizon adjustment.
 VOLATILITY_FEATURE_SCALES = tuple(RETURN_SCALE for _ in config.VOLATILITY_HORIZONS)
+
+# Range position is raw 0 to 1: no scaling, no recentring.
+RANGE_FEATURE_SCALES = (1.0,) * len(config.RANGE_HORIZONS)
 
 
 def _return_series(mid: np.ndarray, horizon: int, scale: float) -> np.ndarray:
@@ -94,10 +97,6 @@ def _volatility_series(mid: np.ndarray, horizon: int, scale: float) -> np.ndarra
                 windows[i : i + 8192], axis=1, ddof=1
             )
     return out
-
-
-# Range position is raw 0 to 1: no scaling, no recentring.
-RANGE_FEATURE_SCALES = (1.0,) * len(config.RANGE_HORIZONS)
 
 
 def _range_series(mid: np.ndarray, horizon: int, scale: float) -> np.ndarray:

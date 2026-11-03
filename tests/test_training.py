@@ -10,11 +10,13 @@ import torch
 from stable_baselines3 import PPO
 
 from shadow_trader import bars, cli, config, training
-from shadow_trader.env import FEATURE_COUNT
+from shadow_trader.env import FEATURE_COUNT, LOOKBACK
 
 T0 = datetime(2016, 1, 4, tzinfo=UTC)
 M5 = timedelta(minutes=5)
-LEAD = 400  # leading Bars before the first Gap: lookback for the run after it
+LEAD = (
+    LOOKBACK + 112
+)  # leading Bars before the first Gap: lookback for the run after it
 RUN = 3000
 COUNT = LEAD + RUN
 TINY_PPO = {**config.PPO, "n_steps": 64, "batch_size": 32, "n_epochs": 2}
