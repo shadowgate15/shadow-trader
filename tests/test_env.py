@@ -13,6 +13,7 @@ N = 24
 SCALE = 1e4
 LEAD = 300  # leading history: more than the 288-Bar lookback a Segment needs
 RETURN_HORIZONS = (48, 144, 288)
+RANGE_HORIZONS = (48, 288)
 
 
 def make_prices(count: int, seed: int = 0) -> np.ndarray:
@@ -42,7 +43,7 @@ def run_to_end(env: TradingEnv, action: int = 1):
 def test_spaces():
     env = env_for()
     assert env.observation_space == spaces.Box(
-        -np.inf, np.inf, (1 + (3 + FEATURE_COUNT) * N,), np.float32
+        -np.inf, np.inf, (1 + 3 * N + FEATURE_COUNT * N,), np.float32
     )
     assert env.action_space == spaces.Discrete(3)
 
@@ -319,7 +320,8 @@ def test_volatility_looks_back_across_a_gap_and_includes_its_jump():
         np.testing.assert_allclose(
             block, ref_volatility_block(prices, t, n), rtol=1e-4, atol=1e-6
         )
-    assert volatility_blocks(obs)[1].min() > 5  # 1e4 * ln(1.02) / sqrt(288) = 11.7 vs ~1 without the jump
+    # 1e4 * ln(1.02) / sqrt(288) = 11.7, against ~1 without the jump
+    assert volatility_blocks(obs)[1].min() > 5
 
 
 def test_volatility_at_t_ignores_later_bars():
@@ -330,3 +332,66 @@ def test_volatility_at_t_ignores_later_bars():
     later[t + 1 :] *= 1.3
     obs2, _ = obs_after(later, segs, 3)
     assert obs.tobytes() == obs2.tobytes()
+
+
+# --- Range position Features (#186) -------------------------------------------
+
+
+def ref_range_block(prices, t, n):
+    """Independent reference: (c - min l) / (max h - min l) over the n Bars to b."""
+    out = []
+    for b in range(t - N + 1, t + 1):
+        lo = min(prices[i, 2] for i in range(b - n + 1, b + 1))
+        hi = max(prices[i, 1] for i in range(b - n + 1, b + 1))
+        out.append(0.5 if hi == lo else (prices[b, 3] - lo) / (hi - lo))
+    return out
+
+
+def range_blocks(obs):
+    """The range blocks are last in FAMILIES order: 48 then 288."""
+    return [obs[len(obs) - 2 * N : len(obs) - N], obs[len(obs) - N :]]
+
+
+def test_range_blocks_match_the_reference_and_stay_within_zero_to_one():
+    prices = make_prices(LEAD + 400)
+    for steps in (0, 5, 100):
+        obs, t = obs_after(prices, [(LEAD, LEAD + 400)], steps)
+        for block, n in zip(range_blocks(obs), RANGE_HORIZONS, strict=True):
+            np.testing.assert_allclose(
+                block, ref_range_block(prices, t, n), rtol=1e-4, atol=1e-6
+            )
+            assert block.min() >= 0.0 and block.max() <= 1.0
+
+
+def test_constant_price_stretch_reads_exactly_half_and_is_finite():
+    prices = make_prices(LEAD + 400)
+    prices[LEAD - 300 :] = 1.2  # every Bar flat, so every range is flat
+    obs, _ = obs_after(prices, [(LEAD, LEAD + 400)], 3)
+    for block in range_blocks(obs):
+        assert np.all(np.isfinite(block))
+        assert np.all(block == np.float32(0.5))
+
+
+def test_range_blocks_look_back_across_a_gap():
+    prices = make_prices(900)
+    env = TradingEnv(prices, [(0, 500), (600, 900)])
+    obs, info = env.reset(options={"segment": 0})
+    for block, n in zip(range_blocks(obs), RANGE_HORIZONS, strict=True):
+        expected = ref_range_block(prices, info["bar"], n)
+        np.testing.assert_allclose(block, expected, rtol=1e-4, atol=1e-6)
+
+
+def test_range_blocks_ignore_later_bars_but_not_earlier_ones():
+>>>>>>> spec-181-features
+    prices = make_prices(LEAD + 400)
+    segs = [(LEAD, LEAD + 400)]
+    obs, t = obs_after(prices, segs, 3)
+    later = prices.copy()
+    later[t + 1 :] *= 1.3
+    obs2, _ = obs_after(later, segs, 3)
+    assert obs[-2 * N :].tobytes() == obs2[-2 * N :].tobytes()
+    earlier = prices.copy()
+    earlier[t - 100, 1] += 0.05  # a high 100 Bars back lies inside the 288 range only
+    obs3, _ = obs_after(earlier, segs, 3)
+    assert not np.array_equal(range_blocks(obs)[1], range_blocks(obs3)[1])
+    assert np.array_equal(range_blocks(obs)[0], range_blocks(obs3)[0])

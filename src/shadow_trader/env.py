@@ -82,6 +82,28 @@ def _volatility_series(mid: np.ndarray, horizon: int, scale: float) -> np.ndarra
     return out
 
 
+# Range position is raw 0 to 1: no scaling, no recentring.
+RANGE_FEATURE_SCALES = (1.0,) * len(config.RANGE_HORIZONS)
+
+
+def _range_series(mid: np.ndarray, horizon: int, scale: float) -> np.ndarray:
+    """``(c_t - min l) / (max h - min l)`` over the ``horizon`` Bars to ``t``.
+
+    A flat range reads exactly 0.5. NaN where fewer than ``horizon`` Bars exist.
+    """
+    n = len(mid)
+    out = np.full(n, np.nan)
+    if n >= horizon:
+        windows = np.lib.stride_tricks.sliding_window_view
+        high = windows(mid[:, 1], horizon).max(axis=1)
+        low = windows(mid[:, 2], horizon).min(axis=1)
+        span = high - low
+        flat = span == 0
+        pos = (mid[horizon - 1 :, 3] - low) / np.where(flat, 1.0, span)
+        out[horizon - 1 :] = scale * np.where(flat, 0.5, pos)
+    return out
+
+
 @dataclass(frozen=True)
 class FeatureFamily:
     """One family of Feature series, one per horizon, in ascending horizon order.
@@ -106,6 +128,9 @@ FAMILIES: tuple[FeatureFamily, ...] = (
         VOLATILITY_FEATURE_SCALES,
         lambda n: n,
         _volatility_series,
+    ),
+    FeatureFamily(
+        config.RANGE_HORIZONS, RANGE_FEATURE_SCALES, lambda h: h - 1, _range_series
     ),
 )
 FEATURE_COUNT = sum(len(f.horizons) for f in FAMILIES)
