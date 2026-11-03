@@ -304,7 +304,7 @@ def test_sma_features_look_back_across_a_gap_and_ignore_the_future():
 
 def test_observation_width_counts_the_sma_blocks():
     env = env_for()
-    expected = 1 + 3 * N + (len(RETURN_HORIZONS) + len(SMA_SPANS)) * N
+    expected = 1 + 3 * N + FEATURE_COUNT * N
     assert env.observation_space.shape == (expected,)
     check_env(env, skip_render_check=True)
 
