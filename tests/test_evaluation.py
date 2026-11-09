@@ -69,10 +69,18 @@ def always(action):
     return lambda obs: action
 
 
-def env_for(segs, count=400):
+def env_for(segs, count=400, **kw):
     """Segments and indices are relative to the end of ``LEAD`` leading Bars."""
     shifted = [(first + LEAD, stop + LEAD) for first, stop in segs]
-    return TradingEnv(make_prices(LEAD + count), shifted)
+    return TradingEnv(make_prices(LEAD + count), shifted, **kw)
+
+
+def spread_env(segs, spread_by_bar, count=400, **kw):
+    """Like ``env_for`` with close Spread (pips) given per Bar (LEAD-relative)."""
+    spread = np.zeros(LEAD + count)
+    for bar, pips in spread_by_bar.items():
+        spread[LEAD + bar] = pips
+    return env_for(segs, count, close_spread_pips=spread, **kw)
 
 
 def test_segments_shorter_than_the_window_plus_a_step_are_skipped_entirely():
@@ -98,6 +106,34 @@ def test_long_policy_is_flattened_at_each_segment_end_and_pays_spread_both_ways(
     assert s.metrics.net_pips == pytest.approx(gross / PIP - 4 * 0.5)
     assert s.position_changes == (2, 2)
     assert s.metrics.segments == 2
+
+
+def test_final_flatten_pays_the_cost_of_the_segments_last_bar():
+    env = spread_env([(0, 100)], {99: 6.0, 98: 20.0})
+    s = evaluation.score(env, always(2))
+    p = env.mid[LEAD:, 3]
+    assert s.metrics.net_pips == pytest.approx((p[99] - p[N]) / PIP - 0.5 - 3.0)
+
+
+def test_buy_and_hold_pays_the_per_bar_cost_at_open_and_close():
+    env = spread_env([(0, 100), (120, 220)], {N: 4.0, 99: 8.0, 120 + N: 2.0})
+    s = evaluation.buy_and_hold(env)
+    p = env.mid[LEAD:, 3]
+    gross = (p[99] - p[N]) + (p[219] - p[120 + N])
+    # opens: 2.0 + 1.0; closes: 4.0 + 0.5 (floor at bar 219)
+    assert s.metrics.net_pips == pytest.approx(gross / PIP - (2.0 + 4.0 + 1.0 + 0.5))
+
+
+def test_random_baseline_pays_the_same_cost_function():
+    segs = [(0, 200)]
+    wide = spread_env(segs, {b: 4.0 for b in range(200)})
+    floor_4 = env_for(segs, spread_pips=4.0)
+    narrow = env_for(segs)
+    a = evaluation.random_baseline(wide, (8,), draws=3)
+    b = evaluation.random_baseline(floor_4, (8,), draws=3)
+    c = evaluation.random_baseline(narrow, (8,), draws=3)
+    assert [d.metrics for d in a] == [d.metrics for d in b]
+    assert [d.metrics.net_pips for d in a] != [d.metrics.net_pips for d in c]
 
 
 def test_bar_count_is_rewarded_bars_and_equity_has_no_cross_gap_return():

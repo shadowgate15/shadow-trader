@@ -6,9 +6,10 @@ use it, so every policy is treated identically.
 
 Ending flat. The environment does not force the Position flat, so after the
 last Bar's move the scorer closes whatever Position is open at that Bar's Mid
-and charges the usual Spread cost for it (half a spread per unit of Position
-crossed). That cost is subtracted from the Segment's final Reward and counts as
-one Position change. A Segment is entered flat, so no Position crosses a Gap.
+and charges the usual Spread cost for it, at the Segment's last Bar (half the
+per-Bar cost per unit of Position crossed). That cost is subtracted from the
+Segment's final Reward and counts as one Position change. A Segment is entered
+flat, so no Position crosses a Gap.
 
 Segments with fewer than ``window_size + 2`` Bars are skipped entirely: 25 Bars
 give one Observation but no Reward, so there is nothing to score.
@@ -104,7 +105,7 @@ def score(env: TradingEnv, policy: Policy) -> Score:
             obs, reward, _, truncated, _ = env.step(action)
             rs.append(reward)
             held.append(POSITIONS[action])
-        rs[-1] -= env.spread_pips / 2 * abs(held[-1])  # the final flatten
+        rs[-1] -= env.cost_pips[stop - 1] / 2 * abs(held[-1])  # the final flatten
         held.append(0.0)
         rewards.append(np.array(rs))
         changes.append(int(np.count_nonzero(np.diff(held))))

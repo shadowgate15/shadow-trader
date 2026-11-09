@@ -126,6 +126,52 @@ def test_spread_pips_is_configurable():
     )
 
 
+def spread_env(spread_by_bar: dict[int, float], **kw):
+    """Env whose close Spread (pips) is ``spread_by_bar`` and zero elsewhere."""
+    prices = make_prices(LEAD + 400)
+    spread = np.zeros(len(prices))
+    for bar, pips in spread_by_bar.items():
+        spread[bar] = pips
+    env = TradingEnv(prices, [(LEAD, LEAD + 400)], close_spread_pips=spread, **kw)
+    env.reset(options={"segment": 0})
+    return prices, env
+
+
+@pytest.mark.parametrize(
+    ("spread", "cost"),
+    [(0.0, 1.0), (-3.0, 1.0), (0.4, 1.0), (1.0, 1.0), (4.0, 4.0), (15.0, 15.0)],
+)
+def test_cost_is_the_floor_unless_the_spread_is_wider(spread, cost):
+    t = LEAD + N
+    prices, env = spread_env({t: spread})
+    _, r, *_ = env.step(2)  # open: half the cost
+    assert r == pytest.approx((prices[t + 1, 3] - prices[t, 3]) / 1e-4 - cost / 2)
+
+
+def test_the_decision_bars_spread_is_charged_not_the_next_bars():
+    t = LEAD + N
+    prices, env = spread_env({t: 6.0, t + 1: 20.0})
+    _, r, *_ = env.step(2)
+    assert r == pytest.approx((prices[t + 1, 3] - prices[t, 3]) / 1e-4 - 3.0)
+
+
+def test_open_pays_half_and_reversal_pays_the_full_decision_bar_cost():
+    t = LEAD + N
+    prices, env = spread_env({t: 4.0, t + 1: 6.0, t + 2: 8.0})
+    env.step(2)  # open at t: pays 2.0
+    _, r, *_ = env.step(2)  # hold at t+1: free
+    assert r == pytest.approx((prices[t + 2, 3] - prices[t + 1, 3]) / 1e-4)
+    _, r, *_ = env.step(0)  # reverse at t+2: two units of half of 8
+    assert r == pytest.approx(-(prices[t + 3, 3] - prices[t + 2, 3]) / 1e-4 - 8.0)
+
+
+def test_spread_pips_is_the_floor_for_the_spread_data():
+    t = LEAD + N
+    prices, env = spread_env({t: 1.5}, spread_pips=2.0)
+    _, r, *_ = env.step(2)
+    assert r == pytest.approx((prices[t + 1, 3] - prices[t, 3]) / 1e-4 - 1.0)
+
+
 def test_episode_is_288_steps_and_truncates():
     env = env_for(count=1300, segs=((LEAD, 1300),))
     env.reset(seed=3)
