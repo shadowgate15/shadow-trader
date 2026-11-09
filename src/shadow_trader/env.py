@@ -164,6 +164,12 @@ class TradingEnv(gym.Env):
     inside a single Segment. ``reset(options={"segment": i})`` instead runs
     the i-th Segment from its start through its last Bar, starting flat, for
     deterministic evaluation. ``info["bar"]`` is the Bar the next Action falls on.
+
+    Spread cost. ``close_spread_pips`` is the close Spread (ask close minus bid
+    close, in pips) of every Bar, or None for none. A Position change decided at
+    Bar ``t`` pays half of ``cost_pips[t] = max(close Spread at t, spread_pips)``
+    per unit changed, so ``spread_pips`` is the floor and Bar ``t+1``'s Spread is
+    never used.
     """
 
     metadata = {"render_modes": []}  # noqa: RUF012
@@ -176,13 +182,24 @@ class TradingEnv(gym.Env):
         window_size: int = config.WINDOW_SIZE,
         episode_length: int = config.EPISODE_LENGTH,
         spread_pips: float = config.SPREAD_PIPS,
+        close_spread_pips: np.ndarray | None = None,
     ) -> None:
         super().__init__()
         self.mid = np.asarray(mid, dtype=np.float64)
         self.window_size = window_size
         self.segments = [r for r in map(_range, segments) if self._usable(r[0])]
         self.episode_length = episode_length
-        self.spread_pips = spread_pips
+        self.spread_pips = spread_pips  # the floor on the per-Bar Spread cost
+        # Spread cost in pips of a Position change decided at each Bar:
+        # max(close Spread, floor). Zero, crossed and narrow Spreads all floor.
+        spread = (
+            np.zeros(len(self.mid))
+            if close_spread_pips is None
+            else np.asarray(close_spread_pips, dtype=np.float64)
+        )
+        if spread.shape != (len(self.mid),):
+            raise ValueError("close_spread_pips needs one value per Bar")
+        self.cost_pips = np.maximum(spread, spread_pips)
         n = window_size
         self.observation_space = spaces.Box(
             -np.inf, np.inf, (1 + (3 + FEATURE_COUNT) * n,), np.float32
@@ -263,10 +280,10 @@ class TradingEnv(gym.Env):
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         target = POSITIONS[int(action)]
-        cost = self.spread_pips / 2 * abs(target - self._position)
         t = self._bar
+        cost = self.cost_pips[t] / 2 * abs(target - self._position)
         move = (self.mid[t + 1, 3] - self.mid[t, 3]) / PIP
-        reward = target * move - cost
+        reward = target * move - float(cost)
         self._position = target
         self._bar = t + 1
         truncated = self._bar >= self._last

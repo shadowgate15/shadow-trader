@@ -25,6 +25,8 @@ KNOWN_MISSING_WEEKS = (
 # Chronological train / validation / test fractions.
 SPLIT = (0.70, 0.15, 0.15)
 
+# Floor, in pips, on the per-Bar Spread cost: a Position change decided at a Bar
+# pays half of max(that Bar's close Spread, SPREAD_PIPS) per unit changed.
 SPREAD_PIPS = 1.0
 
 BAR_INTERVAL = timedelta(minutes=5)
