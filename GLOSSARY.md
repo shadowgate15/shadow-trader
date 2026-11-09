@@ -13,7 +13,7 @@ The price midway between a Bar's bid and ask. The single price series the Agent 
 _Avoid_: Price, close, mid-market
 
 **Spread**:
-The ask minus the bid on a Bar. An indicative quantity rather than a price anyone could trade at: in History it is frequently zero and sometimes negative. Nothing in the MVP treats it as a cost; see Spread cost.
+The ask minus the bid on a Bar. An indicative quantity rather than a price anyone could trade at: in History it is frequently zero and sometimes negative. It sets the Spread cost, floored so that zero and crossed values never count as free: see Spread cost.
 _Avoid_: Bid-ask, gap
 
 **History**:
@@ -25,7 +25,7 @@ The learned policy that chooses an Action at each Bar.
 _Avoid_: Bot, model, strategy
 
 **Observation**:
-Everything the Agent sees at a Bar: how Mid moved over a Window, Features derived from Mid, and its own current Position. Nothing else: no clock, no volume, and no view of the Spread.
+Everything the Agent sees at a Bar: how Mid moved over a Window, Features derived from Mid, its own current Position, and the Spread cost of the current Bar as a single number in pips. Nothing else: no clock, no volume, no raw Spread, and no history of past Spread costs.
 _Avoid_: State, input
 
 **Feature**:
@@ -45,7 +45,7 @@ The Agent's current exposure: short, flat, or long, always one fixed size.
 _Avoid_: Trade, holding
 
 **Spread cost**:
-The cost charged whenever the Position changes: a fixed notional spread, not the Spread observed on the Bar. Half of it is charged for each unit of Position crossed, so a round trip and a direct reversal each pay one full spread. Set deliberately wider than the Spread seen in History, which is an indicative quote rather than a price anyone could trade at.
+The cost charged whenever the Position changes, set per Bar by the Spread: the Spread on the Bar where the Action is decided, floored at the configured floor (`SPREAD_PIPS`), so zero and crossed Spreads never make trading free. Half of it is charged for each unit of Position crossed, so a round trip and a direct reversal each pay one full spread. Genuine widening (rollover, week open) costs more than the floor. The same rule prices Agent Actions, the final flatten and both Baselines. The Agent sees the current Bar's Spread cost; the Baselines do not.
 _Avoid_: Fee, commission, slippage
 
 **Reward**:

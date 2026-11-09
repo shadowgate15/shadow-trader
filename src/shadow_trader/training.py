@@ -25,6 +25,7 @@ from shadow_trader.env import TradingEnv
 class Market:
     mid: np.ndarray  # (n, 4) Mid open/high/low/close, indexed by global Bar
     structure: segments.Structure
+    close_spread_pips: np.ndarray  # (n,) ask close minus bid close, in pips
 
     def make_env(self, period: segments.Period) -> TradingEnv:
         """The environment for one Period, with the configured settings."""
@@ -34,13 +35,15 @@ class Market:
             window_size=config.WINDOW_SIZE,
             episode_length=config.EPISODE_LENGTH,
             spread_pips=config.SPREAD_PIPS,
+            close_spread_pips=self.close_spread_pips,
         )
 
 
 def load_market() -> Market:
-    mid = bars.mid(pq.read_table(bars.bars_path()))
+    table = pq.read_table(bars.bars_path())
+    mid = bars.mid(table)
     mid_ohlc = np.column_stack([mid[f"mid_{f}"] for f in bars.FIELDS])
-    return Market(mid_ohlc, segments.load())
+    return Market(mid_ohlc, segments.load(), bars.close_spread_pips(table))
 
 
 def model_path() -> Path:

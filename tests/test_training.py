@@ -58,6 +58,26 @@ def test_load_market_gives_mid_prices_and_structure(stored_bars):
     np.testing.assert_allclose(market.mid[:, 3], stored_bars)
 
 
+def test_market_carries_the_stored_close_spread_in_pips_to_the_env(stored_bars):
+    table = pq.read_table(bars.bars_path())
+    ask = table["ask_close"].to_pylist()
+    ask[LEAD + 500] += 7e-4  # one wide Bar, in the long run
+    ask[LEAD + 501] -= 3e-4  # one crossed Bar
+    pq.write_table(
+        table.set_column(
+            table.schema.get_field_index("ask_close"), "ask_close", pa.array(ask)
+        ),
+        bars.bars_path(),
+    )
+    market = training.load_market()
+    assert market.close_spread_pips[LEAD + 500] == pytest.approx(8.0)
+    assert market.close_spread_pips[LEAD + 501] == pytest.approx(-2.0)
+    assert market.close_spread_pips[LEAD + 502] == pytest.approx(1.0)
+    env = market.make_env(market.structure.split.train)
+    assert env.spread_pips == config.SPREAD_PIPS
+    np.testing.assert_allclose(env.cost_pips[LEAD + 500 : LEAD + 503], [8.0, 1.0, 1.0])
+
+
 def test_same_config_and_seed_gives_the_same_model(stored_bars):
     market = training.load_market()
     a = training.fit(market, total_timesteps=256, ppo=TINY_PPO).model
@@ -86,7 +106,7 @@ def test_cli_train_saves_a_loadable_model_and_prints_progress(
     model = PPO.load(path, device="cpu")
     assert model.seed == 42
     assert model.policy.observation_space.shape == (
-        1 + (3 + FEATURE_COUNT) * config.WINDOW_SIZE,
+        2 + (3 + FEATURE_COUNT) * config.WINDOW_SIZE,
     )
 
 
