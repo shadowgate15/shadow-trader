@@ -45,7 +45,7 @@ The Agent's current exposure: short, flat, or long, always one fixed size.
 _Avoid_: Trade, holding
 
 **Spread cost**:
-The cost charged whenever the Position changes, set per Bar by the Spread: the Spread on the Bar where the Action is decided, floored at 1.0 pip, so zero and crossed Spreads never make trading free. Half of it is charged for each unit of Position crossed, so a round trip and a direct reversal each pay one full spread. Genuine widening (rollover, week open) costs more than the floor. The same rule prices Agent Actions, the final flatten and both Baselines. The Agent sees the current Bar's Spread cost; the Baselines do not.
+The cost charged whenever the Position changes, set per Bar by the Spread: the Spread on the Bar where the Action is decided, floored at the configured floor (`SPREAD_PIPS`), so zero and crossed Spreads never make trading free. Half of it is charged for each unit of Position crossed, so a round trip and a direct reversal each pay one full spread. Genuine widening (rollover, week open) costs more than the floor. The same rule prices Agent Actions, the final flatten and both Baselines. The Agent sees the current Bar's Spread cost; the Baselines do not.
 _Avoid_: Fee, commission, slippage
 
 **Reward**:

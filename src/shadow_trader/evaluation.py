@@ -105,7 +105,7 @@ def score(env: TradingEnv, policy: Policy) -> Score:
             obs, reward, _, truncated, _ = env.step(action)
             rs.append(reward)
             held.append(POSITIONS[action])
-        rs[-1] -= env.cost_pips[stop - 1] / 2 * abs(held[-1])  # the final flatten
+        rs[-1] -= env.flatten_cost()  # the final flatten, at the last Bar
         held.append(0.0)
         rewards.append(np.array(rs))
         changes.append(int(np.count_nonzero(np.diff(held))))

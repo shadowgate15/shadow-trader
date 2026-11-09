@@ -3,7 +3,7 @@ from typing import Any
 import numpy as np
 import pytest
 from stable_baselines3 import PPO
-from test_env import make_prices
+from test_env import make_prices, spread_array
 from test_training import TINY_PPO, stored_bars  # noqa: F401
 
 from shadow_trader import cli, config, evaluation, training
@@ -77,9 +77,7 @@ def env_for(segs, count=400, **kw):
 
 def spread_env(segs, spread_by_bar, count=400, **kw):
     """Like ``env_for`` with close Spread (pips) given per Bar (LEAD-relative)."""
-    spread = np.zeros(LEAD + count)
-    for bar, pips in spread_by_bar.items():
-        spread[LEAD + bar] = pips
+    spread = spread_array(LEAD + count, {LEAD + b: p for b, p in spread_by_bar.items()})
     return env_for(segs, count, close_spread_pips=spread, **kw)
 
 
