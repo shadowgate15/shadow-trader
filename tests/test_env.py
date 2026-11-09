@@ -50,7 +50,7 @@ def run_to_end(env: TradingEnv, action: int = 1):
 def test_spaces():
     env = env_for()
     assert env.observation_space == spaces.Box(
-        -np.inf, np.inf, (1 + 3 * N + FEATURE_COUNT * N,), np.float32
+        -np.inf, np.inf, ((2 + 3 * N + FEATURE_COUNT * N,)), np.float32
     )
     assert env.action_space == spaces.Discrete(3)
 
@@ -69,7 +69,7 @@ def test_observation_holds_scaled_log_returns_against_previous_close():
     for ch, col in enumerate((1, 2, 3)):  # high, low, close
         expected = [SCALE * math.log(prices[b, col] / prices[b - 1, 3]) for b in bars]
         np.testing.assert_allclose(
-            obs[1 + ch * N : 1 + (ch + 1) * N], expected, rtol=1e-4
+            obs[2 + ch * N : 2 + (ch + 1) * N], expected, rtol=1e-4
         )
     assert obs[0] == 0.0
     assert obs.dtype == np.float32
@@ -82,7 +82,7 @@ def test_observation_is_not_clipped():
     env.reset(options={"segment": 0})
     for _ in range(6):
         obs, *_ = env.step(1)
-    assert obs[1 : 1 + N].max() > 3000
+    assert obs[2 : 2 + N].max() > 3000
 
 
 def test_position_is_first_observation_element_and_target_not_increment():
@@ -172,6 +172,41 @@ def test_spread_pips_is_the_floor_for_the_spread_data():
     assert r == pytest.approx((prices[t + 1, 3] - prices[t, 3]) / 1e-4 - 1.0)
 
 
+@pytest.mark.parametrize(
+    ("spread", "cost"),
+    [(0.0, 1.0), (-3.0, 1.0), (0.4, 1.0), (1.0, 1.0), (4.0, 4.0), (15.0, 15.0)],
+)
+def test_observation_second_value_is_the_decision_bars_floored_cost_in_pips(
+    spread, cost
+):
+    t = LEAD + N
+    _, env = spread_env({t: spread, t + 1: 7.5})
+    obs, _ = env.reset(options={"segment": 0})
+    assert obs[0] == 0.0
+    assert obs[1] == np.float32(cost)
+    # After a step the Observation is of Bar t+1: its cost, not Bar t's.
+    obs, *_ = env.step(2)
+    assert obs[0] == 1.0
+    assert obs[1] == np.float32(7.5)
+
+
+def test_observation_cost_floors_at_spread_pips_and_without_spread_data():
+    t = LEAD + N
+    _, env = spread_env({t: 1.5}, spread_pips=2.0)
+    obs, _ = env.reset(options={"segment": 0})
+    assert obs[1] == np.float32(2.0)
+    obs, _ = env_for(spread_pips=3.0).reset(options={"segment": 0})
+    assert obs[1] == np.float32(3.0)
+
+
+def test_observation_cost_is_unclipped_and_adds_no_window_of_costs():
+    t = LEAD + N
+    _, env = spread_env({t: 5000.0})
+    obs, _ = env.reset(options={"segment": 0})
+    assert obs[1] == np.float32(5000.0)
+    assert obs.shape == (2 + (3 + FEATURE_COUNT) * N,)
+
+
 def test_episode_is_288_steps_and_truncates():
     env = env_for(count=1300, segs=((LEAD, 1300),))
     env.reset(seed=3)
@@ -232,7 +267,7 @@ def ref_return_block(prices, t, h):
 
 
 def return_blocks(obs):
-    base = 1 + 3 * N
+    base = 2 + 3 * N
     return [obs[base + k * N : base + (k + 1) * N] for k in range(len(RETURN_HORIZONS))]
 
 
@@ -283,7 +318,7 @@ def test_features_look_back_across_a_gap_while_the_raw_window_does_not():
         SCALE * math.log(prices[b, 3] / prices[b - 1, 3])
         for b in range(t - N + 1, t + 1)
     ]
-    np.testing.assert_allclose(obs[1 + 2 * N : 1 + 3 * N], raw_close, rtol=1e-4)
+    np.testing.assert_allclose(obs[2 + 2 * N : 2 + 3 * N], raw_close, rtol=1e-4)
 
 
 def test_segment_without_enough_lookback_is_dropped_and_serves_as_lookback():
@@ -327,7 +362,7 @@ def ref_sma_block(prices, t, n):
 
 
 def sma_blocks(obs):
-    base = 1 + 3 * N + len(RETURN_HORIZONS) * N
+    base = 2 + 3 * N + len(RETURN_HORIZONS) * N
     return [obs[base + k * N : base + (k + 1) * N] for k in range(len(SMA_SPANS))]
 
 
@@ -357,7 +392,7 @@ def test_sma_features_look_back_across_a_gap_and_ignore_the_future():
 
 def test_observation_width_counts_the_sma_blocks():
     env = env_for()
-    expected = 1 + 3 * N + FEATURE_COUNT * N
+    expected = 2 + 3 * N + FEATURE_COUNT * N
     assert env.observation_space.shape == (expected,)
     check_env(env, skip_render_check=True)
 
@@ -371,7 +406,7 @@ def volatility_blocks(obs):
     k = 0
     for family in FAMILIES:
         if family.precompute is _volatility_series:
-            base = 1 + 3 * N + k * N
+            base = 2 + 3 * N + k * N
             return [
                 obs[base + i * N : base + (i + 1) * N]
                 for i in range(len(family.horizons))
@@ -513,11 +548,11 @@ def test_lookback_continues_through_a_previous_segment_shorter_than_the_horizon(
 
 def test_observation_width_is_pinned_and_float32():
     env = env_for()
-    assert env.observation_space.shape == (289,)
+    assert env.observation_space.shape == (290,)
     assert env.observation_space.dtype == np.float32
     check_env(env, skip_render_check=True)
     obs, _ = env.reset(options={"segment": 0})
-    assert obs.shape == (289,)
+    assert obs.shape == (290,)
     assert obs.dtype == np.float32
 
 

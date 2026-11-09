@@ -10,9 +10,11 @@ Everything is marked to Mid; no fill is simulated at bid or ask.
 Warm-up. N log-return vectors need N+1 Bars, so the first Action of a Segment
 falls on its Bar N+1 (index ``first + N``) and no Reward accrues before it.
 
-Observation, float32, ``1 + 3N + F*N`` values (N = window size, F = Feature
-count): ``[Position, high log returns (N), low log
-returns (N), close log returns (N), then F Feature blocks of N]``. Every block
+Observation, float32, ``2 + 3N + F*N`` values (N = window size, F = Feature
+count): ``[Position, Spread cost, high log returns (N), low log
+returns (N), close log returns (N), then F Feature blocks of N]``. The Spread
+cost is the decision Bar's effective cost in plain pips (``max(close Spread,
+floor)``): no clipping, transform or scale, and no Window of past costs. Every block
 runs oldest Bar to newest. Feature ``k`` at Window position ``j`` is that
 Feature evaluated at Bar ``t - N + 1 + j``, so raw and Feature blocks line up
 Bar for Bar. Feature blocks follow ``FAMILIES`` order, ascending horizon within
@@ -202,7 +204,7 @@ class TradingEnv(gym.Env):
         self.cost_pips = np.maximum(spread, spread_pips)
         n = window_size
         self.observation_space = spaces.Box(
-            -np.inf, np.inf, (1 + (3 + FEATURE_COUNT) * n,), np.float32
+            -np.inf, np.inf, (2 + (3 + FEATURE_COUNT) * n,), np.float32
         )
         self.action_space = spaces.Discrete(3)
 
@@ -241,13 +243,13 @@ class TradingEnv(gym.Env):
         #   answers a different question. Features are Mid-derived price
         #   context only; no clock, volume, Spread, other-pair or Position
         #   history Feature either.
-        # Layout: Position, the high, low, close blocks (channel-major), then
-        # the Feature blocks in FAMILIES order.
+        # Layout: Position, Spread cost, the high, low, close blocks
+        # (channel-major), then the Feature blocks in FAMILIES order.
         t, n = self._bar, self.window_size
         window = self._returns[t - n + 1 : t + 1]  # (n, 3): high, low, close
         features = self._features[t - n + 1 : t + 1]  # (n, F)
         return np.concatenate(
-            [[self._position], window.T.ravel(), features.T.ravel()]
+            [[self._position, self.cost_pips[t]], window.T.ravel(), features.T.ravel()]
         ).astype(np.float32)
 
     def reset(
