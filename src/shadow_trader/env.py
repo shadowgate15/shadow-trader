@@ -241,8 +241,12 @@ class TradingEnv(gym.Env):
         # - No clock or calendar feature (hour, day of week, session marker).
         #   The MVP asks whether price movement alone carries signal; a clock
         #   answers a different question. Features are Mid-derived price
-        #   context only; no clock, volume, Spread, other-pair or Position
-        #   history Feature either.
+        #   context only; no clock, volume, other-pair or Position history
+        #   Feature either.
+        # - No raw Spread and no Window of past Spread costs. The one Spread
+        #   quantity in the vector is the decision Bar's floored Spread cost
+        #   (slot 1), so indicative-quote zeros and crossings never reach the
+        #   Agent and 97.2% of Bars sitting at the floor add no history signal.
         # Layout: Position, Spread cost, the high, low, close blocks
         # (channel-major), then the Feature blocks in FAMILIES order.
         t, n = self._bar, self.window_size
