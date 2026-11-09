@@ -8,7 +8,8 @@ Ending flat. The environment does not force the Position flat, so after the
 last Bar's move the scorer closes whatever Position is open at that Bar's Mid
 and charges the usual Spread cost for it, at the Segment's last Bar (half the
 per-Bar cost per unit of Position crossed). That cost is subtracted from the
-Segment's final Reward and counts as one Position change. A Segment is entered flat, so no Position crosses a Gap.
+Segment's final Reward and counts as one Position change. A Segment is entered
+flat, so no Position crosses a Gap.
 
 Segments with fewer than ``window_size + 2`` Bars are skipped entirely: 25 Bars
 give one Observation but no Reward, so there is nothing to score.
