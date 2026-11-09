@@ -11,7 +11,7 @@ Results are grouped by cost regime. A regime is defined by the cost rule and by 
 | Regime | Cost rule | Spread view | Observation size | Entries |
 |---|---|---|---|---|
 | Fixed 1.0 pip (historical) | Fixed 1.0 pip per Position change | None | 289 | `4b214c0`, `b17f473` |
-| Spread cost | `max(close Spread of Bar t, 1.0 pip)` per Position change, half charged per unit (#195) | Cost scalar, second after Position | 290 | None yet |
+| Spread cost | `max(close Spread of Bar t, 1.0 pip)` per Position change, half charged per unit (#195) | Cost scalar, second after Position | 290 | `0d0eb5b` |
 
 Buy-and-hold is listed once per regime, since its cost differs between regimes. It is identical across every entry within a regime.
 
@@ -31,9 +31,11 @@ Net and drawdown in pips; Sharpe is per-Bar, un-annualised. Random is the mean o
 
 ### Spread cost regime: `max(close Spread, 1.0 pip)`, Agent observes the cost scalar
 
-No entries yet. The first entry is the user's pipeline step (fresh train and evaluate at its commit); add it per "How to add an entry".
+| Commit | Change | Cost rule | Checkpoint | Agent net | Agent Sharpe | Agent max DD | Position changes | Random net | Random Sharpe | Verdict |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `0d0eb5b` | Spread cost (#195) | `max(close Spread, 1.0 pip)`, Spread view | 563,200 | -10,554.95 | -0.0618 | 10,664.80 | 20,885 | -14,420.17 | -0.0748 | FAIL |
 
-Buy-and-hold under this regime: **not yet recorded** (placeholder; the user's pipeline run fills it in, since the per-Bar cost changes it).
+Buy-and-hold under this regime: net -81.90 pips (-0.74%), Sharpe -0.0004, max drawdown 843.20 pips (7.64%).
 
 ### Fixed 1.0 pip, no Spread view regime (historical)
 
@@ -48,7 +50,24 @@ Buy-and-hold under this regime, same in both: net -20.15 pips (-0.18%), Sharpe -
 
 ## Spread cost regime entries
 
-None yet.
+## `0d0eb5b`: Spread cost (#195)
+
+Regime: `max(close Spread of Bar t, 1.0 pip)` per Position change, Agent observes the cost scalar (Observation size 290).
+
+Merge of PR #200.
+
+| | net (pips) | net (% notional) | Sharpe | max DD (pips) | max DD (%) |
+|---|---|---|---|---|---|
+| Agent | -10,554.95 | -95.66 | -0.0618 | 10,664.80 | 96.66 |
+| buy-and-hold | -81.90 | -0.74 | -0.0004 | 843.20 | 7.64 |
+| random (mean) | -14,420.17 | -130.69 | -0.0748 | 14,459.13 | 131.05 |
+
+- Selected Checkpoint: 563,200 steps. Validation there: net -15,387.35 pips, Sharpe -0.0531, 28,473 Position changes.
+- Agent Position changes on test: 20,885.
+- Agent beats 100% of random draws on net return and 100% on Sharpe.
+- Verdict: **FAIL**. Net return and Sharpe not above buy-and-hold: -10,554.95 vs -81.90 pips, -0.0618 vs -0.0004.
+- Provenance: model built by the user with `uv run shadow-trader train` (`data/model/` saved 2026-11-09, loadable against the 290-wide Observation); evaluated with `uv run shadow-trader evaluate` at this commit. The user's report that it is a fresh retrain at this commit was not independently verified.
+- Accepted confound: the cost rule and the Spread view changed together, with no ablation, so this result cannot be attributed to either alone. It is also not comparable to the fixed 1.0 pip regime.
 
 ## Fixed 1.0 pip, no Spread view regime entries (historical)
 
