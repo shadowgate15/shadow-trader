@@ -43,10 +43,7 @@ def load_market() -> Market:
     table = pq.read_table(bars.bars_path())
     mid = bars.mid(table)
     mid_ohlc = np.column_stack([mid[f"mid_{f}"] for f in bars.FIELDS])
-    close_spread = (
-        table["ask_close"].to_numpy() - table["bid_close"].to_numpy()
-    ) / bars.PIP
-    return Market(mid_ohlc, segments.load(), close_spread)
+    return Market(mid_ohlc, segments.load(), bars.close_spread_pips(table))
 
 
 def model_path() -> Path:

@@ -246,7 +246,7 @@ class TradingEnv(gym.Env):
         # - No raw Spread and no Window of past Spread costs. The one Spread
         #   quantity in the vector is the decision Bar's floored Spread cost
         #   (slot 1), so indicative-quote zeros and crossings never reach the
-        #   Agent and 97.2% of Bars sitting at the floor add no history signal.
+        #   Agent.
         # Layout: Position, Spread cost, the high, low, close blocks
         # (channel-major), then the Feature blocks in FAMILIES order.
         t, n = self._bar, self.window_size
@@ -283,6 +283,10 @@ class TradingEnv(gym.Env):
             self._last = self._bar + self.episode_length
         self._position = 0.0
         return self._observation(), {"bar": self._bar}
+
+    def flatten_cost(self) -> float:
+        """Pips to close the current Position at the current Bar's Spread cost."""
+        return float(self.cost_pips[self._bar] / 2 * abs(self._position))
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         target = POSITIONS[int(action)]

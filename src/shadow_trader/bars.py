@@ -30,6 +30,7 @@ from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -270,6 +271,12 @@ def mid(table: pa.Table) -> dict[str, list[float]]:
         ]
         for f in FIELDS
     }
+
+
+def close_spread_pips(table: pa.Table) -> np.ndarray:
+    """Close Spread (ask close minus bid close) of every Bar, in pips."""
+    spread = table["ask_close"].to_numpy() - table["bid_close"].to_numpy()
+    return spread / PIP
 
 
 def bars_path() -> Path:
