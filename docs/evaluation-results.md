@@ -2,26 +2,59 @@
 
 A running log of `evaluate` output, one entry per commit, newest first. Terms are defined in [GLOSSARY.md](../GLOSSARY.md); read [limitations.md](limitations.md) before interpreting any number (one seed, one configuration, so a difference between rows is a single sample, not a finding).
 
-Every run is on the same pinned History and Split, with `SEED = 42`, `TOTAL_TIMESTEPS = 1_000_000` and the same 93,080 rewarded test Bars over 68 Segments. Buy-and-hold is identical in every entry, so it is listed once below.
+Every run is on the same pinned History and Split, with `SEED = 42`, `TOTAL_TIMESTEPS = 1_000_000` and the same 93,080 rewarded test Bars over 68 Segments.
+
+## Cost regimes
+
+Results are grouped by cost regime. A regime is defined by the cost rule and by what the Agent observes. Rows from different regimes are not comparable: a difference across regimes mixes the cost change with the Observation change and is not a finding.
+
+| Regime | Cost rule | Spread view | Observation size | Entries |
+|---|---|---|---|---|
+| Fixed 1.0 pip (historical) | Fixed 1.0 pip per Position change | None | 289 | `4b214c0`, `b17f473` |
+| Spread cost | `max(close Spread of Bar t, 1.0 pip)` per Position change, half charged per unit (#195) | Cost scalar, second after Position | 290 | None yet |
+
+Buy-and-hold is listed once per regime, since its cost differs between regimes. It is identical across every entry within a regime.
 
 ## How to add an entry
 
 1. Check out the commit and run `uv run shadow-trader train`, then `uv run shadow-trader evaluate`.
-2. Copy the `evaluate` table and the selected Checkpoint (from `data/model/learning_curve.csv`, the row with `selected` true) into a new row and a new section.
-3. Evaluate the test period once per commit; never use it to choose a configuration.
+   - The first entry of a regime must be retrained fresh at its commit. Do not reuse an existing model for it.
+   - Later entries in a regime may reuse the model already in `data/model/` only if it is loadable against that commit's Observation shape; say so in the provenance.
+2. Copy the `evaluate` table and the selected Checkpoint (from `data/model/learning_curve.csv`, the row with `selected` true) into a new row and a new section. Add the row under its regime in the Summary.
+3. Record provenance: how the model was produced (fresh retrain or reused), the cost rule (for example fixed 1.0 pip, or `max(close Spread, 1.0 pip)`), and whether the Agent observes the Spread scalar.
+4. The first entry of the Spread cost regime must also note the accepted confound: the cost rule and the Spread view changed together, with no ablation, so its result cannot be attributed to either alone.
+5. Evaluate the test period once per commit; never use it to choose a configuration.
 
 ## Summary
 
 Net and drawdown in pips; Sharpe is per-Bar, un-annualised. Random is the mean of 20 turnover-matched draws.
 
-| Commit | Change | Checkpoint | Agent net | Agent Sharpe | Agent max DD | Position changes | Random net | Random Sharpe | Verdict |
-|---|---|---|---|---|---|---|---|---|---|
-| `4b214c0` | Features (#181) | 716,800 | -12,632.80 | -0.0657 | 12,648.25 | 23,260 | -15,608.04 | -0.0808 | FAIL |
-| `b17f473` | Checkpoints (#159) | 102,400 | -8,477.45 | -0.0658 | 8,493.10 | 16,091 | -10,618.69 | -0.0553 | FAIL |
+### Spread cost regime: `max(close Spread, 1.0 pip)`, Agent observes the cost scalar
 
-Buy-and-hold, same in both: net -20.15 pips (-0.18%), Sharpe -0.0001, max drawdown 843.20 pips (7.64%).
+No entries yet. The first entry is the user's pipeline step (fresh train and evaluate at its commit); add it per "How to add an entry".
+
+Buy-and-hold under this regime: **not yet recorded** (placeholder; the user's pipeline run fills it in, since the per-Bar cost changes it).
+
+### Fixed 1.0 pip, no Spread view regime (historical)
+
+Cost rule: fixed 1.0 pip per Position change. The Agent had no Spread view (Observation size 289). Kept for history; not comparable to the Spread cost regime.
+
+| Commit | Change | Cost rule | Checkpoint | Agent net | Agent Sharpe | Agent max DD | Position changes | Random net | Random Sharpe | Verdict |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `4b214c0` | Features (#181) | Fixed 1.0 pip, no Spread view | 716,800 | -12,632.80 | -0.0657 | 12,648.25 | 23,260 | -15,608.04 | -0.0808 | FAIL |
+| `b17f473` | Checkpoints (#159) | Fixed 1.0 pip, no Spread view | 102,400 | -8,477.45 | -0.0658 | 8,493.10 | 16,091 | -10,618.69 | -0.0553 | FAIL |
+
+Buy-and-hold under this regime, same in both: net -20.15 pips (-0.18%), Sharpe -0.0001, max drawdown 843.20 pips (7.64%).
+
+## Spread cost regime entries
+
+None yet.
+
+## Fixed 1.0 pip, no Spread view regime entries (historical)
 
 ## `4b214c0`: Features (#181)
+
+Regime: fixed 1.0 pip, no Spread view.
 
 Merge of PR #188. Adds the Feature families (return, SMA, volatility, range horizons) to the Observation.
 
@@ -38,6 +71,8 @@ Merge of PR #188. Adds the Feature families (return, SMA, volatility, range hori
 - Provenance: evaluated with the model already in `data/model/` (saved after this commit and loadable against its Observation shape), not retrained for this entry.
 
 ## `b17f473`: Checkpoints (#159)
+
+Regime: fixed 1.0 pip, no Spread view.
 
 Merge of PR #165, the commit before Features.
 
