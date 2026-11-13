@@ -70,6 +70,12 @@ class Metrics:
 class Score:
     metrics: Metrics
     position_changes: tuple[int, ...]  # per scored Segment, final flatten included
+    cost_pips: float = 0.0  # total Spread cost paid, final flatten included
+
+    @property
+    def gross_pips(self) -> float:
+        """Net before Spread cost: what the Positions earned on Mid alone."""
+        return self.metrics.net_pips + self.cost_pips
 
 
 def compute_metrics(rewards: Sequence[np.ndarray], notional: float) -> Metrics:
@@ -94,7 +100,7 @@ def compute_metrics(rewards: Sequence[np.ndarray], notional: float) -> Metrics:
 
 def score(env: TradingEnv, policy: Policy) -> Score:
     """Roll ``policy`` through each scoreable Segment of ``env`` and measure it."""
-    rewards, changes, notional = [], [], None
+    rewards, changes, notional, cost = [], [], None, 0.0
     for i, (first, stop) in enumerate(env.segments):
         if stop - first < env.window_size + 2:
             continue
@@ -102,16 +108,19 @@ def score(env: TradingEnv, policy: Policy) -> Score:
         rs, held, truncated = [], [0.0], False
         while not truncated:
             action = int(policy(obs))
-            obs, reward, _, truncated, _ = env.step(action)
+            obs, reward, _, truncated, info = env.step(action)
             rs.append(reward)
+            cost += info["cost"]
             held.append(POSITIONS[action])
-        rs[-1] -= env.flatten_cost()  # the final flatten, at the last Bar
+        flatten = env.flatten_cost()
+        rs[-1] -= flatten  # the final flatten, at the last Bar
+        cost += flatten
         held.append(0.0)
         rewards.append(np.array(rs))
         changes.append(int(np.count_nonzero(np.diff(held))))
         if notional is None:
             notional = float(env.mid[first + env.window_size, 3])
-    return Score(compute_metrics(rewards, notional or 1.0), tuple(changes))
+    return Score(compute_metrics(rewards, notional or 1.0), tuple(changes), cost)
 
 
 def _scored_lengths(env: TradingEnv) -> list[int]:
@@ -295,6 +304,18 @@ def run() -> None:
         )
         _say(f"{name:14}" + "".join(f"{c:18.4f}" for c in cells))
     _say("sharpe is per-Bar, un-annualised; max drawdown is from a zero starting peak")
+    _say()
+    rand_cost = float(np.mean([d.cost_pips for d in draws]))
+    rand_gross = float(np.mean([d.gross_pips for d in draws]))
+    _say(f"{'':14}{'gross (pips)':>18}{'cost (pips)':>18}{'cost / change':>18}")
+    for name, gross, cost, n in (
+        ("Agent", agent.gross_pips, agent.cost_pips, changes),
+        ("buy-and-hold", hold.gross_pips, hold.cost_pips, sum(hold.position_changes)),
+        ("random (mean)", rand_gross, rand_cost, changes),
+    ):
+        per = cost / n if n else 0.0
+        _say(f"{name:14}{gross:18.4f}{cost:18.4f}{per:18.4f}")
+    _say("gross = net + Spread cost: the Positions' P&L on Mid before any cost")
     _say()
     _say(
         f"random Baseline: {len(draws)} seeded draws, turnover matched per Segment; "

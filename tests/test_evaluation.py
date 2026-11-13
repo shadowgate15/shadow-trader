@@ -312,3 +312,17 @@ def test_cli_evaluate_prefers_the_best_model_and_reports_its_timestep(
     assert lines.index("checkpoint: best @ 128 steps (ppo_eurusd_best.zip)") < next(
         i for i, ln in enumerate(lines) if "net (pips)" in ln
     )
+
+
+def test_gross_is_net_plus_the_spread_cost_paid():
+    env = spread_env([(0, 100), (120, 220)], {N: 4.0, 99: 8.0, 120 + N: 2.0})
+    s = evaluation.buy_and_hold(env)
+    p = env.mid[LEAD:, 3]
+    gross = ((p[99] - p[N]) + (p[219] - p[120 + N])) / PIP
+    assert s.cost_pips == pytest.approx(2.0 + 4.0 + 1.0 + 0.5)
+    assert s.gross_pips == pytest.approx(gross)
+
+
+def test_a_flat_policy_pays_no_cost():
+    s = evaluation.score(env_for([(0, 100)]), always(1))
+    assert (s.cost_pips, s.gross_pips) == (0.0, 0.0)

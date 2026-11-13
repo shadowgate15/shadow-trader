@@ -165,7 +165,8 @@ class TradingEnv(gym.Env):
     ``reset()`` starts a random Episode of ``episode_length`` rewarded Bars
     inside a single Segment. ``reset(options={"segment": i})`` instead runs
     the i-th Segment from its start through its last Bar, starting flat, for
-    deterministic evaluation. ``info["bar"]`` is the Bar the next Action falls on.
+    deterministic evaluation. ``info["bar"]`` is the Bar the next Action falls on;
+    after ``step``, ``info["cost"]`` is the Spread cost in pips just charged.
 
     Spread cost. ``close_spread_pips`` is the close Spread (ask close minus bid
     close, in pips) of every Bar, or None for none. A Position change decided at
@@ -297,7 +298,8 @@ class TradingEnv(gym.Env):
         self._position = target
         self._bar = t + 1
         truncated = self._bar >= self._last
-        return self._observation(), float(reward), False, truncated, {"bar": self._bar}
+        info = {"bar": self._bar, "cost": float(cost)}
+        return self._observation(), float(reward), False, truncated, info
 
 
 def _range(segment: Any) -> tuple[int, int]:
