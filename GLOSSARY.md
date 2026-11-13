@@ -25,8 +25,12 @@ The learned policy that chooses an Action at each Bar.
 _Avoid_: Bot, model, strategy
 
 **Observation**:
-Everything the Agent sees at a Bar: how Mid moved over a Window, Features derived from Mid, its own current Position, and the Spread cost of the current Bar as a single number in pips. Nothing else: no clock, no volume, no raw Spread, and no history of past Spread costs.
+Everything the Agent sees at a Bar: how Mid moved over a Window, Features derived from Mid, its own current Position, how long it has held that Position (Time in position), and the Spread cost of the current Bar as a single number in pips. Nothing else: no clock, no volume, no raw Spread, and no history of past Spread costs.
 _Avoid_: State, input
+
+**Time in position**:
+How many Bars the Agent has held its current Position as of the Bar it is deciding on: the Bars since the last Position change, for every Position including flat. A direct reversal is a Position change and starts the count again at 0, as does the start of an Episode or a Segment. It is a plain count of Bars, neither capped nor scaled.
+_Avoid_: Holding period, hold time, age, duration
 
 **Feature**:
 A quantity derived only from Mid up to and including a Bar, with one value per Bar across the Window, carried alongside the raw Window.
