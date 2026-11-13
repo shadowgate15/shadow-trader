@@ -230,7 +230,7 @@ class TradingEnv(gym.Env):
         self._bar = 0
         self._last = 0  # last Bar of the current run
         self._position = 0.0
-        self._held = 0  # Bars since the last Position change
+        self._time_in_position = 0  # Bars since the last Position change
 
     def _usable(self, first: int) -> bool:
         # The oldest Window Bar is first + 1; the Feature needing the most
@@ -260,7 +260,7 @@ class TradingEnv(gym.Env):
         features = self._features[t - n + 1 : t + 1]  # (n, F)
         return np.concatenate(
             [
-                [self._position, self.cost_pips[t], self._held],
+                [self._position, self.cost_pips[t], self._time_in_position],
                 window.T.ravel(),
                 features.T.ravel(),
             ]
@@ -292,7 +292,7 @@ class TradingEnv(gym.Env):
             self._bar = start + n
             self._last = self._bar + self.episode_length
         self._position = 0.0
-        self._held = 0
+        self._time_in_position = 0
         return self._observation(), {"bar": self._bar}
 
     def flatten_cost(self) -> float:
@@ -305,7 +305,9 @@ class TradingEnv(gym.Env):
         cost = self.cost_pips[t] / 2 * abs(target - self._position)
         move = (self.mid[t + 1, 3] - self.mid[t, 3]) / PIP
         reward = target * move - float(cost)
-        self._held = self._held + 1 if target == self._position else 0
+        self._time_in_position = (
+            self._time_in_position + 1 if target == self._position else 0
+        )
         self._position = target
         self._bar = t + 1
         truncated = self._bar >= self._last

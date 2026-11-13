@@ -17,9 +17,7 @@ from shadow_trader.segments import Segment
 
 N = 24
 SCALE = 1e4
-OBS_OFFSET = (
-    3  # slots before the return blocks: Position, Spread cost, Time in position
-)
+OBS_OFFSET = 3  # slots before the return blocks: Position, cost, time in position
 LEAD = LOOKBACK + 12  # leading history: more than the lookback a Segment needs
 RETURN_HORIZONS = (48, 144, 288)
 SMA_SPANS = (48, 288)
