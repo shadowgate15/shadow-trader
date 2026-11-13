@@ -10,11 +10,14 @@ Everything is marked to Mid; no fill is simulated at bid or ask.
 Warm-up. N log-return vectors need N+1 Bars, so the first Action of a Segment
 falls on its Bar N+1 (index ``first + N``) and no Reward accrues before it.
 
-Observation, float32, ``2 + 3N + F*N`` values (N = window size, F = Feature
-count): ``[Position, Spread cost, high log returns (N), low log
-returns (N), close log returns (N), then F Feature blocks of N]``. The Spread
+Observation, float32, ``3 + 3N + F*N`` values (N = window size, F = Feature
+count): ``[Position, Spread cost, Time in position, high log returns (N), low
+log returns (N), close log returns (N), then F Feature blocks of N]``. The Spread
 cost is the decision Bar's effective cost in plain pips (``max(close Spread,
-floor)``): no clipping, transform or scale, and no Window of past costs. Every block
+floor)``): no clipping, transform or scale, and no Window of past costs. Time in
+position is the plain count of Bars since the last Position change as of the
+decision Bar (flat included; a direct reversal resets it; 0 at ``reset``):
+uncapped and unscaled, so it can far exceed an Episode's 288 Bars. Every block
 runs oldest Bar to newest. Feature ``k`` at Window position ``j`` is that
 Feature evaluated at Bar ``t - N + 1 + j``, so raw and Feature blocks line up
 Bar for Bar. Feature blocks follow ``FAMILIES`` order, ascending horizon within
@@ -205,7 +208,7 @@ class TradingEnv(gym.Env):
         self.cost_pips = np.maximum(spread, spread_pips)
         n = window_size
         self.observation_space = spaces.Box(
-            -np.inf, np.inf, (2 + (3 + FEATURE_COUNT) * n,), np.float32
+            -np.inf, np.inf, (3 + (3 + FEATURE_COUNT) * n,), np.float32
         )
         self.action_space = spaces.Discrete(3)
 
@@ -227,6 +230,7 @@ class TradingEnv(gym.Env):
         self._bar = 0
         self._last = 0  # last Bar of the current run
         self._position = 0.0
+        self._held = 0  # Bars since the last Position change
 
     def _usable(self, first: int) -> bool:
         # The oldest Window Bar is first + 1; the Feature needing the most
@@ -242,19 +246,24 @@ class TradingEnv(gym.Env):
         # - No clock or calendar feature (hour, day of week, session marker).
         #   The MVP asks whether price movement alone carries signal; a clock
         #   answers a different question. Features are Mid-derived price
-        #   context only; no clock, volume, other-pair or Position history
-        #   Feature either.
+        #   context only; no clock, volume or other-pair Feature either.
         # - No raw Spread and no Window of past Spread costs. The one Spread
         #   quantity in the vector is the decision Bar's floored Spread cost
         #   (slot 1), so indicative-quote zeros and crossings never reach the
         #   Agent.
-        # Layout: Position, Spread cost, the high, low, close blocks
+        # - Time in position (slot 2) is the one Position-history quantity: raw
+        #   Bar count, deliberately uncapped and unscaled.
+        # Layout: Position, Spread cost, Time in position, the high, low, close blocks
         # (channel-major), then the Feature blocks in FAMILIES order.
         t, n = self._bar, self.window_size
         window = self._returns[t - n + 1 : t + 1]  # (n, 3): high, low, close
         features = self._features[t - n + 1 : t + 1]  # (n, F)
         return np.concatenate(
-            [[self._position, self.cost_pips[t]], window.T.ravel(), features.T.ravel()]
+            [
+                [self._position, self.cost_pips[t], self._held],
+                window.T.ravel(),
+                features.T.ravel(),
+            ]
         ).astype(np.float32)
 
     def reset(
@@ -283,6 +292,7 @@ class TradingEnv(gym.Env):
             self._bar = start + n
             self._last = self._bar + self.episode_length
         self._position = 0.0
+        self._held = 0
         return self._observation(), {"bar": self._bar}
 
     def flatten_cost(self) -> float:
@@ -295,6 +305,7 @@ class TradingEnv(gym.Env):
         cost = self.cost_pips[t] / 2 * abs(target - self._position)
         move = (self.mid[t + 1, 3] - self.mid[t, 3]) / PIP
         reward = target * move - float(cost)
+        self._held = self._held + 1 if target == self._position else 0
         self._position = target
         self._bar = t + 1
         truncated = self._bar >= self._last

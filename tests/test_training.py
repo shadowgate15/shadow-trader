@@ -106,7 +106,7 @@ def test_cli_train_saves_a_loadable_model_and_prints_progress(
     model = PPO.load(path, device="cpu")
     assert model.seed == 42
     assert model.policy.observation_space.shape == (
-        2 + (3 + FEATURE_COUNT) * config.WINDOW_SIZE,
+        3 + (3 + FEATURE_COUNT) * config.WINDOW_SIZE,
     )
 
 

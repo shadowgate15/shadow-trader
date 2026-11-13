@@ -17,7 +17,9 @@ from shadow_trader.segments import Segment
 
 N = 24
 SCALE = 1e4
-OBS_OFFSET = 2  # Observation slots before the return blocks: Position, Spread cost
+OBS_OFFSET = (
+    3  # slots before the return blocks: Position, Spread cost, Time in position
+)
 LEAD = LOOKBACK + 12  # leading history: more than the lookback a Segment needs
 RETURN_HORIZONS = (48, 144, 288)
 SMA_SPANS = (48, 288)
@@ -558,11 +560,11 @@ def test_lookback_continues_through_a_previous_segment_shorter_than_the_horizon(
 
 def test_observation_width_is_pinned_and_float32():
     env = env_for()
-    assert env.observation_space.shape == (290,)
+    assert env.observation_space.shape == (291,)
     assert env.observation_space.dtype == np.float32
     check_env(env, skip_render_check=True)
     obs, _ = env.reset(options={"segment": 0})
-    assert obs.shape == (290,)
+    assert obs.shape == (291,)
     assert obs.dtype == np.float32
 
 
@@ -587,3 +589,52 @@ def test_flatten_cost_is_half_the_current_bars_cost_per_unit_of_position():
     assert env.flatten_cost() == pytest.approx(3.0)
     env.step(0)  # short
     assert env.flatten_cost() == pytest.approx(0.5)  # Bar t+2 at the floor
+
+
+def test_time_in_position_is_zero_after_reset_for_episode_and_segment():
+    env = env_for(count=1300, segs=((LEAD, 1300),))
+    for options in (None, {"segment": 0}):
+        obs, _ = env.reset(seed=1, options=options)
+        assert obs[2] == 0.0
+        env.step(2)
+        env.step(2)
+        obs, _ = env.reset(options=options)  # a used env starts from 0 again
+        assert obs[2] == 0.0
+
+
+@pytest.mark.parametrize("action", [0, 1, 2])
+def test_time_in_position_rises_by_one_per_bar_held(action):
+    env = env_for()
+    env.reset(options={"segment": 0})
+    obs, *_ = env.step(action)
+    # Starting flat: holding flat reads 1; entering short or long reads 0.
+    base = 1.0 if action == 1 else 0.0
+    assert obs[2] == base
+    for k in range(1, 6):
+        obs, *_ = env.step(action)
+        assert obs[2] == base + k
+
+
+def test_time_in_position_resets_on_any_position_change():
+    env = env_for()
+    env.reset(options={"segment": 0})
+    for _ in range(3):
+        obs, *_ = env.step(1)
+    assert obs[2] == 3.0
+    obs, *_ = env.step(2)  # flat to long
+    assert obs[2] == 0.0
+    obs, *_ = env.step(2)
+    assert obs[2] == 1.0
+    obs, *_ = env.step(0)  # direct reversal, long to short
+    assert obs[2] == 0.0
+    obs, *_ = env.step(0)
+    obs, *_ = env.step(1)  # short to flat
+    assert obs[2] == 0.0
+
+
+def test_time_in_position_is_uncapped_and_unscaled():
+    env = env_for(count=LEAD + 1000, segs=((LEAD, LEAD + 1000),))
+    obs, _ = env.reset(options={"segment": 0})
+    for _ in range(600):
+        obs, *_ = env.step(2)
+    assert obs[2] == np.float32(599.0)
